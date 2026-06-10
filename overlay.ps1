@@ -729,11 +729,17 @@ function Update-List {
 # floating window that shows a different animated GIF per overall Claude state.
 # ---------------------------------------------------------------------------
 $script:OverallState   = 'idle'
-$script:GifCurrentPath = ''      # path currently displayed (avoids needless reloads)
-$script:GifCache       = @{}     # path -> @{ frames; delays }, decoded once and reused
+$script:GifShownPath   = ''      # path currently DISPLAYED (dedup; stays put while a load is in flight)
+$script:GifCache       = @{}     # path -> @{ frames; delays }  (decoded packs; UI thread only)
 $script:GifActive      = $null   # @{ frames; delays; idx } currently animating
 $script:gifHwnd        = [IntPtr]::Zero
 $script:gifPinned      = $false
+# Async loading: a background runspace downloads GIF bytes (the slow part, ~seconds for
+# large remote GIFs) OFF the UI thread; the UI thread decodes the bytes (fast, ~150ms)
+# when they arrive. The overlay never freezes on a download.
+$script:GifBytes  = [hashtable]::Synchronized(@{})   # path -> byte[] OR 'FAILED'  (bg writes, UI reads)
+$script:GifQueue  = [System.Collections.Queue]::Synchronized((New-Object System.Collections.Queue))
+$script:GifQueued = @{}           # paths already enqueued this lifetime (UI thread only)
 
 [xml]$gifXaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -793,50 +799,20 @@ $script:GifTimer.Add_Tick({
   $script:GifTimer.Interval = [TimeSpan]::FromMilliseconds([Math]::Max(20, [int]$a.delays[$a.idx] * 10))
 })
 
-# Decode + composite a GIF into reusable frozen frames, CACHED BY PATH so each unique
-# GIF is downloaded/decoded only ONCE. The heavy work (network + per-frame composite)
-# happens here; caching is what keeps state switches instant and stops the GIF lagging
-# behind the live state. Returns @{ frames; delays } or $null (empty/unreadable/not a GIF).
-function Get-GifFrames($path) {
-  if ([string]::IsNullOrWhiteSpace($path)) { return $null }
-  if ($script:GifCache.ContainsKey($path)) { return $script:GifCache[$path] }
-  $pack = $null
+# Decode an already-fetched GIF stream into reusable frozen frames. A full-canvas frame
+# is used RAW (no RenderTargetBitmap); only a partial/differenced frame is composited.
+# CRITICAL: one RenderTargetBitmap per frame silently renders BLANK past a few dozen
+# frames (and is slow + memory-heavy) -- that made long GIFs flash once then vanish.
+# Runs on the UI thread (fast, ~150ms even for 300 frames). Returns @{ frames; delays }
+# or $null. Does NOT do any network I/O (that happens on the background downloader).
+function ConvertTo-GifPack($stream) {
   try {
-    $decoder = $null
-    if ($path -match '^https?://') {
-      # Remote GIF: WPF's remote-URI decode is unreliable, so download the bytes (with
-      # an 8s timeout so a dead URL can't freeze the UI) and decode from a memory stream.
-      try {
-        [System.Net.ServicePointManager]::SecurityProtocol = `
-          [System.Net.SecurityProtocolType]::Tls12 -bor `
-          [System.Net.SecurityProtocolType]::Tls11 -bor `
-          [System.Net.SecurityProtocolType]::Tls
-      } catch {}
-      $req = [System.Net.HttpWebRequest]::Create($path)
-      $req.Timeout = 8000
-      $req.ReadWriteTimeout = 8000
-      $req.UserAgent = 'Mozilla/5.0'
-      $resp = $req.GetResponse()
-      $ms = New-Object System.IO.MemoryStream
-      $resp.GetResponseStream().CopyTo($ms)
-      $resp.Close()
-      $ms.Position = 0
-      $decoder = New-Object System.Windows.Media.Imaging.GifBitmapDecoder(
-        $ms,
-        [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat,
-        [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
-    } else {
-      $local = $path -replace '^file:///?', ''   # accept file:// URLs as well as bare paths
-      if (-not (Test-Path -LiteralPath $local)) { return $null }
-      $uri = New-Object System.Uri((Resolve-Path -LiteralPath $local).ProviderPath)
-      $decoder = New-Object System.Windows.Media.Imaging.GifBitmapDecoder(
-        $uri,
-        [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat,
-        [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
-    }
+    $decoder = New-Object System.Windows.Media.Imaging.GifBitmapDecoder(
+      $stream,
+      [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat,
+      [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
     $count = $decoder.Frames.Count
     if ($count -le 0) { return $null }
-
     $fw = $decoder.Frames[0].PixelWidth
     $fh = $decoder.Frames[0].PixelHeight
     if ($fw -le 0 -or $fh -le 0) { return $null }
@@ -855,11 +831,6 @@ function Get-GifFrames($path) {
       } catch {}
       if ($delay -le 0) { $delay = 10 }   # delay is in centiseconds (1/100s)
 
-      # A full-canvas frame IS the complete image -> use the decoded frame directly.
-      # Only a partial (differenced) frame needs compositing over the previous one.
-      # CRITICAL: a RenderTargetBitmap per frame silently renders BLANK past a few
-      # dozen frames (and is slow + memory-heavy) -- that made long GIFs flash once
-      # then vanish. Raw frames avoid RTB entirely for the common full-frame case.
       $isFull = ($left -eq 0 -and $top -eq 0 -and $fr.PixelWidth -eq $fw -and $fr.PixelHeight -eq $fh)
       if ($isFull) {
         if ($fr.CanFreeze -and -not $fr.IsFrozen) { $fr.Freeze() }
@@ -880,37 +851,24 @@ function Get-GifFrames($path) {
       }
       [void]$delays.Add($delay)
     }
-    $pack = [pscustomobject]@{ frames = $frames; delays = $delays }
-  } catch { $pack = $null }
-  if ($pack) { $script:GifCache[$path] = $pack }   # cache successes only (transient failures can retry)
-  return $pack
+    return [pscustomobject]@{ frames = $frames; delays = $delays }
+  } catch { return $null }
 }
 
-# Reconcile the GIF window with the current overall state. Cheap no-op when the
-# target GIF path hasn't changed. -force reloads even if the path is unchanged
-# (used after the settings dialog edits paths).
-function Update-Gif([bool]$force = $false) {
-  if (-not $script:gifWindow) { return }
-  $want = if ($script:Gif.enabled) { [string]$script:Gif.paths[$script:OverallState] } else { '' }
-  if (-not $force -and $want -eq $script:GifCurrentPath) { return }
-  $script:GifCurrentPath = $want
+# Decode a GIF already present on disk (a file path or file:// URL). Local files are
+# read directly on the UI thread (no network), so no async download is needed.
+function Get-LocalGifPack($path) {
+  $local = $path -replace '^file:///?', ''
+  if (-not (Test-Path -LiteralPath $local)) { return $null }
+  $fs = $null
+  try {
+    $fs = [System.IO.File]::OpenRead((Resolve-Path -LiteralPath $local).ProviderPath)
+    return ConvertTo-GifPack $fs
+  } catch { return $null } finally { if ($fs) { $fs.Dispose() } }
+}
 
-  if ([string]::IsNullOrWhiteSpace($want)) {
-    $script:GifTimer.Stop(); $script:GifActive = $null
-    $script:GifImage.Source = $null
-    $script:gifWindow.Hide()
-    return
-  }
-
-  $pack = Get-GifFrames $want   # cached after first load -> instant on later switches
-  if (-not $pack) {
-    $script:GifTimer.Stop(); $script:GifActive = $null
-    $script:GifImage.Source = $null
-    $script:gifWindow.Hide()   # bad path / unloadable
-    return
-  }
-
-  # Re-point the shared timer at the (cached) frame pack and show frame 0.
+# Point the shared timer at a decoded pack and reveal the window.
+function Show-GifPack($pack) {
   $script:GifTimer.Stop()
   $script:GifActive = [pscustomobject]@{ frames = $pack.frames; delays = $pack.delays; idx = 0 }
   $script:GifImage.Source = $pack.frames[0]
@@ -919,6 +877,94 @@ function Update-Gif([bool]$force = $false) {
     $script:GifTimer.Interval = [TimeSpan]::FromMilliseconds([Math]::Max(20, [int]$pack.delays[0] * 10))
     $script:GifTimer.Start()
   }
+}
+
+function Hide-Gif {
+  $script:GifTimer.Stop(); $script:GifActive = $null
+  $script:GifImage.Source = $null
+  $script:gifWindow.Hide()
+}
+
+# Background downloader runspace: drains $GifQueue, fetching GIF bytes off the UI thread
+# (pure HTTP I/O, no WPF) so the overlay never blocks on a slow download. Writes the
+# resulting byte[] (or the string 'FAILED') into the synchronized $GifBytes map; the UI
+# thread decodes it on its next poll.
+$script:DlRunspace = [runspacefactory]::CreateRunspace()
+$script:DlRunspace.Open()
+$script:DlRunspace.SessionStateProxy.SetVariable('q', $script:GifQueue)
+$script:DlRunspace.SessionStateProxy.SetVariable('bytesMap', $script:GifBytes)
+$script:DlPs = [powershell]::Create()
+$script:DlPs.Runspace = $script:DlRunspace
+[void]$script:DlPs.AddScript({
+  try {
+    [System.Net.ServicePointManager]::SecurityProtocol =
+      [System.Net.SecurityProtocolType]::Tls12 -bor
+      [System.Net.SecurityProtocolType]::Tls11 -bor
+      [System.Net.SecurityProtocolType]::Tls
+  } catch {}
+  while ($true) {
+    $path = $null
+    try { if ($q.Count -gt 0) { $path = $q.Dequeue() } } catch {}
+    if (-not $path) { Start-Sleep -Milliseconds 120; continue }
+    if ($bytesMap.ContainsKey($path)) { continue }
+    try {
+      $req = [System.Net.HttpWebRequest]::Create($path)
+      $req.Timeout = 20000; $req.ReadWriteTimeout = 20000; $req.UserAgent = 'Mozilla/5.0'
+      $resp = $req.GetResponse()
+      $ms = New-Object System.IO.MemoryStream
+      $resp.GetResponseStream().CopyTo($ms)
+      $resp.Close()
+      $bytesMap[$path] = $ms.ToArray()
+    } catch { $bytesMap[$path] = 'FAILED' }
+  }
+})
+$script:DlHandle = $script:DlPs.BeginInvoke()
+
+# Fast poll so a freshly-downloaded GIF appears promptly (Update-Gif dedups to a cheap
+# no-op when nothing has changed).
+$gifPollTimer = New-Object System.Windows.Threading.DispatcherTimer
+$gifPollTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+$gifPollTimer.Add_Tick({ Update-Gif })
+$gifPollTimer.Start()
+
+# Reconcile the GIF window with the current overall state. Cheap no-op when the
+# target GIF path hasn't changed. -force reloads even if the path is unchanged
+# (used after the settings dialog edits paths).
+function Update-Gif([bool]$force = $false) {
+  if (-not $script:gifWindow) { return }
+  $want = if ($script:Gif.enabled) { [string]$script:Gif.paths[$script:OverallState] } else { '' }
+  if (-not $force -and $want -eq $script:GifShownPath) { return }
+
+  if ([string]::IsNullOrWhiteSpace($want)) { Hide-Gif; $script:GifShownPath = $want; return }
+
+  # Already decoded -> show instantly.
+  if ($script:GifCache.ContainsKey($want)) { Show-GifPack $script:GifCache[$want]; $script:GifShownPath = $want; return }
+
+  # Local file -> decode now (no network, fast).
+  if ($want -notmatch '^https?://') {
+    $pack = Get-LocalGifPack $want
+    if ($pack) { $script:GifCache[$want] = $pack; Show-GifPack $pack }
+    else { Hide-Gif }
+    $script:GifShownPath = $want
+    return
+  }
+
+  # Remote -> have the downloaded bytes arrived (from the background runspace)?
+  $b = $script:GifBytes[$want]
+  if ($b -is [byte[]]) {
+    $ms = New-Object System.IO.MemoryStream(, $b)
+    $pack = ConvertTo-GifPack $ms       # decode on UI thread (fast)
+    if ($pack) { $script:GifCache[$want] = $pack; Show-GifPack $pack }
+    else { Hide-Gif }                   # bytes weren't a valid GIF
+    $script:GifShownPath = $want
+    return
+  }
+  if ($b -eq 'FAILED') { Hide-Gif; $script:GifShownPath = $want; return }   # download failed; stop until state changes
+
+  # Bytes not here yet: enqueue the download once and LEAVE the current GIF on screen
+  # (no freeze, no flicker). Do NOT advance GifShownPath -> the next poll re-checks and
+  # shows it the instant the bytes arrive.
+  if (-not $script:GifQueued.ContainsKey($want)) { $script:GifQueued[$want] = $true; $script:GifQueue.Enqueue($want) }
 }
 
 # Lightweight settings dialog: per-state GIF paths + an enable toggle.
@@ -969,7 +1015,9 @@ function Show-GifSettings {
     $script:Gif.paths.needs_input = $nb.Text.Trim()
     $script:Gif.paths.idle        = $ib.Text.Trim()
     Save-UISettings
-    $script:GifCache.Clear()   # paths may have changed -> drop stale decodes; reload lazily
+    # Paths may have changed -> drop stale decodes + downloaded bytes so new paths reload.
+    $script:GifCache.Clear(); $script:GifBytes.Clear(); $script:GifQueued.Clear()
+    $script:GifShownPath = ''
     Update-Gif $true
     $w.Close()
   })
@@ -1056,9 +1104,13 @@ $pinTimer.Start()
 
 $Window.Add_Closed({
   $timer.Stop(); $followTimer.Stop(); $pinTimer.Stop(); $gifDesktopTimer.Stop()
+  if ($gifPollTimer) { $gifPollTimer.Stop() }
   if ($script:GifTimer) { $script:GifTimer.Stop() }
   $script:GifActive = $null
   if ($script:GifCache) { $script:GifCache.Clear() }
+  # Stop the background downloader runspace so it doesn't outlive the window.
+  try { if ($script:DlPs) { $script:DlPs.Stop(); $script:DlPs.Dispose() } } catch {}
+  try { if ($script:DlRunspace) { $script:DlRunspace.Close(); $script:DlRunspace.Dispose() } } catch {}
   try {
     if ($script:gifWindow) {
       $script:Gif.win.width  = $script:gifWindow.Width
