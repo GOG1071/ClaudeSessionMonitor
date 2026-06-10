@@ -855,31 +855,35 @@ function Get-GifFrames($path) {
       } catch {}
       if ($delay -le 0) { $delay = 10 }   # delay is in centiseconds (1/100s)
 
-      $dv = New-Object System.Windows.Media.DrawingVisual
-      $dc = $dv.RenderOpen()
-      if ($prev) { $dc.DrawImage($prev, (New-Object System.Windows.Rect(0, 0, $fw, $fh))) }
-      $dc.DrawImage($fr, (New-Object System.Windows.Rect($left, $top, $fr.PixelWidth, $fr.PixelHeight)))
-      $dc.Close()
-      $rtb = New-Object System.Windows.Media.Imaging.RenderTargetBitmap(
-        $fw, $fh, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
-      $rtb.Render($dv)
-      $rtb.Freeze()
-      [void]$frames.Add($rtb)
+      # A full-canvas frame IS the complete image -> use the decoded frame directly.
+      # Only a partial (differenced) frame needs compositing over the previous one.
+      # CRITICAL: a RenderTargetBitmap per frame silently renders BLANK past a few
+      # dozen frames (and is slow + memory-heavy) -- that made long GIFs flash once
+      # then vanish. Raw frames avoid RTB entirely for the common full-frame case.
+      $isFull = ($left -eq 0 -and $top -eq 0 -and $fr.PixelWidth -eq $fw -and $fr.PixelHeight -eq $fh)
+      if ($isFull) {
+        if ($fr.CanFreeze -and -not $fr.IsFrozen) { $fr.Freeze() }
+        [void]$frames.Add($fr)
+        $prev = $fr
+      } else {
+        $dv = New-Object System.Windows.Media.DrawingVisual
+        $dc = $dv.RenderOpen()
+        if ($prev) { $dc.DrawImage($prev, (New-Object System.Windows.Rect(0, 0, $fw, $fh))) }
+        $dc.DrawImage($fr, (New-Object System.Windows.Rect($left, $top, $fr.PixelWidth, $fr.PixelHeight)))
+        $dc.Close()
+        $rtb = New-Object System.Windows.Media.Imaging.RenderTargetBitmap(
+          $fw, $fh, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
+        $rtb.Render($dv)
+        $rtb.Freeze()
+        [void]$frames.Add($rtb)
+        $prev = $rtb
+      }
       [void]$delays.Add($delay)
-      $prev = $rtb
     }
     $pack = [pscustomobject]@{ frames = $frames; delays = $delays }
   } catch { $pack = $null }
   if ($pack) { $script:GifCache[$path] = $pack }   # cache successes only (transient failures can retry)
   return $pack
-}
-
-# Pre-decode every configured GIF up front so the FIRST switch to each state is instant.
-function Preload-Gifs {
-  foreach ($k in 'running', 'needs_input', 'idle') {
-    $p = [string]$script:Gif.paths[$k]
-    if (-not [string]::IsNullOrWhiteSpace($p)) { [void](Get-GifFrames $p) }
-  }
 }
 
 # Reconcile the GIF window with the current overall state. Cheap no-op when the
@@ -965,8 +969,7 @@ function Show-GifSettings {
     $script:Gif.paths.needs_input = $nb.Text.Trim()
     $script:Gif.paths.idle        = $ib.Text.Trim()
     Save-UISettings
-    $script:GifCache.Clear()   # paths may have changed -> drop stale decodes
-    Preload-Gifs
+    $script:GifCache.Clear()   # paths may have changed -> drop stale decodes; reload lazily
     Update-Gif $true
     $w.Close()
   })
@@ -1000,8 +1003,7 @@ $gifDesktopTimer.Start()
 
 # Initial render + refresh timer
 Update-List
-Preload-Gifs   # decode all configured GIFs once so state switches are instant
-Update-Gif
+Update-Gif   # lazy-loads the current state's GIF; cached + instant on later switches
 $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromSeconds(2)
 $timer.Add_Tick({ Update-List; Update-Gif })
