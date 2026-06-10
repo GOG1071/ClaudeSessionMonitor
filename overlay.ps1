@@ -263,11 +263,23 @@ function Save-Links {
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
                   FontSize="13" Cursor="Hand"/>
         </Grid>
-        <!-- Session list -->
-        <ItemsControl x:Name="List" Margin="8,2,8,10"/>
+        <!-- Session list (scrolls when rows exceed the dragged height cap) -->
+        <ScrollViewer x:Name="ListScroller" VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled" MaxHeight="600">
+          <ItemsControl x:Name="List" Margin="8,2,8,10"/>
+        </ScrollViewer>
       </DockPanel>
       <!-- Right-edge handle for horizontal resizing (below the header). -->
       <Thumb x:Name="ResizeGrip" HorizontalAlignment="Right" Width="6" Margin="0,34,0,0" Cursor="SizeWE">
+        <Thumb.Template>
+          <ControlTemplate TargetType="Thumb">
+            <Border Background="Transparent"/>
+          </ControlTemplate>
+        </Thumb.Template>
+      </Thumb>
+      <!-- Bottom-right corner handle for diagonal (width + height) resizing. -->
+      <Thumb x:Name="ResizeGripBR" HorizontalAlignment="Right" VerticalAlignment="Bottom"
+             Width="14" Height="14" Cursor="SizeNWSE">
         <Thumb.Template>
           <ControlTemplate TargetType="Thumb">
             <Border Background="Transparent"/>
@@ -287,13 +299,15 @@ $List       = $Window.FindName('List')
 $CloseBtn   = $Window.FindName('CloseBtn')
 $CountText  = $Window.FindName('CountText')
 $ResizeGrip = $Window.FindName('ResizeGrip')
+$ResizeGripBR = $Window.FindName('ResizeGripBR')
+$ListScroller = $Window.FindName('ListScroller')
 $OpacitySlider = $Window.FindName('OpacitySlider')
 $GifBtn     = $Window.FindName('GifBtn')
 $PinBtn     = $Window.FindName('PinBtn')
 
 # Persisted UI settings (width + opacity).
 $UISettingsFile = Join-Path $PSScriptRoot 'settings.json'
-$script:UI = @{ width = 340.0; opacity = 0.95; pinned = $true }
+$script:UI = @{ width = 340.0; opacity = 0.95; pinned = $true; listMaxHeight = 600.0 }
 
 # Per-state GIF config. Each path is user-configured (a local file path, or a
 # file:// / http(s) URL); an empty path means "no GIF for that state". The floating
@@ -309,6 +323,7 @@ if (Test-Path $UISettingsFile) {
     $cfg = Get-Content $UISettingsFile -Raw | ConvertFrom-Json
     if ($cfg.width)   { $script:UI.width   = [double]$cfg.width }
     if ($cfg.opacity) { $script:UI.opacity = [double]$cfg.opacity }
+    if ($cfg.listMaxHeight) { $script:UI.listMaxHeight = [double]$cfg.listMaxHeight }
     if ($null -ne $cfg.pinned) { $script:UI.pinned = [bool]$cfg.pinned }
     # GIF settings are additive: missing keys fall back to the defaults above.
     if ($null -ne $cfg.gifEnabled) { $script:Gif.enabled = [bool]$cfg.gifEnabled }
@@ -330,6 +345,7 @@ function Save-UISettings {
       width      = $Window.Width
       opacity    = $OpacitySlider.Value
       pinned     = $script:UI.pinned
+      listMaxHeight = $ListScroller.MaxHeight
       gifEnabled = $script:Gif.enabled
       gifPaths   = [pscustomobject]$script:Gif.paths
       gifWindow  = [pscustomobject]$script:Gif.win
@@ -339,6 +355,7 @@ function Save-UISettings {
 
 # Apply saved width + opacity.
 $Window.Width = [Math]::Max(240, [Math]::Min(1000, $script:UI.width))
+$ListScroller.MaxHeight = [Math]::Max(120, [Math]::Min(1200, $script:UI.listMaxHeight))
 $OpacitySlider.Value = [Math]::Max(0.25, [Math]::Min(1.0, $script:UI.opacity))
 $Window.Opacity = $OpacitySlider.Value
 $Window.Topmost = $script:UI.pinned   # honor persisted pin state from first paint
@@ -364,6 +381,15 @@ $ResizeGrip.Add_DragDelta({
   $Window.Width = [Math]::Max(240, [Math]::Min(1000, $w))
 })
 $ResizeGrip.Add_DragCompleted({ Save-UISettings })
+
+# Bottom-right corner grip -> diagonal resize (width + list height cap).
+$ResizeGripBR.Add_DragDelta({
+  $w = $Window.Width + $_.HorizontalChange
+  $Window.Width = [Math]::Max(240, [Math]::Min(1000, $w))
+  $h = $ListScroller.MaxHeight + $_.VerticalChange
+  $ListScroller.MaxHeight = [Math]::Max(120, [Math]::Min(1200, $h))
+})
+$ResizeGripBR.Add_DragCompleted({ Save-UISettings })
 
 # Capture the handle and make the overlay a no-activate window (never steals focus).
 $Window.Add_SourceInitialized({
@@ -999,6 +1025,10 @@ $script:gifPinned      = $false
 $script:GifBytes  = [hashtable]::Synchronized(@{})   # path -> byte[] OR 'FAILED'  (bg writes, UI reads)
 $script:GifQueue  = [System.Collections.Queue]::Synchronized((New-Object System.Collections.Queue))
 $script:GifQueued = @{}           # paths already enqueued this lifetime (UI thread only)
+# Transient-failure retry state: a remote download that returns 'FAILED' (e.g. a network
+# blip on tenor.com) is retried with capped backoff instead of hiding the GIF forever.
+$script:GifFailN  = @{}           # remote path -> consecutive download-failure count (UI thread only)
+$script:GifFailAt = @{}           # remote path -> earliest next retry time (UI thread only)
 
 [xml]$gifXaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -1208,6 +1238,8 @@ function Update-Gif([bool]$force = $false) {
   # Remote -> have the downloaded bytes arrived (from the background runspace)?
   $b = $script:GifBytes[$want]
   if ($b -is [byte[]]) {
+    # Success: clear any prior failure backoff for this path.
+    if ($script:GifFailN.ContainsKey($want)) { $script:GifFailN.Remove($want); $script:GifFailAt.Remove($want) }
     $ms = New-Object System.IO.MemoryStream(, $b)
     $pack = ConvertTo-GifPack $ms       # decode on UI thread (fast)
     if ($pack) { $script:GifCache[$want] = $pack; Show-GifPack $pack }
@@ -1215,7 +1247,25 @@ function Update-Gif([bool]$force = $false) {
     $script:GifShownPath = $want
     return
   }
-  if ($b -eq 'FAILED') { Hide-Gif; $script:GifShownPath = $want; return }   # download failed; stop until state changes
+  if ($b -eq 'FAILED') {
+    # Transient download failure: retry with capped backoff instead of giving up
+    # permanently. Leaves any currently-shown GIF on screen while we wait, and self-heals
+    # the moment the network recovers (no need for the overall state to change first).
+    $now = [DateTime]::UtcNow
+    $due = $script:GifFailAt[$want]
+    if (-not $due) {
+      $n = [int]$script:GifFailN[$want] + 1
+      $script:GifFailN[$want]  = $n
+      $script:GifFailAt[$want] = $now.AddMilliseconds([Math]::Min(60000, $n * 5000))  # 5s,10s,...,cap 60s
+      return
+    }
+    if ($now -lt $due) { return }       # still cooling down
+    # Backoff elapsed: drop the FAILED marker + queued flag so the next poll re-enqueues.
+    $script:GifFailAt.Remove($want)
+    [void]$script:GifBytes.Remove($want)
+    $script:GifQueued.Remove($want)
+    return
+  }
 
   # Bytes not here yet: enqueue the download once and LEAVE the current GIF on screen
   # (no freeze, no flicker). Do NOT advance GifShownPath -> the next poll re-checks and
@@ -1273,6 +1323,7 @@ function Show-GifSettings {
     Save-UISettings
     # Paths may have changed -> drop stale decodes + downloaded bytes so new paths reload.
     $script:GifCache.Clear(); $script:GifBytes.Clear(); $script:GifQueued.Clear()
+    $script:GifFailN.Clear(); $script:GifFailAt.Clear()
     $script:GifShownPath = ''
     Update-Gif $true
     $w.Close()
