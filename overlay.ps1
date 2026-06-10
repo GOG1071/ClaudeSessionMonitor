@@ -1,0 +1,699 @@
+# Claude Sessions Overlay
+# A frameless, always-on-top WPF overlay that shows every running Claude Code
+# session globally by reading ~/.claude/sessions/<pid>.json files.
+
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName WindowsBase
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+
+# Win32 helpers: enumerate top-level windows and focus one (restoring if minimized,
+# using AttachThreadInput to bypass the foreground lock).
+Add-Type @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public class WinInfo { public IntPtr Handle; public uint Pid; public string Title; }
+
+public static class WinTools {
+  delegate bool EnumProc(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr h);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool f);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr h, bool altTab);
+  [DllImport("user32.dll")] static extern bool SystemParametersInfo(uint a, uint b, ref uint c, uint d);
+  [DllImport("user32.dll")] static extern bool SystemParametersInfo(uint a, uint b, IntPtr c, uint d);
+  [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int i);
+  [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr h, int i, int v);
+  [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+
+  // Make the overlay a no-activate window so clicking it never steals foreground.
+  public static void SetNoActivate(IntPtr h) {
+    int ex = GetWindowLong(h, -20);            // GWL_EXSTYLE
+    SetWindowLong(h, -20, ex | 0x08000000);    // WS_EX_NOACTIVATE
+  }
+
+  public static WinInfo[] List() {
+    var res = new List<WinInfo>();
+    EnumWindows((h, l) => {
+      if (!IsWindowVisible(h)) return true;
+      int len = GetWindowTextLength(h);
+      if (len == 0) return true;
+      var sb = new StringBuilder(len + 1);
+      GetWindowText(h, sb, sb.Capacity);
+      uint pid; GetWindowThreadProcessId(h, out pid);
+      res.Add(new WinInfo { Handle = h, Pid = pid, Title = sb.ToString() });
+      return true;
+    }, IntPtr.Zero);
+    return res.ToArray();
+  }
+
+  const uint SPI_GETFOREGROUNDLOCKTIMEOUT = 0x2000;
+  const uint SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001;
+  const uint SPIF_SENDCHANGE = 0x0002;
+
+  public static void Focus(IntPtr h) {
+    if (h == IntPtr.Zero) return;
+    if (IsIconic(h)) ShowWindow(h, 9); // SW_RESTORE
+
+    // Disable the foreground lock for the duration of the call. Without this, once the
+    // overlay has given focus away it loses the right to call SetForegroundWindow and
+    // Windows silently blocks every later attempt (flashing the taskbar instead).
+    uint oldTimeout = 0;
+    SystemParametersInfo(SPI_GETFOREGROUNDLOCKTIMEOUT, 0, ref oldTimeout, 0);
+    SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, IntPtr.Zero, SPIF_SENDCHANGE);
+
+    IntPtr fg = GetForegroundWindow();
+    uint fgPid; uint fgThread = GetWindowThreadProcessId(fg, out fgPid);
+    uint cur = GetCurrentThreadId();
+    bool attached = (fgThread != cur) && AttachThreadInput(cur, fgThread, true);
+    BringWindowToTop(h);
+    SetForegroundWindow(h);
+    SwitchToThisWindow(h, true);   // Alt-Tab mechanism; reliably activates, ignores the lock
+    if (attached) AttachThreadInput(cur, fgThread, false);
+
+    // Restore the user's original foreground-lock setting.
+    SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, (IntPtr)(long)oldTimeout, SPIF_SENDCHANGE);
+  }
+}
+"@
+
+# Virtual-desktop "follow" support via the public, build-stable IVirtualDesktopManager.
+# We can't truly pin without undocumented per-build COM GUIDs, so instead we move the
+# overlay onto the current desktop whenever it gets left behind -> it follows you
+# everywhere, which is effectively "visible on all desktops".
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+
+[ComImport, Guid("a5cd92ff-29be-454c-8d04-d82879fb3f1b"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IVirtualDesktopManager {
+  [PreserveSig] int IsWindowOnCurrentVirtualDesktop(IntPtr w, out int onCur);
+  [PreserveSig] int GetWindowDesktopId(IntPtr w, out Guid id);
+  [PreserveSig] int MoveWindowToDesktop(IntPtr w, ref Guid id);
+}
+[ComImport, Guid("aa509086-5ca9-4c25-8f95-589d3c07b48a")] public class CVirtualDesktopManager { }
+
+public static class VD {
+  [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+  static IVirtualDesktopManager m;
+  public static bool Ready { get { return m != null; } }
+  static VD() { try { m = (IVirtualDesktopManager)new CVirtualDesktopManager(); } catch { m = null; } }
+
+  // If the overlay was left on another desktop, move it to the one the user is now on.
+  public static void Follow(IntPtr overlay) {
+    if (m == null || overlay == IntPtr.Zero) return;
+    int onCur;
+    if (m.IsWindowOnCurrentVirtualDesktop(overlay, out onCur) != 0) return;
+    if (onCur != 0) return;                       // already here
+    IntPtr fg = GetForegroundWindow();
+    if (fg == IntPtr.Zero || fg == overlay) return;
+    Guid id;
+    if (m.GetWindowDesktopId(fg, out id) != 0) return;
+    if (id == Guid.Empty) return;
+    try { m.MoveWindowToDesktop(overlay, ref id); } catch { }
+  }
+}
+"@
+
+# True Windows-side "show on all desktops": pin the window via the shell's internal
+# IVirtualDesktopPinnedApps. Once pinned, Windows itself keeps it on every desktop —
+# no polling. GUIDs/vtable below are for Windows 11 24H2/25H2 (build 261xx/262xx).
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+
+[ComImport, Guid("6D5140C1-7436-11CE-8034-00AA006009FA"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IServiceProvider10 {
+  [return: MarshalAs(UnmanagedType.IUnknown)] object QueryService(ref Guid service, ref Guid riid);
+}
+[ComImport, Guid("372E1D3B-38D3-42E4-A15B-8AB2B178F513"), InterfaceType(ComInterfaceType.InterfaceIsIInspectable)]
+public interface IApplicationView { }
+[ComImport, Guid("1841C6D7-4F9D-42C0-AF41-8747538F10E5"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IApplicationViewCollection {
+  int GetViews(out object array);
+  int GetViewsByZOrder(out object array);
+  int GetViewsByAppUserModelId(string id, out object array);
+  int GetViewForHwnd(IntPtr hwnd, out IApplicationView view);
+}
+[ComImport, Guid("4CE81583-1E4C-4632-A621-07A53543148F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IVirtualDesktopPinnedApps {
+  bool IsAppIdPinned(string appId);
+  void PinAppID(string appId);
+  void UnpinAppID(string appId);
+  bool IsViewPinned(IApplicationView view);
+  void PinView(IApplicationView view);
+  void UnpinView(IApplicationView view);
+}
+public static class Pinner {
+  static readonly Guid CLSID_ImmersiveShell = new Guid("C2F03A33-21F5-47FA-B4BB-156362A2F239");
+  static readonly Guid CLSID_VDPinnedApps   = new Guid("B5A399E7-1C87-46B8-88E9-FC5747B171BD");
+  static IServiceProvider10 Shell() {
+    return (IServiceProvider10)Activator.CreateInstance(Type.GetTypeFromCLSID(CLSID_ImmersiveShell));
+  }
+  static IApplicationViewCollection VC(IServiceProvider10 s) {
+    Guid a = typeof(IApplicationViewCollection).GUID; Guid b = a;
+    return (IApplicationViewCollection)s.QueryService(ref a, ref b);
+  }
+  static IVirtualDesktopPinnedApps PA(IServiceProvider10 s) {
+    Guid a = CLSID_VDPinnedApps; Guid b = typeof(IVirtualDesktopPinnedApps).GUID;
+    return (IVirtualDesktopPinnedApps)s.QueryService(ref a, ref b);
+  }
+  // Pin the window to all virtual desktops. Returns true if Windows now reports it pinned.
+  public static bool Pin(IntPtr hwnd) {
+    try {
+      var s = Shell(); var vc = VC(s);
+      IApplicationView view; int hr = vc.GetViewForHwnd(hwnd, out view);
+      if (hr != 0 || view == null) return false;
+      var pa = PA(s);
+      if (!pa.IsViewPinned(view)) pa.PinView(view);
+      return pa.IsViewPinned(view);
+    } catch { return false; }
+  }
+}
+"@
+
+$SessionsDir = Join-Path $env:USERPROFILE '.claude\sessions'
+$sep = [char]0x00B7   # middle dot, defined via char code so file encoding never mangles it
+
+# Persisted "links": sessionId -> terminal window handle, for sessions whose window
+# title can't be auto-matched (right-click a row to link it to the current terminal).
+$LinksFile = Join-Path $PSScriptRoot 'links.json'
+$script:Links = @{}
+if (Test-Path $LinksFile) {
+  try {
+    (Get-Content $LinksFile -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object {
+      $script:Links[$_.Name] = [int64]$_.Value
+    }
+  } catch {}
+}
+function Save-Links {
+  try {
+    $o = New-Object psobject
+    foreach ($k in $script:Links.Keys) { $o | Add-Member -NotePropertyName $k -NotePropertyValue $script:Links[$k] }
+    $o | ConvertTo-Json -Compress | Set-Content -Path $LinksFile -Encoding UTF8
+  } catch {}
+}
+
+[xml]$xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Claude Sessions" Width="340" SizeToContent="Height"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize"
+        WindowStartupLocation="Manual" Left="40" Top="40">
+  <Border CornerRadius="10" Background="#E6141414" BorderBrush="#33FFFFFF" BorderThickness="1">
+    <Border.Effect>
+      <DropShadowEffect BlurRadius="18" ShadowDepth="2" Opacity="0.5" Color="Black"/>
+    </Border.Effect>
+    <Grid>
+      <DockPanel Margin="0">
+        <!-- Header bar (drag handle) -->
+        <Grid DockPanel.Dock="Top" x:Name="Header" Background="#00000000" Height="34">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="Auto"/>
+          </Grid.ColumnDefinitions>
+          <TextBlock Grid.Column="0" Text="&#x25CF; Claude Sessions" Foreground="#FFE6A23C"
+                     FontFamily="Segoe UI Semibold" FontSize="12" VerticalAlignment="Center"
+                     Margin="12,0,0,0"/>
+          <Slider Grid.Column="1" x:Name="OpacitySlider" Minimum="0.25" Maximum="1.0" Value="0.95"
+                  Width="58" VerticalAlignment="Center" Margin="0,0,8,0"
+                  ToolTip="Window opacity" IsMoveToPointEnabled="True"/>
+          <TextBlock Grid.Column="2" x:Name="CountText" Text="" Foreground="#80FFFFFF"
+                     FontFamily="Segoe UI" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
+          <Button Grid.Column="3" x:Name="CloseBtn" Content="&#x2715;" Width="30" Height="30"
+                  Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
+                  FontSize="13" Cursor="Hand"/>
+        </Grid>
+        <!-- Session list -->
+        <ItemsControl x:Name="List" Margin="8,2,8,10"/>
+      </DockPanel>
+      <!-- Right-edge handle for horizontal resizing (below the header). -->
+      <Thumb x:Name="ResizeGrip" HorizontalAlignment="Right" Width="6" Margin="0,34,0,0" Cursor="SizeWE">
+        <Thumb.Template>
+          <ControlTemplate TargetType="Thumb">
+            <Border Background="Transparent"/>
+          </ControlTemplate>
+        </Thumb.Template>
+      </Thumb>
+    </Grid>
+  </Border>
+</Window>
+"@
+
+$reader = New-Object System.Xml.XmlNodeReader $xaml
+$Window = [Windows.Markup.XamlReader]::Load($reader)
+
+$Header     = $Window.FindName('Header')
+$List       = $Window.FindName('List')
+$CloseBtn   = $Window.FindName('CloseBtn')
+$CountText  = $Window.FindName('CountText')
+$ResizeGrip = $Window.FindName('ResizeGrip')
+$OpacitySlider = $Window.FindName('OpacitySlider')
+
+# Persisted UI settings (width + opacity).
+$UISettingsFile = Join-Path $PSScriptRoot 'settings.json'
+$script:UI = @{ width = 340.0; opacity = 0.95 }
+if (Test-Path $UISettingsFile) {
+  try {
+    $cfg = Get-Content $UISettingsFile -Raw | ConvertFrom-Json
+    if ($cfg.width)   { $script:UI.width   = [double]$cfg.width }
+    if ($cfg.opacity) { $script:UI.opacity = [double]$cfg.opacity }
+  } catch {}
+}
+function Save-UISettings {
+  try {
+    [pscustomobject]@{ width = $Window.Width; opacity = $OpacitySlider.Value } |
+      ConvertTo-Json -Compress | Set-Content -Path $UISettingsFile -Encoding UTF8
+  } catch {}
+}
+
+# Apply saved width + opacity.
+$Window.Width = [Math]::Max(240, [Math]::Min(1000, $script:UI.width))
+$OpacitySlider.Value = [Math]::Max(0.25, [Math]::Min(1.0, $script:UI.opacity))
+$Window.Opacity = $OpacitySlider.Value
+
+# Drag the window from the header — but not when interacting with the opacity slider.
+$Header.Add_MouseLeftButtonDown({
+  $el = $_.OriginalSource
+  while ($el) {
+    if ($el -eq $OpacitySlider) { return }
+    $el = if ($el -is [System.Windows.DependencyObject]) { [System.Windows.Media.VisualTreeHelper]::GetParent($el) } else { $null }
+  }
+  $Window.DragMove()
+})
+$CloseBtn.Add_Click({ $Window.Close() })
+
+# Opacity slider -> window opacity.
+$OpacitySlider.Add_ValueChanged({ $Window.Opacity = $_.NewValue })
+$OpacitySlider.Add_PreviewMouseUp({ Save-UISettings })
+
+# Right-edge grip -> horizontal resize.
+$ResizeGrip.Add_DragDelta({
+  $w = $Window.Width + $_.HorizontalChange
+  $Window.Width = [Math]::Max(240, [Math]::Min(1000, $w))
+})
+$ResizeGrip.Add_DragCompleted({ Save-UISettings })
+
+# Capture the handle and make the overlay a no-activate window (never steals focus).
+$Window.Add_SourceInitialized({
+  $script:overlayHwnd = (New-Object System.Windows.Interop.WindowInteropHelper $Window).Handle
+  if ($script:overlayHwnd -ne [IntPtr]::Zero) { [WinTools]::SetNoActivate($script:overlayHwnd) }
+})
+
+function Get-AliveProcessIds {
+  $set = @{}
+  foreach ($p in Get-Process -ErrorAction SilentlyContinue) { $set[$p.Id] = $true }
+  return $set
+}
+
+function Format-Age([long]$ms) {
+  if ($ms -le 0) { return 'now' }
+  $s = [int]($ms / 1000)
+  if ($s -lt 60)    { return "${s}s" }
+  $m = [int]($s / 60)
+  if ($m -lt 60)    { return "${m}m" }
+  $h = [int]($m / 60)
+  if ($h -lt 24)    { return "${h}h" }
+  $d = [int]($h / 24)
+  return "${d}d"
+}
+
+# Read a session's transcript tail and summarise what it's currently doing.
+# Cached per session keyed on updatedAt, so idle sessions aren't re-parsed every tick.
+$script:ActivityCache = @{}
+function Get-SessionActivity($cwd, $sessionId, $updatedAt) {
+  if (-not $sessionId -or -not $cwd) { return '' }
+  $cached = $script:ActivityCache[$sessionId]
+  if ($cached -and $cached.upd -eq $updatedAt) { return $cached.text }
+
+  $enc  = ($cwd -replace '[^A-Za-z0-9]', '-')
+  $path = Join-Path $env:USERPROFILE ".claude\projects\$enc\$sessionId.jsonl"
+  $text = ''
+  if (Test-Path $path) {
+    try {
+      $lastUser = ''; $lastAsst = ''; $lastTool = ''
+      foreach ($ln in (Get-Content -Path $path -Tail 80 -Encoding UTF8 -ErrorAction Stop)) {
+        if ([string]::IsNullOrWhiteSpace($ln)) { continue }
+        try { $d = $ln | ConvertFrom-Json } catch { continue }
+        $m = $d.message
+        if (-not $m) { continue }
+        $c = $m.content
+        if ($m.role -eq 'user') {
+          $t = $null
+          if ($c -is [string]) { $t = $c }
+          elseif ($c) { foreach ($b in $c) { if ($b.type -eq 'text') { $t = $b.text; break } } }
+          if ($t -and -not $t.StartsWith('<') -and -not $t.StartsWith('Caveat') -and $t -notmatch 'tool_result') { $lastUser = $t }
+        }
+        elseif ($m.role -eq 'assistant' -and $c) {
+          foreach ($b in $c) {
+            if ($b.type -eq 'text' -and "$($b.text)".Trim()) { $lastAsst = $b.text }
+            elseif ($b.type -eq 'tool_use') { $lastTool = $b.name }
+          }
+        }
+      }
+      $text = if ($lastAsst) { $lastAsst } elseif ($lastUser) { $lastUser } elseif ($lastTool) { "running $lastTool" } else { '' }
+      $text = ($text -replace '\s+', ' ').Trim()
+      if ($text.Length -gt 200) { $text = $text.Substring(0, 200) }
+    } catch {}
+  }
+  $script:ActivityCache[$sessionId] = @{ upd = $updatedAt; text = $text }
+  return $text
+}
+
+# Score how well a Windows Terminal tab/window title identifies a session.
+# Returns 100 when the title contains the exact folder name at a word boundary,
+# else 0. The boundary guard is essential: "Foo_IdleRPG" must NOT match the window
+# of "Foo_IdleRPG2". A 0 means no identifying signal (e.g. generic "Claude Code").
+function Get-TitleScore($title, $folder) {
+  if ([string]::IsNullOrWhiteSpace($title) -or [string]::IsNullOrWhiteSpace($folder)) { return 0 }
+  $t = $title.ToLower()
+  $f = [regex]::Escape($folder.ToLower())
+  if ($t -match "(?<![a-z0-9])$f(?![a-z0-9])") { return 100 }
+  return 0
+}
+
+function Test-LiveWindow($h) {
+  foreach ($w in [WinTools]::List()) { if ($w.Handle -eq $h) { return $true } }
+  return $false
+}
+
+# Briefly tint a row (red = failure, green = linked), then restore.
+function Show-RowFlash($row, $hex) {
+  $row.Background = [Windows.Media.BrushConverter]::new().ConvertFrom($hex)
+  $ft = New-Object System.Windows.Threading.DispatcherTimer
+  $ft.Interval = [TimeSpan]::FromMilliseconds(700)
+  $ft.Add_Tick({
+    $row.Background = [Windows.Media.BrushConverter]::new().ConvertFrom('#1AFFFFFF')
+    $this.Stop()
+  }.GetNewClosure())
+  $ft.Start()
+}
+
+# Resolve and focus the terminal for a session.
+#   $cwd       disambiguates Windows Terminal windows/tabs by title.
+#   $sessionId looks up a user-created link (right-click) when the title can't be matched.
+function Focus-Session($sessionPid, $cwd, $sessionId) {
+  $sessionPid = [int]$sessionPid
+  $folder = if ($cwd) { Split-Path $cwd -Leaf } else { '' }
+
+  # Prefer an explicit user link if it still points to a live window.
+  if ($sessionId -and $script:Links.ContainsKey($sessionId)) {
+    $lh = [IntPtr]([int64]$script:Links[$sessionId])
+    if ((Test-LiveWindow $lh)) { [WinTools]::Focus($lh); return $true }
+    $script:Links.Remove($sessionId); Save-Links            # stale -> forget it
+  }
+
+  # Build a child -> parent process map and a pid -> name map once.
+  $parent = @{}; $pname = @{}
+  foreach ($pr in Get-CimInstance Win32_Process -ErrorAction SilentlyContinue) {
+    $parent[[int]$pr.ProcessId] = [int]$pr.ParentProcessId
+    $pname[[int]$pr.ProcessId] = "$($pr.Name)"
+  }
+
+  # Ancestor chain of the session (incl. itself).
+  $anc = @{}; $c = $sessionPid; $g = 0
+  $isWT = $false
+  while ($c -gt 0 -and -not $anc.ContainsKey($c) -and $g -lt 24) {
+    $anc[$c] = $true
+    if ($pname[$c] -eq 'WindowsTerminal.exe') { $isWT = $true }
+    $c = if ($parent.ContainsKey($c)) { $parent[$c] } else { 0 }
+    $g++
+  }
+
+  # --- Non-Windows-Terminal terminals: process tree is reliable (one window per console). ---
+  if (-not $isWT) {
+    $match = [IntPtr]::Zero
+    foreach ($w in [WinTools]::List()) {
+      $wp = [int]$w.Pid
+      if ($anc.ContainsKey($wp)) { $match = $w.Handle; break }   # window owned by an ancestor
+      $cc = $wp; $gg = 0                                          # or by a descendant (legacy conhost)
+      while ($cc -gt 0 -and $gg -lt 24) {
+        if ($cc -eq $sessionPid) { $match = $w.Handle; break }
+        $cc = if ($parent.ContainsKey($cc)) { $parent[$cc] } else { 0 }
+        $gg++
+      }
+      if ($match -ne [IntPtr]::Zero) { break }
+    }
+    if ($match -ne [IntPtr]::Zero) { [WinTools]::Focus($match); return $true }
+    return $false
+  }
+
+  # --- Windows Terminal: one process hosts every window+tab. Win32 EnumWindows sees
+  # every WT window (incl. minimized / other virtual desktop) which UIA's RootElement
+  # children query misses, so enumerate windows there and match by title. ---
+  $wtPidSet = @{}
+  foreach ($p in (Get-Process WindowsTerminal -ErrorAction SilentlyContinue)) { $wtPidSet[[int]$p.Id] = $true }
+
+  $cands = @()
+  foreach ($w in [WinTools]::List()) { if ($wtPidSet.ContainsKey([int]$w.Pid)) { $cands += $w } }
+
+  $best = $null; $bestScore = 0
+  foreach ($w in $cands) {
+    $s = Get-TitleScore $w.Title $folder
+    if ($s -gt $bestScore) { $bestScore = $s; $best = $w }
+  }
+
+  # Confident match: window title identifies the folder (>=30 = strong token overlap).
+  if ($best -and $bestScore -ge 30) {
+    [WinTools]::Focus($best.Handle)
+    Select-WTTabInWindow $best.Handle $folder    # drill into the right tab if multi-tab
+    return $true
+  }
+  # Exactly one WT window total -> unambiguous.
+  if ($cands.Count -eq 1) { [WinTools]::Focus($cands[0].Handle); return $true }
+
+  # Can't identify it (e.g. a generic "Claude Code" title shared by idle sessions).
+  # Refuse to guess and jump to the wrong window.
+  return $false
+}
+
+# Within an already-matched WT window, select the tab whose title best fits the folder.
+function Select-WTTabInWindow($hwnd, $folder) {
+  try {
+    $el = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$hwnd)
+    if (-not $el) { return }
+    $tabType = New-Object System.Windows.Automation.PropertyCondition(
+      [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+      [System.Windows.Automation.ControlType]::TabItem)
+    $tabs = $el.FindAll([System.Windows.Automation.TreeScope]::Descendants, $tabType)
+    if ($tabs.Count -le 1) { return }
+    $bt = $null; $bs = 0
+    foreach ($t in $tabs) {
+      $s = Get-TitleScore $t.Current.Name $folder
+      if ($s -gt $bs) { $bs = $s; $bt = $t }
+    }
+    if ($bt -and $bs -gt 0) {
+      $sip = $bt.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+      [void]$sip.Select()
+    }
+  } catch {}
+}
+
+function New-Row($session) {
+  $border = New-Object System.Windows.Controls.Border
+  $border.CornerRadius = '7'
+  $border.Margin = '0,3,0,0'
+  $border.Padding = '10,7,10,7'
+  $border.Background = [Windows.Media.BrushConverter]::new().ConvertFrom('#1AFFFFFF')
+
+  # Left-click focuses the session's terminal; right-click links it to the current terminal.
+  $border.Tag = [pscustomobject]@{ Pid = $session.pid; Cwd = $session.cwd; SessionId = $session.sessionId }
+  $border.Cursor = 'Hand'
+  if ($session.tip) { $border.ToolTip = $session.tip }
+
+  $border.Add_MouseLeftButtonUp({
+    $t = $this.Tag
+    if ($t -and $t.Pid) {
+      $ok = Focus-Session $t.Pid $t.Cwd $t.SessionId
+      if (-not $ok) { Show-RowFlash $this '#55F56C6C' }   # red: couldn't locate; right-click to link
+    }
+  })
+
+  # Right-click: link this session to whatever terminal is currently focused.
+  # (The overlay is no-activate, so the foreground window is the terminal you came from.)
+  $border.Add_MouseRightButtonUp({
+    $t = $this.Tag
+    if ($t -and $t.SessionId) {
+      $fg = [WinTools]::GetForegroundWindow()
+      if ($fg -ne [IntPtr]::Zero -and $fg -ne $script:overlayHwnd) {
+        $script:Links[$t.SessionId] = $fg.ToInt64()
+        Save-Links
+        Show-RowFlash $this '#5567C23A'                   # green: linked
+      } else {
+        Show-RowFlash $this '#55F56C6C'
+      }
+    }
+  })
+
+  $border.Add_MouseEnter({ $this.Background = [Windows.Media.BrushConverter]::new().ConvertFrom('#33FFFFFF') })
+  $border.Add_MouseLeave({ $this.Background = [Windows.Media.BrushConverter]::new().ConvertFrom('#1AFFFFFF') })
+
+  $grid = New-Object System.Windows.Controls.Grid
+  $c0 = New-Object System.Windows.Controls.ColumnDefinition; $c0.Width = 'Auto'
+  $c1 = New-Object System.Windows.Controls.ColumnDefinition; $c1.Width = '*'
+  $c2 = New-Object System.Windows.Controls.ColumnDefinition; $c2.Width = 'Auto'
+  $grid.ColumnDefinitions.Add($c0)
+  $grid.ColumnDefinitions.Add($c1)
+  $grid.ColumnDefinitions.Add($c2)
+
+  # status dot color
+  switch ($session.color) {
+    'busy'  { $dot = '#FF67C23A' }   # green = actively working
+    'idle'  { $dot = '#FF909399' }   # gray = waiting
+    'stale' { $dot = '#FFF56C6C' }   # red = process gone
+    default { $dot = '#FFE6A23C' }
+  }
+
+  $ell = New-Object System.Windows.Shapes.Ellipse
+  $ell.Width = 9; $ell.Height = 9
+  $ell.VerticalAlignment = 'Center'
+  $ell.Margin = '0,0,9,0'
+  $ell.Fill = [Windows.Media.BrushConverter]::new().ConvertFrom($dot)
+  [Windows.Controls.Grid]::SetColumn($ell, 0)
+
+  $stack = New-Object System.Windows.Controls.StackPanel
+  [Windows.Controls.Grid]::SetColumn($stack, 1)
+
+  $name = New-Object System.Windows.Controls.TextBlock
+  $name.FontFamily = 'Segoe UI Semibold'
+  $name.FontSize = 12
+  $name.TextTrimming = 'CharacterEllipsis'
+  $runName = New-Object System.Windows.Documents.Run $session.name
+  $runName.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#FFFFFFFF')
+  $runPid = New-Object System.Windows.Documents.Run "  $($session.pid)"
+  $runPid.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#80FFFFFF')
+  $runPid.FontFamily = 'Segoe UI'
+  $runPid.FontSize = 11
+  $name.Inlines.Add($runName)
+  $name.Inlines.Add($runPid)
+
+  $sub = New-Object System.Windows.Controls.TextBlock
+  $sub.Text = $session.sub
+  $sub.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#80FFFFFF')
+  $sub.FontFamily = 'Segoe UI'
+  $sub.FontSize = 10
+  $sub.TextTrimming = 'CharacterEllipsis'
+
+  $stack.Children.Add($name) | Out-Null
+  $stack.Children.Add($sub)  | Out-Null
+
+  $age = New-Object System.Windows.Controls.TextBlock
+  $age.Text = $session.age
+  $age.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#66FFFFFF')
+  $age.FontFamily = 'Segoe UI'
+  $age.FontSize = 10
+  $age.VerticalAlignment = 'Center'
+  $age.Margin = '8,0,0,0'
+  [Windows.Controls.Grid]::SetColumn($age, 2)
+
+  $grid.Children.Add($ell)   | Out-Null
+  $grid.Children.Add($stack) | Out-Null
+  $grid.Children.Add($age)   | Out-Null
+  $border.Child = $grid
+  return $border
+}
+
+function Update-List {
+  $List.Items.Clear()
+  if (-not (Test-Path $SessionsDir)) {
+    $CountText.Text = '0'
+    return
+  }
+  $alive = Get-AliveProcessIds
+  $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  $rows = @()
+
+  foreach ($file in Get-ChildItem -Path $SessionsDir -Filter '*.json' -ErrorAction SilentlyContinue) {
+    try { $s = Get-Content $file.FullName -Raw | ConvertFrom-Json } catch { continue }
+    if (-not $s.pid) { continue }
+
+    $isAlive = $alive.ContainsKey([int]$s.pid)
+    $proj = if ($s.cwd) { Split-Path $s.cwd -Leaf } else { 'unknown' }
+    if ([string]::IsNullOrWhiteSpace($proj)) { $proj = $s.cwd }
+
+    if (-not $isAlive) {
+      $color = 'stale'; $statusTxt = 'ended'
+    } else {
+      $color = $s.status
+      $statusTxt = $s.status
+    }
+
+    $age = Format-Age ($now - [long]$s.updatedAt)
+
+    $activity = if ($isAlive) { Get-SessionActivity $s.cwd $s.sessionId $s.updatedAt } else { '' }
+    $sub = if ($activity) { $activity } else { "$statusTxt $sep pid $($s.pid)" }
+    $tip = "pid $($s.pid) $sep v$($s.version) $sep $statusTxt`n$($s.cwd)" + $(if ($activity) { "`n`n$activity" } else { '' })
+
+    $rows += [pscustomobject]@{
+      pid       = [int]$s.pid
+      cwd       = "$($s.cwd)"
+      sessionId = "$($s.sessionId)"
+      name   = $proj
+      sub    = $sub
+      tip    = $tip
+      age    = $age
+      color  = $color
+      alive  = $isAlive
+      busy   = ($s.status -eq 'busy')
+      upd    = [long]$s.updatedAt
+    }
+  }
+
+  # Sort: busy first, then alive, then most recently updated
+  $rows = $rows | Sort-Object @{e={ -([int]$_.busy) }}, @{e={ -([int]$_.alive) }}, @{e={ -$_.upd }}
+
+  foreach ($r in $rows) { $List.Items.Add((New-Row $r)) | Out-Null }
+
+  $aliveCount = ($rows | Where-Object { $_.alive }).Count
+  $busyCount  = ($rows | Where-Object { $_.busy -and $_.alive }).Count
+  $CountText.Text = "$aliveCount active" + $(if ($busyCount) { " $sep $busyCount busy" } else { '' })
+}
+
+# Initial render + refresh timer
+Update-List
+$timer = New-Object System.Windows.Threading.DispatcherTimer
+$timer.Interval = [TimeSpan]::FromSeconds(2)
+$timer.Add_Tick({ Update-List })
+$timer.Start()
+
+# Show on all desktops. Primary: ask Windows to pin the window (Windows-side, no
+# polling). Fallback: if pinning isn't available, a light timer keeps the overlay on
+# the active desktop so it still follows you everywhere.
+$script:overlayHwnd = [IntPtr]::Zero
+$script:pinned = $false
+
+$followTimer = New-Object System.Windows.Threading.DispatcherTimer
+$followTimer.Interval = [TimeSpan]::FromMilliseconds(350)
+$followTimer.Add_Tick({
+  if ($script:overlayHwnd -ne [IntPtr]::Zero) { [VD]::Follow($script:overlayHwnd) }
+})
+
+# One-shot pin, fired ~600ms after show so the shell has registered the window as a view.
+$pinTimer = New-Object System.Windows.Threading.DispatcherTimer
+$pinTimer.Interval = [TimeSpan]::FromMilliseconds(600)
+$pinTimer.Add_Tick({
+  $pinTimer.Stop()
+  $script:overlayHwnd = (New-Object System.Windows.Interop.WindowInteropHelper $Window).Handle
+  if ($script:overlayHwnd -ne [IntPtr]::Zero) { $script:pinned = [Pinner]::Pin($script:overlayHwnd) }
+  if (-not $script:pinned) { $followTimer.Start() }   # Windows-side pin unavailable -> follow
+})
+$pinTimer.Start()
+
+$Window.Add_Closed({ $timer.Stop(); $followTimer.Stop(); $pinTimer.Stop() })
+[void]$Window.ShowDialog()

@@ -1,0 +1,6 @@
+# Local runtime state (per-machine, not meant to be shared)
+settings.json
+links.json
+_*.ps1
+_*.txt
+_vendor/
