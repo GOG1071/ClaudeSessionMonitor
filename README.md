@@ -3,6 +3,10 @@
 A lightweight, always-on-top Windows overlay that shows every running Claude Code
 session globally — across all terminals, projects, and virtual desktops.
 
+> **Setting up on a new machine?** See [INSTALL.md](INSTALL.md) — it covers the one
+> step that isn't in the repo: registering the `needs_input` attention hook in
+> `~/.claude/settings.json`.
+
 ## Features
 
 - **Live session list** — reads `~/.claude/sessions/<pid>.json` and refreshes every 2s.
@@ -62,8 +66,15 @@ for it. The floating GIF window only appears when the current state has a GIF co
 
 - Drag the GIF window anywhere to move it; drag its bottom-right corner to resize. Position
   and size persist across restarts.
-- The state set maps directly from each session's reported status: `busy` → **running**,
-  `needs_input` → **needs input**, everything else → **idle**. Dead-process sessions are ignored.
+- Busy and idle map directly from each session's native status (`busy` → **running**,
+  otherwise → **idle**). Dead-process sessions are ignored.
+- **Needs-input requires the attention hook.** Claude Code's native `~/.claude/sessions`
+  files only ever report `busy`/`idle` — never `needs_input` — so the *waiting-for-you* state
+  comes from `scripts/session-attention.cjs`, wired into `~/.claude/settings.json` as a
+  `Notification` hook (writes a marker when Claude needs input) and a `UserPromptSubmit` hook
+  (clears it when you reply). The overlay shows **needs input** for any alive, non-busy session
+  that has a marker; markers are reaped automatically when the session goes busy or ends. Without
+  these hooks installed, sessions only ever show running/idle.
 - GIFs are decoded and animated natively (no external dependencies). For best results use GIFs
   with a transparent background — the window itself is transparent and always-on-top, and shows
   on every virtual desktop like the main overlay.

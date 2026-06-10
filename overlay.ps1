@@ -197,6 +197,10 @@ public static class Pinner {
 "@
 
 $SessionsDir = Join-Path $env:USERPROFILE '.claude\sessions'
+# needs_input markers written by scripts\session-attention.cjs (Notification hook).
+# The native session JSON only ever carries busy/idle, so this sidecar is the sole
+# source for the "Claude is waiting for the user" state.
+$AttentionDir = Join-Path $env:USERPROFILE '.claude\session-attention'
 $sep = [char]0x00B7   # middle dot, defined via char code so file encoding never mangles it
 
 # Persisted "links": sessionId -> terminal window handle, for sessions whose window
@@ -633,7 +637,7 @@ function Get-RowTint($color) {
     'needs_input' { return @{ base = '#38D29922'; hover = '#57D29922' } }   # yellow = waiting for input
     'stale'       { return @{ base = '#33F85149'; hover = '#52F85149' } }   # red    = process ended
     'idle'        { return @{ base = '#386E7681'; hover = '#576E7681' } }   # gray   = idle
-    default       { return @{ base = '#386E7681'; hover = '#576E7681' } }
+    default       { return @{ base = '#386E7681'; hover = '#57D29922' } }
   }
 }
 
@@ -826,6 +830,7 @@ function Update-List {
   $alive = Get-AliveProcessIds
   $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
   $rows = @()
+  $nativeSids = @{}   # sessionIds seen this tick, for reaping orphaned attention markers
 
   foreach ($file in Get-ChildItem -Path $SessionsDir -Filter '*.json' -ErrorAction SilentlyContinue) {
     try { $s = Get-Content $file.FullName -Raw | ConvertFrom-Json } catch { continue }
@@ -840,6 +845,26 @@ function Update-List {
     } else {
       $color = $s.status
       $statusTxt = $s.status
+    }
+
+    # needs_input is a refinement of the idle state. The native session file only ever
+    # carries busy/idle; the Notification hook (scripts\session-attention.cjs) drops a
+    # marker when Claude is waiting for the user. Show needs_input when an ALIVE session
+    # is NOT busy and has a marker. We deliberately do NOT compare timestamps: the native
+    # updatedAt is a heartbeat that keeps advancing while a session runs (verified), so a
+    # "marker newer than updatedAt" test would be raced by the heartbeat. The rule is
+    # purely state-based — a busy (working) or dead session can't need input, so its
+    # marker is reaped on sight, which also self-heals a missed `clear`.
+    if ($s.sessionId) {
+      $nativeSids[$s.sessionId] = $true
+      $mk = Join-Path $AttentionDir "$($s.sessionId).json"
+      if (Test-Path $mk) {
+        if ($isAlive -and $s.status -ne 'busy') {
+          $color = 'needs_input'; $statusTxt = 'needs input'
+        } else {
+          Remove-Item $mk -ErrorAction SilentlyContinue   # busy or dead: can't need input
+        }
+      }
     }
 
     $age = Format-Age ($now - [long]$s.updatedAt)
@@ -895,6 +920,15 @@ function Update-List {
       tokTxt = $tokTxt
       tokTip = $tokTip
       total  = $total
+    }
+  }
+
+  # Reap orphaned attention markers whose native session file is gone entirely (the
+  # per-row reap above only covers sessions still present in $SessionsDir). Keeps
+  # ~/.claude/session-attention from growing without bound across many sessions.
+  if (Test-Path $AttentionDir) {
+    foreach ($mf in Get-ChildItem -Path $AttentionDir -Filter '*.json' -ErrorAction SilentlyContinue) {
+      if (-not $nativeSids.ContainsKey($mf.BaseName)) { Remove-Item $mf.FullName -ErrorAction SilentlyContinue }
     }
   }
 
