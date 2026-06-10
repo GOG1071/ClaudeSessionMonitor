@@ -773,16 +773,34 @@ $script:gifWindow.Add_SizeChanged({
 function New-GifAnimator($image, $path) {
   try {
     if ([string]::IsNullOrWhiteSpace($path)) { return $null }
-    if ($path -match '^[a-zA-Z][a-zA-Z0-9+.-]*://') {
-      $uri = New-Object System.Uri($path)
+    $decoder = $null
+    if ($path -match '^https?://') {
+      # Remote GIF: WPF's remote-URI decode is unreliable (async/TLS), so download
+      # the bytes ourselves and decode from a memory stream. Force modern TLS and a
+      # UA string so CDNs (e.g. tenor) serve the file.
+      try {
+        [System.Net.ServicePointManager]::SecurityProtocol = `
+          [System.Net.SecurityProtocolType]::Tls12 -bor `
+          [System.Net.SecurityProtocolType]::Tls11 -bor `
+          [System.Net.SecurityProtocolType]::Tls
+      } catch {}
+      $wc = New-Object System.Net.WebClient
+      $wc.Headers.Add('User-Agent', 'Mozilla/5.0')
+      $bytes = $wc.DownloadData($path)
+      $ms = New-Object System.IO.MemoryStream(,$bytes)
+      $decoder = New-Object System.Windows.Media.Imaging.GifBitmapDecoder(
+        $ms,
+        [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat,
+        [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
     } else {
-      if (-not (Test-Path -LiteralPath $path)) { return $null }
-      $uri = New-Object System.Uri((Resolve-Path -LiteralPath $path).Path)
+      $local = $path -replace '^file:///?', ''   # accept file:// URLs as well as bare paths
+      if (-not (Test-Path -LiteralPath $local)) { return $null }
+      $uri = New-Object System.Uri((Resolve-Path -LiteralPath $local).ProviderPath)
+      $decoder = New-Object System.Windows.Media.Imaging.GifBitmapDecoder(
+        $uri,
+        [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat,
+        [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
     }
-    $decoder = New-Object System.Windows.Media.Imaging.GifBitmapDecoder(
-      $uri,
-      [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat,
-      [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
     $count = $decoder.Frames.Count
     if ($count -le 0) { return $null }
 
@@ -909,6 +927,18 @@ function Show-GifSettings {
     Save-UISettings
     Update-Gif $true
     $w.Close()
+  }.GetNewClosure())
+  # The overlay is a no-activate window, so a modal opened from it gets MOUSE clicks
+  # but not KEYBOARD focus (typed text would go to the terminal). Force this dialog to
+  # the foreground using the same AttachThreadInput trick the overlay uses elsewhere,
+  # then drop the caret into the first field so typing works immediately.
+  $w.Add_Loaded({
+    try {
+      $hh = (New-Object System.Windows.Interop.WindowInteropHelper $w).Handle
+      if ($hh -ne [IntPtr]::Zero) { [WinTools]::Focus($hh) }
+    } catch {}
+    $rb.Focus() | Out-Null
+    [System.Windows.Input.Keyboard]::Focus($rb) | Out-Null
   }.GetNewClosure())
   [void]$w.ShowDialog()
 }
