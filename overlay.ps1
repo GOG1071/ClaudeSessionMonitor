@@ -729,8 +729,9 @@ function Update-List {
 # floating window that shows a different animated GIF per overall Claude state.
 # ---------------------------------------------------------------------------
 $script:OverallState   = 'idle'
-$script:GifAnim        = $null   # current frame-animator controller
-$script:GifCurrentPath = ''      # path currently loaded (avoids needless reloads)
+$script:GifCurrentPath = ''      # path currently displayed (avoids needless reloads)
+$script:GifCache       = @{}     # path -> @{ frames; delays }, decoded once and reused
+$script:GifActive      = $null   # @{ frames; delays; idx } currently animating
 $script:gifHwnd        = [IntPtr]::Zero
 $script:gifPinned      = $false
 
@@ -780,29 +781,46 @@ $script:gifWindow.Add_SizeChanged({
   if ($script:gifWindow.IsVisible) { Save-UISettings }
 })
 
-# Build a looping frame animator for a GIF. Zero external deps: GifBitmapDecoder
-# decodes frames, each frame is composited over the previous one (so frame-
-# differenced GIFs render correctly), and a DispatcherTimer cycles them honoring
-# each frame's own delay metadata. Returns a controller with a .timer field, or
-# $null when the path is empty/unreadable/not a GIF.
-function New-GifAnimator($image, $path) {
+# Single shared animation timer: advances whichever decoded frame pack is active.
+# One timer (instead of one-per-load) means a state switch only re-points it at the
+# cached frames — no timer churn, no leaks, no re-decode.
+$script:GifTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:GifTimer.Add_Tick({
+  $a = $script:GifActive
+  if (-not $a -or $a.frames.Count -le 1) { $script:GifTimer.Stop(); return }
+  $a.idx = ($a.idx + 1) % $a.frames.Count
+  $script:GifImage.Source = $a.frames[$a.idx]
+  $script:GifTimer.Interval = [TimeSpan]::FromMilliseconds([Math]::Max(20, [int]$a.delays[$a.idx] * 10))
+})
+
+# Decode + composite a GIF into reusable frozen frames, CACHED BY PATH so each unique
+# GIF is downloaded/decoded only ONCE. The heavy work (network + per-frame composite)
+# happens here; caching is what keeps state switches instant and stops the GIF lagging
+# behind the live state. Returns @{ frames; delays } or $null (empty/unreadable/not a GIF).
+function Get-GifFrames($path) {
+  if ([string]::IsNullOrWhiteSpace($path)) { return $null }
+  if ($script:GifCache.ContainsKey($path)) { return $script:GifCache[$path] }
+  $pack = $null
   try {
-    if ([string]::IsNullOrWhiteSpace($path)) { return $null }
     $decoder = $null
     if ($path -match '^https?://') {
-      # Remote GIF: WPF's remote-URI decode is unreliable (async/TLS), so download
-      # the bytes ourselves and decode from a memory stream. Force modern TLS and a
-      # UA string so CDNs (e.g. tenor) serve the file.
+      # Remote GIF: WPF's remote-URI decode is unreliable, so download the bytes (with
+      # an 8s timeout so a dead URL can't freeze the UI) and decode from a memory stream.
       try {
         [System.Net.ServicePointManager]::SecurityProtocol = `
           [System.Net.SecurityProtocolType]::Tls12 -bor `
           [System.Net.SecurityProtocolType]::Tls11 -bor `
           [System.Net.SecurityProtocolType]::Tls
       } catch {}
-      $wc = New-Object System.Net.WebClient
-      $wc.Headers.Add('User-Agent', 'Mozilla/5.0')
-      $bytes = $wc.DownloadData($path)
-      $ms = New-Object System.IO.MemoryStream(,$bytes)
+      $req = [System.Net.HttpWebRequest]::Create($path)
+      $req.Timeout = 8000
+      $req.ReadWriteTimeout = 8000
+      $req.UserAgent = 'Mozilla/5.0'
+      $resp = $req.GetResponse()
+      $ms = New-Object System.IO.MemoryStream
+      $resp.GetResponseStream().CopyTo($ms)
+      $resp.Close()
+      $ms.Position = 0
       $decoder = New-Object System.Windows.Media.Imaging.GifBitmapDecoder(
         $ms,
         [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat,
@@ -850,21 +868,18 @@ function New-GifAnimator($image, $path) {
       [void]$delays.Add($delay)
       $prev = $rtb
     }
+    $pack = [pscustomobject]@{ frames = $frames; delays = $delays }
+  } catch { $pack = $null }
+  if ($pack) { $script:GifCache[$path] = $pack }   # cache successes only (transient failures can retry)
+  return $pack
+}
 
-    if ($frames.Count -eq 1) { $image.Source = $frames[0]; return [pscustomobject]@{ timer = $null; frames = $frames } }
-
-    $st = [pscustomobject]@{ idx = 0 }
-    $image.Source = $frames[0]
-    $timer = New-Object System.Windows.Threading.DispatcherTimer
-    $timer.Interval = [TimeSpan]::FromMilliseconds([Math]::Max(20, [int]$delays[0] * 10))
-    $timer.Add_Tick({
-      $st.idx = ($st.idx + 1) % $frames.Count
-      $image.Source = $frames[$st.idx]
-      $this.Interval = [TimeSpan]::FromMilliseconds([Math]::Max(20, [int]$delays[$st.idx] * 10))
-    }.GetNewClosure())
-    $timer.Start()
-    return [pscustomobject]@{ timer = $timer; frames = $frames }
-  } catch { return $null }
+# Pre-decode every configured GIF up front so the FIRST switch to each state is instant.
+function Preload-Gifs {
+  foreach ($k in 'running', 'needs_input', 'idle') {
+    $p = [string]$script:Gif.paths[$k]
+    if (-not [string]::IsNullOrWhiteSpace($p)) { [void](Get-GifFrames $p) }
+  }
 }
 
 # Reconcile the GIF window with the current overall state. Cheap no-op when the
@@ -876,23 +891,29 @@ function Update-Gif([bool]$force = $false) {
   if (-not $force -and $want -eq $script:GifCurrentPath) { return }
   $script:GifCurrentPath = $want
 
-  # Tear down the previous animator before loading the next (prevents two timers
-  # fighting over Image.Source and leaking DispatcherTimers / frozen frames).
-  if ($script:GifAnim) {
-    if ($script:GifAnim.timer)  { $script:GifAnim.timer.Stop() }
-    if ($script:GifAnim.frames) { $script:GifAnim.frames.Clear() }   # release frozen RenderTargetBitmaps
+  if ([string]::IsNullOrWhiteSpace($want)) {
+    $script:GifTimer.Stop(); $script:GifActive = $null
+    $script:GifImage.Source = $null
+    $script:gifWindow.Hide()
+    return
   }
-  $script:GifAnim = $null
-  $script:GifImage.Source = $null
 
-  if ([string]::IsNullOrWhiteSpace($want)) { $script:gifWindow.Hide(); return }
-
-  $anim = New-GifAnimator $script:GifImage $want
-  if ($anim) {
-    $script:GifAnim = $anim
-    if (-not $script:gifWindow.IsVisible) { $script:gifWindow.Show() }
-  } else {
+  $pack = Get-GifFrames $want   # cached after first load -> instant on later switches
+  if (-not $pack) {
+    $script:GifTimer.Stop(); $script:GifActive = $null
+    $script:GifImage.Source = $null
     $script:gifWindow.Hide()   # bad path / unloadable
+    return
+  }
+
+  # Re-point the shared timer at the (cached) frame pack and show frame 0.
+  $script:GifTimer.Stop()
+  $script:GifActive = [pscustomobject]@{ frames = $pack.frames; delays = $pack.delays; idx = 0 }
+  $script:GifImage.Source = $pack.frames[0]
+  if (-not $script:gifWindow.IsVisible) { $script:gifWindow.Show() }
+  if ($pack.frames.Count -gt 1) {
+    $script:GifTimer.Interval = [TimeSpan]::FromMilliseconds([Math]::Max(20, [int]$pack.delays[0] * 10))
+    $script:GifTimer.Start()
   }
 }
 
@@ -944,6 +965,8 @@ function Show-GifSettings {
     $script:Gif.paths.needs_input = $nb.Text.Trim()
     $script:Gif.paths.idle        = $ib.Text.Trim()
     Save-UISettings
+    $script:GifCache.Clear()   # paths may have changed -> drop stale decodes
+    Preload-Gifs
     Update-Gif $true
     $w.Close()
   })
@@ -977,6 +1000,7 @@ $gifDesktopTimer.Start()
 
 # Initial render + refresh timer
 Update-List
+Preload-Gifs   # decode all configured GIFs once so state switches are instant
 Update-Gif
 $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromSeconds(2)
@@ -1030,10 +1054,9 @@ $pinTimer.Start()
 
 $Window.Add_Closed({
   $timer.Stop(); $followTimer.Stop(); $pinTimer.Stop(); $gifDesktopTimer.Stop()
-  if ($script:GifAnim) {
-    if ($script:GifAnim.timer)  { $script:GifAnim.timer.Stop() }
-    if ($script:GifAnim.frames) { $script:GifAnim.frames.Clear() }
-  }
+  if ($script:GifTimer) { $script:GifTimer.Stop() }
+  $script:GifActive = $null
+  if ($script:GifCache) { $script:GifCache.Clear() }
   try {
     if ($script:gifWindow) {
       $script:Gif.win.width  = $script:gifWindow.Width
