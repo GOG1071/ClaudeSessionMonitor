@@ -8,9 +8,17 @@ session globally — across all terminals, projects, and virtual desktops.
 - **Live session list** — reads `~/.claude/sessions/<pid>.json` and refreshes every 2s.
   Each row shows the project folder, the session **PID**, and a coloured status dot
   (🟢 busy · ⚪ idle · 🔴 ended).
-- **What each session is doing** — the second line summarises the session's current
-  activity, read from its transcript (`~/.claude/projects/<cwd>/<sessionId>.jsonl`).
-  Hover a row for the full text plus pid, version, status, and cwd.
+- **What each session is doing** — under the session name, the **recent prompt** line
+  (italic amber) shows the most recent user prompt, and the activity line summarises what
+  the session is currently doing, read from its transcript
+  (`~/.claude/projects/<cwd>/<sessionId>.jsonl`). Hover a row for the full text plus pid,
+  version, status, and cwd.
+- **Token consumption** — each row shows the live **context-window fill** (`ctx 112K`)
+  and the session's **cumulative token use** (`Σ 2.20M`); the header shows the grand
+  total across all sessions. Computed by summing `message.usage` (input + cache-create +
+  cache-read + output) over the transcript, read incrementally so each 2s tick only scans
+  newly appended lines. Hover the figures for a full breakdown (context, output, input,
+  cache read/write, total).
 - **Click to focus** — left-click a row to bring that session's terminal window to the
   foreground. Works reliably across the foreground-lock and minimised windows.
 - **Right-click to link** — for sessions whose terminal can't be auto-identified
