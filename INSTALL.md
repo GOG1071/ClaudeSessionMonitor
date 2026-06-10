@@ -1,7 +1,7 @@
 # Install
 
 Setup guide for **Claude Session Monitor** (the `overlay.ps1` overlay + the
-`needs_input` attention hook). Works on a fresh Windows machine.
+`waiting` attention hook). Works on a fresh Windows machine.
 
 ---
 
@@ -33,7 +33,7 @@ Setup guide for **Claude Session Monitor** (the `overlay.ps1` overlay + the
        "Notification": [
          {
            "hooks": [
-             { "type": "command", "command": "node \"C:/Tools/ClaudeSessionMonitor/scripts/session-attention.cjs\" needs_input" }
+             { "type": "command", "command": "node \"C:/Tools/ClaudeSessionMonitor/scripts/session-attention.cjs\" waiting" }
            ]
          }
        ],
@@ -53,7 +53,7 @@ Setup guide for **Claude Session Monitor** (the `overlay.ps1` overlay + the
    > it isn't there). Leave every other hook untouched.
 
 3. **Restart any open Claude Code sessions.** Hooks load at session start, so currently-running
-   sessions won't report `needs_input` until relaunched.
+   sessions won't report `waiting` until relaunched.
 
 4. **Run the overlay** — double-click `Start Overlay.vbs`, or:
 
@@ -86,7 +86,7 @@ If you are an AI agent setting this up, do exactly this:
    the same command already exists, and do not remove or reorder any other hooks:
 
    - In `hooks.Notification[].hooks[]`:
-     `node "<REPO>/scripts/session-attention.cjs" needs_input`
+     `node "<REPO>/scripts/session-attention.cjs" waiting`
    - In `hooks.UserPromptSubmit[].hooks[]`:
      `node "<REPO>/scripts/session-attention.cjs" clear`
 

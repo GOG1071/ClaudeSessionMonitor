@@ -197,7 +197,7 @@ public static class Pinner {
 "@
 
 $SessionsDir = Join-Path $env:USERPROFILE '.claude\sessions'
-# needs_input markers written by scripts\session-attention.cjs (Notification hook).
+# waiting markers written by scripts\session-attention.cjs (Notification hook).
 # The native session JSON only ever carries busy/idle, so this sidecar is the sole
 # source for the "Claude is waiting for the user" state.
 $AttentionDir = Join-Path $env:USERPROFILE '.claude\session-attention'
@@ -298,10 +298,10 @@ $script:UI = @{ width = 340.0; opacity = 0.95; pinned = $true }
 # Per-state GIF config. Each path is user-configured (a local file path, or a
 # file:// / http(s) URL); an empty path means "no GIF for that state". The floating
 # GIF window shows the GIF for the current overall Claude state, aggregated across all
-# sessions with priority needs_input > running > idle. Empty default = feature off.
+# sessions with priority waiting > running > idle. Empty default = feature off.
 $script:Gif = @{
   enabled = $true
-  paths   = @{ running = ''; needs_input = ''; idle = '' }
+  paths   = @{ running = ''; waiting = ''; idle = '' }
   win     = @{ left = 60.0; top = 360.0; width = 200.0; height = 200.0 }
 }
 if (Test-Path $UISettingsFile) {
@@ -313,7 +313,7 @@ if (Test-Path $UISettingsFile) {
     # GIF settings are additive: missing keys fall back to the defaults above.
     if ($null -ne $cfg.gifEnabled) { $script:Gif.enabled = [bool]$cfg.gifEnabled }
     if ($cfg.gifPaths) {
-      foreach ($k in 'running','needs_input','idle') {
+      foreach ($k in 'running','waiting','idle') {
         if ($cfg.gifPaths.$k) { $script:Gif.paths[$k] = [string]$cfg.gifPaths.$k }
       }
     }
@@ -634,7 +634,7 @@ function Select-WTTabInWindow($hwnd, $folder) {
 function Get-RowTint($color) {
   switch ($color) {
     'busy'        { return @{ base = '#2E3FB950'; hover = '#4D3FB950' } }   # green  = running
-    'needs_input' { return @{ base = '#38D29922'; hover = '#57D29922' } }   # yellow = waiting for input
+    'waiting' { return @{ base = '#38D29922'; hover = '#57D29922' } }   # yellow = waiting for input
     'stale'       { return @{ base = '#33F85149'; hover = '#52F85149' } }   # red    = process ended
     'idle'        { return @{ base = '#386E7681'; hover = '#576E7681' } }   # gray   = idle
     default       { return @{ base = '#386E7681'; hover = '#57D29922' } }
@@ -847,9 +847,9 @@ function Update-List {
       $statusTxt = $s.status
     }
 
-    # needs_input is a refinement of the idle state. The native session file only ever
+    # waiting is a refinement of the idle state. The native session file only ever
     # carries busy/idle; the Notification hook (scripts\session-attention.cjs) drops a
-    # marker when Claude is waiting for the user. Show needs_input when an ALIVE session
+    # marker when Claude is waiting for the user. Show waiting when an ALIVE session
     # is NOT busy and has a marker. We deliberately do NOT compare timestamps: the native
     # updatedAt is a heartbeat that keeps advancing while a session runs (verified), so a
     # "marker newer than updatedAt" test would be raced by the heartbeat. The rule is
@@ -860,7 +860,7 @@ function Update-List {
       $mk = Join-Path $AttentionDir "$($s.sessionId).json"
       if (Test-Path $mk) {
         if ($isAlive -and $s.status -ne 'busy') {
-          $color = 'needs_input'; $statusTxt = 'needs input'
+          $color = 'waiting'; $statusTxt = 'needs input'
         } else {
           Remove-Item $mk -ErrorAction SilentlyContinue   # busy or dead: can't need input
         }
@@ -935,12 +935,12 @@ function Update-List {
   # Sort: busy first, then alive, then most recently updated
   $rows = @($rows | Sort-Object @{e={ -([int]$_.busy) }}, @{e={ -([int]$_.alive) }}, @{e={ -$_.upd }})
 
-  # Overall Claude state drives the status GIF: needs_input > running > idle.
+  # Overall Claude state drives the status GIF: waiting > running > idle.
   # A dead-process ('stale') session counts as not-active and is ignored here.
   $st = 'idle'
   foreach ($r in $rows) {
     if (-not $r.alive) { continue }
-    if ($r.color -eq 'needs_input') { $st = 'needs_input'; break }
+    if ($r.color -eq 'waiting') { $st = 'waiting'; break }
     if ($r.color -eq 'busy')        { $st = 'running' }
   }
   $script:OverallState = $st
@@ -1257,7 +1257,7 @@ function Show-GifSettings {
   $rb = $w.FindName('RunBox'); $nb = $w.FindName('NeedBox'); $ib = $w.FindName('IdleBox')
   $en.IsChecked = $script:Gif.enabled
   $rb.Text = $script:Gif.paths.running
-  $nb.Text = $script:Gif.paths.needs_input
+  $nb.Text = $script:Gif.paths.waiting
   $ib.Text = $script:Gif.paths.idle
   # NOTE: do NOT use .GetNewClosure() on these handlers. GetNewClosure wraps the block
   # in a new module where $script: resolves to that module (so $script:Gif is $null and
@@ -1268,7 +1268,7 @@ function Show-GifSettings {
   $w.FindName('SaveBtn').Add_Click({
     $script:Gif.enabled           = [bool]$en.IsChecked
     $script:Gif.paths.running     = $rb.Text.Trim()
-    $script:Gif.paths.needs_input = $nb.Text.Trim()
+    $script:Gif.paths.waiting = $nb.Text.Trim()
     $script:Gif.paths.idle        = $ib.Text.Trim()
     Save-UISettings
     # Paths may have changed -> drop stale decodes + downloaded bytes so new paths reload.
