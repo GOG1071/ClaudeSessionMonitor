@@ -4,3 +4,5 @@ links.json
 _*.ps1
 _*.txt
 _vendor/
+.claude/
+.t1k-module-summary.txt

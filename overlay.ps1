@@ -385,20 +385,23 @@ function Format-Age([long]$ms) {
   return "${d}d"
 }
 
-# Read a session's transcript tail and summarise what it's currently doing.
-# Cached per session keyed on updatedAt, so idle sessions aren't re-parsed every tick.
+# Read a session's transcript tail and summarise what it's currently doing, the most
+# recent user prompt, and the model in use. Cached per session keyed on updatedAt, so
+# idle sessions aren't re-parsed every tick.
+# Returns @{ activity = <what it's doing>; prompt = <last user prompt>; model = <model id> }.
 $script:ActivityCache = @{}
 function Get-SessionActivity($cwd, $sessionId, $updatedAt) {
-  if (-not $sessionId -or -not $cwd) { return '' }
+  $empty = @{ activity = ''; prompt = ''; model = '' }
+  if (-not $sessionId -or -not $cwd) { return $empty }
   $cached = $script:ActivityCache[$sessionId]
-  if ($cached -and $cached.upd -eq $updatedAt) { return $cached.text }
+  if ($cached -and $cached.upd -eq $updatedAt) { return $cached.val }
 
   $enc  = ($cwd -replace '[^A-Za-z0-9]', '-')
   $path = Join-Path $env:USERPROFILE ".claude\projects\$enc\$sessionId.jsonl"
-  $text = ''
+  $val  = @{ activity = ''; prompt = ''; model = '' }
   if (Test-Path $path) {
     try {
-      $lastUser = ''; $lastAsst = ''; $lastTool = ''
+      $lastUser = ''; $lastAsst = ''; $lastTool = ''; $lastModel = ''
       foreach ($ln in (Get-Content -Path $path -Tail 80 -Encoding UTF8 -ErrorAction Stop)) {
         if ([string]::IsNullOrWhiteSpace($ln)) { continue }
         try { $d = $ln | ConvertFrom-Json } catch { continue }
@@ -412,19 +415,83 @@ function Get-SessionActivity($cwd, $sessionId, $updatedAt) {
           if ($t -and -not $t.StartsWith('<') -and -not $t.StartsWith('Caveat') -and $t -notmatch 'tool_result') { $lastUser = $t }
         }
         elseif ($m.role -eq 'assistant' -and $c) {
+          if ($m.model) { $lastModel = "$($m.model)" }    # model can change mid-session; last wins
           foreach ($b in $c) {
             if ($b.type -eq 'text' -and "$($b.text)".Trim()) { $lastAsst = $b.text }
             elseif ($b.type -eq 'tool_use') { $lastTool = $b.name }
           }
         }
       }
-      $text = if ($lastAsst) { $lastAsst } elseif ($lastUser) { $lastUser } elseif ($lastTool) { "running $lastTool" } else { '' }
-      $text = ($text -replace '\s+', ' ').Trim()
-      if ($text.Length -gt 200) { $text = $text.Substring(0, 200) }
+      $act = if ($lastAsst) { $lastAsst } elseif ($lastUser) { $lastUser } elseif ($lastTool) { "running $lastTool" } else { '' }
+      $act = ($act -replace '\s+', ' ').Trim()
+      if ($act.Length -gt 200) { $act = $act.Substring(0, 200) }
+      $prompt = ($lastUser -replace '\s+', ' ').Trim()
+      if ($prompt.Length -gt 200) { $prompt = $prompt.Substring(0, 200) }
+      $val = @{ activity = $act; prompt = $prompt; model = $lastModel }
     } catch {}
   }
-  $script:ActivityCache[$sessionId] = @{ upd = $updatedAt; text = $text }
-  return $text
+  $script:ActivityCache[$sessionId] = @{ upd = $updatedAt; val = $val }
+  return $val
+}
+
+# Shorten a model id for display: "claude-opus-4-8" -> "opus 4.8",
+# "claude-sonnet-4-6" -> "sonnet 4.6", "claude-haiku-4-5-20251001" -> "haiku 4.5".
+function Format-Model([string]$m) {
+  if (-not $m) { return '' }
+  $x = $m -replace '^claude-', '' -replace '-\d{8}$', ''   # strip prefix + trailing date stamp
+  if ($x -match '^([a-z]+)-(\d+)-(\d+)') { return "$($matches[1]) $($matches[2]).$($matches[3])" }
+  return $x
+}
+
+# Token consumption per session. Sums message.usage across the whole transcript
+# (input + cache-create + cache-read + output) and also tracks the latest turn's
+# prompt size as the current context-window fill. Reads incrementally: the cache
+# remembers the byte offset already parsed, so each 2s tick only scans newly
+# appended lines (transcripts are append-only JSONL) instead of re-summing the file.
+$script:TokenCache = @{}
+function Get-SessionTokens($cwd, $sessionId) {
+  if (-not $sessionId -or -not $cwd) { return $null }
+  $enc  = ($cwd -replace '[^A-Za-z0-9]', '-')
+  $path = Join-Path $env:USERPROFILE ".claude\projects\$enc\$sessionId.jsonl"
+  if (-not (Test-Path $path)) { return $null }
+  try { $len = (Get-Item $path).Length } catch { return $null }
+
+  $c = $script:TokenCache[$sessionId]
+  if (-not $c) {
+    $c = @{ size = 0L; inTok = 0L; cacheCreate = 0L; cacheRead = 0L; outTok = 0L; ctx = 0L }
+    $script:TokenCache[$sessionId] = $c
+  }
+  if ($len -eq $c.size) { return $c }                       # nothing appended since last tick
+  if ($len -lt $c.size) {                                   # file rotated/compacted -> reparse
+    $c.size = 0L; $c.inTok = 0L; $c.cacheCreate = 0L; $c.cacheRead = 0L; $c.outTok = 0L; $c.ctx = 0L
+  }
+
+  try {
+    $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    $null = $fs.Seek($c.size, [System.IO.SeekOrigin]::Begin) # resume at the first un-parsed byte (a line boundary)
+    $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
+    while (($ln = $sr.ReadLine()) -ne $null) {
+      if ([string]::IsNullOrWhiteSpace($ln)) { continue }
+      try { $d = $ln | ConvertFrom-Json } catch { continue }
+      $u = $d.message.usage
+      if (-not $u) { continue }
+      $it = [long]($u.input_tokens); $ci = [long]($u.cache_creation_input_tokens)
+      $cr = [long]($u.cache_read_input_tokens); $ot = [long]($u.output_tokens)
+      $c.inTok += $it; $c.cacheCreate += $ci; $c.cacheRead += $cr; $c.outTok += $ot
+      $c.ctx = $it + $ci + $cr                              # latest turn wins = current window fill
+    }
+    $sr.Close(); $fs.Close()
+    $c.size = $len
+  } catch {}
+  return $c
+}
+
+# Compact human token count: 945 -> "945", 12_300 -> "12.3K", 3_450_000 -> "3.45M".
+function Format-Tokens([long]$n) {
+  if ($n -le 0)        { return '0' }
+  if ($n -lt 1000)     { return "$n" }
+  if ($n -lt 1000000)  { return ('{0:0.0}K' -f ($n / 1000.0)) }
+  return ('{0:0.00}M' -f ($n / 1000000.0))
 }
 
 # Score how well a Windows Terminal tab/window title identifies a session.
@@ -558,31 +625,34 @@ function Select-WTTabInWindow($hwnd, $folder) {
   } catch {}
 }
 
-function New-Row($session) {
+# Map a session status to its row background tint (base + hover shades). Replaces the
+# old status dot — the whole row is tinted by status instead.
+function Get-RowTint($color) {
+  switch ($color) {
+    'busy'        { return @{ base = '#2E3FB950'; hover = '#4D3FB950' } }   # green  = running
+    'needs_input' { return @{ base = '#38D29922'; hover = '#57D29922' } }   # yellow = waiting for input
+    'stale'       { return @{ base = '#33F85149'; hover = '#52F85149' } }   # red    = process ended
+    'idle'        { return @{ base = '#386E7681'; hover = '#576E7681' } }   # gray   = idle
+    default       { return @{ base = '#386E7681'; hover = '#576E7681' } }
+  }
+}
+
+# Build a row once and return a hashtable of the Border plus references to every
+# element whose content changes per tick. The row is then reused across refreshes
+# (see Update-List) and only its text/colors are updated in place via Set-RowData —
+# never destroyed and rebuilt. That is what keeps the hover background from blinking:
+# the element under the cursor stays in the visual tree, so its MouseEnter state holds.
+function New-Row {
   $border = New-Object System.Windows.Controls.Border
   $border.CornerRadius = '7'
   $border.Margin = '0,3,0,0'
   $border.Padding = '10,7,10,7'
-  # Row background encodes status (replaces the old colored dot): a translucent tint
-  # per state, with a slightly stronger tint on hover.
-  switch ($session.color) {
-    'busy'        { $baseBg = '#2E3FB950'; $hoverBg = '#4D3FB950' }   # green  = running
-    'needs_input' { $baseBg = '#38D29922'; $hoverBg = '#57D29922' }   # yellow = waiting for input
-    'stale'       { $baseBg = '#33F85149'; $hoverBg = '#52F85149' }   # red    = process ended
-    'idle'        { $baseBg = '#386E7681'; $hoverBg = '#576E7681' }   # gray   = idle
-    default       { $baseBg = '#386E7681'; $hoverBg = '#576E7681' }
-  }
-  $border.Background = [Windows.Media.BrushConverter]::new().ConvertFrom($baseBg)
-
-  # Tag carries focus/link identity plus the row's base/hover tints (read by the hover
-  # handlers and Show-RowFlash so they restore the right status color, not a flat gray).
-  $border.Tag = [pscustomobject]@{
-    Pid = $session.pid; Cwd = $session.cwd; SessionId = $session.sessionId
-    BaseBg = $baseBg; HoverBg = $hoverBg
-  }
+  # Default tint until Set-RowData re-tints by status (New-Row is a parameterless
+  # template; per-session content/colour is filled in by Set-RowData each tick).
+  $border.Background = [Windows.Media.BrushConverter]::new().ConvertFrom('#386E7681')
   $border.Cursor = 'Hand'
-  if ($session.tip) { $border.ToolTip = $session.tip }
 
+  # Left-click focuses the session's terminal; right-click links it to the current terminal.
   $border.Add_MouseLeftButtonUp({
     $t = $this.Tag
     if ($t -and $t.Pid) {
@@ -623,43 +693,132 @@ function New-Row($session) {
   $name.FontFamily = 'Segoe UI Semibold'
   $name.FontSize = 12
   $name.TextTrimming = 'CharacterEllipsis'
-  $runName = New-Object System.Windows.Documents.Run $session.name
+  $runName = New-Object System.Windows.Documents.Run
   $runName.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#FFFFFFFF')
-  $runPid = New-Object System.Windows.Documents.Run "  $($session.pid)"
+  $runPid = New-Object System.Windows.Documents.Run
   $runPid.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#80FFFFFF')
   $runPid.FontFamily = 'Segoe UI'
   $runPid.FontSize = 11
   $name.Inlines.Add($runName)
   $name.Inlines.Add($runPid)
+  $stack.Children.Add($name) | Out-Null
+
+  # Most recent user prompt — always built, collapsed when empty so the row's element
+  # structure stays stable across refreshes (no add/remove churn under the cursor).
+  $promptTb = New-Object System.Windows.Controls.TextBlock
+  $promptTb.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#99E6A23C')
+  $promptTb.FontFamily = 'Segoe UI'
+  $promptTb.FontStyle = 'Italic'
+  $promptTb.FontSize = 10
+  $promptTb.TextTrimming = 'CharacterEllipsis'
+  $stack.Children.Add($promptTb) | Out-Null
 
   $sub = New-Object System.Windows.Controls.TextBlock
-  $sub.Text = $session.sub
   $sub.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#80FFFFFF')
   $sub.FontFamily = 'Segoe UI'
   $sub.FontSize = 10
   $sub.TextTrimming = 'CharacterEllipsis'
+  $stack.Children.Add($sub) | Out-Null
 
-  $stack.Children.Add($name) | Out-Null
-  $stack.Children.Add($sub)  | Out-Null
+  # Model + CLI version (e.g. "opus 4.8 · v2.1.170"), dim. Collapsed when unknown.
+  $meta = New-Object System.Windows.Controls.TextBlock
+  $meta.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#807AC2FF')
+  $meta.FontFamily = 'Segoe UI'
+  $meta.FontSize = 10
+  $meta.TextTrimming = 'CharacterEllipsis'
+  $stack.Children.Add($meta) | Out-Null
+
+  # Right column: age on top, cumulative token consumption below.
+  $right = New-Object System.Windows.Controls.StackPanel
+  $right.VerticalAlignment = 'Center'
+  $right.Margin = '8,0,0,0'
+  [Windows.Controls.Grid]::SetColumn($right, 1)
 
   $age = New-Object System.Windows.Controls.TextBlock
-  $age.Text = $session.age
   $age.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#66FFFFFF')
   $age.FontFamily = 'Segoe UI'
   $age.FontSize = 10
-  $age.VerticalAlignment = 'Center'
-  $age.Margin = '8,0,0,0'
-  [Windows.Controls.Grid]::SetColumn($age, 1)
+  $age.HorizontalAlignment = 'Right'
+
+  # Current context-window fill (live), brighter blue.
+  $ctx = New-Object System.Windows.Controls.TextBlock
+  $ctx.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#CC6CB6FF')
+  $ctx.FontFamily = 'Segoe UI'
+  $ctx.FontSize = 10
+  $ctx.HorizontalAlignment = 'Right'
+
+  # Cumulative token throughput for the whole session, dimmer blue.
+  $tok = New-Object System.Windows.Controls.TextBlock
+  $tok.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#80A6D4FF')
+  $tok.FontFamily = 'Segoe UI'
+  $tok.FontSize = 10
+  $tok.HorizontalAlignment = 'Right'
+
+  $right.Children.Add($age) | Out-Null
+  $right.Children.Add($ctx) | Out-Null
+  $right.Children.Add($tok) | Out-Null
 
   $grid.Children.Add($stack) | Out-Null
-  $grid.Children.Add($age)   | Out-Null
+  $grid.Children.Add($right) | Out-Null
   $border.Child = $grid
-  return $border
+
+  return @{
+    Border = $border; RunName = $runName; RunPid = $runPid
+    Prompt = $promptTb; Sub = $sub; Meta = $meta; Age = $age; Ctx = $ctx; Tok = $tok
+  }
 }
 
+# Update an existing row's content in place from session data $r. Only writes a
+# property when it actually changed, so unchanged rows incur no layout work and the
+# row under the cursor is never disturbed. Background is intentionally untouched so
+# the hover tint (set by MouseEnter/Leave) survives every refresh.
+function Set-RowData($e, $r) {
+  # Status -> row background tint (replaces the old dot). Carry base/hover on the Tag so
+  # the MouseEnter/Leave handlers (and Show-RowFlash) restore the right shade.
+  $tint = Get-RowTint $r.color
+  $e.Border.Tag = [pscustomobject]@{ Pid = $r.pid; Cwd = $r.cwd; SessionId = $r.sessionId; BaseBg = $tint.base; HoverBg = $tint.hover }
+  if ($e.Border.ToolTip -ne $r.tip) { $e.Border.ToolTip = $r.tip }
+
+  # Re-apply the background only when the tint or hover state actually changed, so an
+  # unchanged row never churns its brush (keeps the in-place update blink-free).
+  $bg = if ($e.Border.IsMouseOver) { $tint.hover } else { $tint.base }
+  if ($e.LastBg -ne $bg) { $e.LastBg = $bg; $e.Border.Background = [Windows.Media.BrushConverter]::new().ConvertFrom($bg) }
+
+  if ($e.RunName.Text -ne $r.name)      { $e.RunName.Text = $r.name }
+  $pidTxt = "  $($r.pid)"
+  if ($e.RunPid.Text -ne $pidTxt)       { $e.RunPid.Text = $pidTxt }
+
+  if ($r.prompt) {
+    if ($e.Prompt.Text -ne $r.prompt)   { $e.Prompt.Text = $r.prompt }
+    if ($e.Prompt.Visibility -ne 'Visible') { $e.Prompt.Visibility = 'Visible' }
+  } elseif ($e.Prompt.Visibility -ne 'Collapsed') {
+    $e.Prompt.Visibility = 'Collapsed'
+  }
+
+  if ($e.Sub.Text -ne $r.sub)           { $e.Sub.Text = $r.sub }
+
+  if ($r.metaTxt) {
+    if ($e.Meta.Text -ne $r.metaTxt)    { $e.Meta.Text = $r.metaTxt }
+    if ($e.Meta.Visibility -ne 'Visible') { $e.Meta.Visibility = 'Visible' }
+  } elseif ($e.Meta.Visibility -ne 'Collapsed') {
+    $e.Meta.Visibility = 'Collapsed'
+  }
+
+  if ($e.Age.Text -ne $r.age)           { $e.Age.Text = $r.age }
+  if ($e.Ctx.Text -ne $r.ctxTxt)        { $e.Ctx.Text = $r.ctxTxt }
+  if ($e.Tok.Text -ne $r.tokTxt)        { $e.Tok.Text = $r.tokTxt }
+  if ($e.Ctx.ToolTip -ne $r.tokTip)     { $e.Ctx.ToolTip = $r.tokTip }
+  if ($e.Tok.ToolTip -ne $r.tokTip)     { $e.Tok.ToolTip = $r.tokTip }
+}
+
+# Reused row elements, keyed by sessionId, so a session's row is built once and then
+# updated in place every tick rather than recreated (prevents the hover blink).
+$script:RowMap = @{}
+
 function Update-List {
-  $List.Items.Clear()
   if (-not (Test-Path $SessionsDir)) {
+    foreach ($e in $script:RowMap.Values) { [void]$List.Items.Remove($e.Border) }
+    $script:RowMap.Clear()
     $CountText.Text = '0'
     $script:OverallState = 'idle'
     return
@@ -685,27 +844,62 @@ function Update-List {
 
     $age = Format-Age ($now - [long]$s.updatedAt)
 
-    $activity = if ($isAlive) { Get-SessionActivity $s.cwd $s.sessionId $s.updatedAt } else { '' }
+    $act = if ($isAlive) { Get-SessionActivity $s.cwd $s.sessionId $s.updatedAt } else { @{ activity = ''; prompt = ''; model = '' } }
+    $activity = $act.activity
+    $prompt   = $act.prompt
     $sub = if ($activity) { $activity } else { "$statusTxt $sep pid $($s.pid)" }
-    $tip = "pid $($s.pid) $sep v$($s.version) $sep $statusTxt`n$($s.cwd)" + $(if ($activity) { "`n`n$activity" } else { '' })
+
+    # Model (from transcript) + CLI version (from session JSON). Effort/reasoning level
+    # is not recorded anywhere in the session or transcript, so it can't be shown.
+    $modelTxt  = Format-Model $act.model
+    $ver       = "$($s.version)"
+    $metaParts = @()
+    if ($modelTxt) { $metaParts += $modelTxt }
+    if ($ver)      { $metaParts += "v$ver" }
+    $metaTxt   = ($metaParts -join " $sep ")
+    $tip = "pid $($s.pid) $sep v$($s.version) $sep $statusTxt`n$($s.cwd)" +
+      $(if ($prompt)   { "`n`nprompt: $prompt" } else { '' }) +
+      $(if ($activity) { "`n`n$activity" } else { '' })
+
+    # Token consumption (cumulative throughput across the session + current context fill).
+    $tk = Get-SessionTokens $s.cwd $s.sessionId
+    $total = 0L; $tokTxt = ''; $ctxTxt = ''; $tokTip = ''
+    if ($tk) {
+      $total  = [long]$tk.inTok + [long]$tk.cacheCreate + [long]$tk.cacheRead + [long]$tk.outTok
+      $ctxTxt = if ([long]$tk.ctx -gt 0) { 'ctx ' + (Format-Tokens $tk.ctx) } else { '' }
+      $tokTxt = if ($total -gt 0) { ([char]0x03A3) + ' ' + (Format-Tokens $total) } else { '' }   # Σ = cumulative
+      $tokTip = "tokens this session" +
+        "`n  context now : $(Format-Tokens $tk.ctx)" +
+        "`n  output      : $(Format-Tokens $tk.outTok)" +
+        "`n  input       : $(Format-Tokens $tk.inTok)" +
+        "`n  cache write : $(Format-Tokens $tk.cacheCreate)" +
+        "`n  cache read  : $(Format-Tokens $tk.cacheRead)" +
+        "`n  total       : $(Format-Tokens $total)"
+    }
 
     $rows += [pscustomobject]@{
       pid       = [int]$s.pid
       cwd       = "$($s.cwd)"
       sessionId = "$($s.sessionId)"
       name   = $proj
+      prompt = $prompt
       sub    = $sub
+      metaTxt = $metaTxt
       tip    = $tip
       age    = $age
       color  = $color
       alive  = $isAlive
       busy   = ($s.status -eq 'busy')
       upd    = [long]$s.updatedAt
+      ctxTxt = $ctxTxt
+      tokTxt = $tokTxt
+      tokTip = $tokTip
+      total  = $total
     }
   }
 
   # Sort: busy first, then alive, then most recently updated
-  $rows = $rows | Sort-Object @{e={ -([int]$_.busy) }}, @{e={ -([int]$_.alive) }}, @{e={ -$_.upd }}
+  $rows = @($rows | Sort-Object @{e={ -([int]$_.busy) }}, @{e={ -([int]$_.alive) }}, @{e={ -$_.upd }})
 
   # Overall Claude state drives the status GIF: needs_input > running > idle.
   # A dead-process ('stale') session counts as not-active and is ignored here.
@@ -717,11 +911,42 @@ function Update-List {
   }
   $script:OverallState = $st
 
-  foreach ($r in $rows) { $List.Items.Add((New-Row $r)) | Out-Null }
+  # Reconcile the live list against $rows without clearing it. Reuse each session's
+  # existing Border (updating its content in place), create one only for new sessions,
+  # and move/insert it to the sorted position. Rows that stay put are never removed
+  # from the visual tree, so the row under the cursor doesn't flicker on refresh.
+  $seen = @{}
+  for ($i = 0; $i -lt $rows.Count; $i++) {
+    $r = $rows[$i]
+    $sid = $r.sessionId
+    $e = $script:RowMap[$sid]
+    if (-not $e) { $e = New-Row; $script:RowMap[$sid] = $e }
+    Set-RowData $e $r
+    $seen[$sid] = $true
+
+    # Place this row at index $i if it isn't already there.
+    $cur = if ($i -lt $List.Items.Count) { $List.Items[$i] } else { $null }
+    if (-not [object]::ReferenceEquals($cur, $e.Border)) {
+      $at = $List.Items.IndexOf($e.Border)
+      if ($at -ge 0) { $List.Items.RemoveAt($at) }
+      if ($i -le $List.Items.Count) { $List.Items.Insert($i, $e.Border) }
+      else { [void]$List.Items.Add($e.Border) }
+    }
+  }
+
+  # Drop rows for sessions that disappeared.
+  $stale = @($script:RowMap.Keys | Where-Object { -not $seen.ContainsKey($_) })
+  foreach ($sid in $stale) {
+    [void]$List.Items.Remove($script:RowMap[$sid].Border)
+    $script:RowMap.Remove($sid)
+  }
 
   $aliveCount = ($rows | Where-Object { $_.alive }).Count
   $busyCount  = ($rows | Where-Object { $_.busy -and $_.alive }).Count
-  $CountText.Text = "$aliveCount active" + $(if ($busyCount) { " $sep $busyCount busy" } else { '' })
+  $grandTotal = 0L; foreach ($r in $rows) { $grandTotal += [long]$r.total }
+  $CountText.Text = "$aliveCount active" +
+    $(if ($busyCount)  { " $sep $busyCount busy" } else { '' }) +
+    $(if ($grandTotal) { " $sep ~$(Format-Tokens $grandTotal) tok" } else { '' })
 }
 
 # ---------------------------------------------------------------------------
