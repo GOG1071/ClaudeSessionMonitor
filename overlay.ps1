@@ -229,6 +229,39 @@ function Save-Links {
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize"
         WindowStartupLocation="Manual" Left="40" Top="40">
+  <Window.Resources>
+    <!-- Minimal dark vertical scrollbar: thin, rounded, and intentionally low-contrast. -->
+    <Style x:Key="MinimalDarkScrollBar" TargetType="{x:Type ScrollBar}">
+      <Setter Property="Width" Value="6"/>
+      <Setter Property="MinWidth" Value="6"/>
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="{x:Type ScrollBar}">
+            <Grid Background="Transparent" Width="6">
+              <Track x:Name="PART_Track" IsDirectionReversed="True">
+                <Track.DecreaseRepeatButton>
+                  <RepeatButton Command="{x:Static ScrollBar.PageUpCommand}" Opacity="0" IsHitTestVisible="False"/>
+                </Track.DecreaseRepeatButton>
+                <Track.Thumb>
+                  <Thumb Background="#66000000" BorderThickness="0">
+                    <Thumb.Template>
+                      <ControlTemplate TargetType="{x:Type Thumb}">
+                        <Border Background="{TemplateBinding Background}" CornerRadius="3"/>
+                      </ControlTemplate>
+                    </Thumb.Template>
+                  </Thumb>
+                </Track.Thumb>
+                <Track.IncreaseRepeatButton>
+                  <RepeatButton Command="{x:Static ScrollBar.PageDownCommand}" Opacity="0" IsHitTestVisible="False"/>
+                </Track.IncreaseRepeatButton>
+              </Track>
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
   <Border CornerRadius="10" Background="#E6141414" BorderBrush="#33FFFFFF" BorderThickness="1">
     <Border.Effect>
       <DropShadowEffect BlurRadius="18" ShadowDepth="2" Opacity="0.5" Color="Black"/>
@@ -263,11 +296,28 @@ function Save-Links {
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
                   FontSize="13" Cursor="Hand"/>
         </Grid>
-        <!-- Session list -->
-        <ItemsControl x:Name="List" Margin="8,2,8,10"/>
+        <!-- Session list: height is snap-resized in row units (2 sessions, 3 sessions, etc.). -->
+        <ScrollViewer x:Name="ScrollHost" Margin="8,2,8,10"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled"
+                      CanContentScroll="False"
+                      PanningMode="VerticalOnly">
+          <ScrollViewer.Resources>
+            <Style TargetType="{x:Type ScrollBar}" BasedOn="{StaticResource MinimalDarkScrollBar}"/>
+          </ScrollViewer.Resources>
+          <ItemsControl x:Name="List" Margin="0"/>
+        </ScrollViewer>
       </DockPanel>
       <!-- Right-edge handle for horizontal resizing (below the header). -->
       <Thumb x:Name="ResizeGrip" HorizontalAlignment="Right" Width="6" Margin="0,34,0,0" Cursor="SizeWE">
+        <Thumb.Template>
+          <ControlTemplate TargetType="Thumb">
+            <Border Background="Transparent"/>
+          </ControlTemplate>
+        </Thumb.Template>
+      </Thumb>
+      <!-- Bottom-edge handle for vertical resizing. It snaps the list height to whole rows. -->
+      <Thumb x:Name="ResizeGripV" VerticalAlignment="Bottom" Height="7" Margin="8,0,14,2" Cursor="SizeNS">
         <Thumb.Template>
           <ControlTemplate TargetType="Thumb">
             <Border Background="Transparent"/>
@@ -284,16 +334,18 @@ $Window = [Windows.Markup.XamlReader]::Load($reader)
 
 $Header     = $Window.FindName('Header')
 $List       = $Window.FindName('List')
+$ScrollHost = $Window.FindName('ScrollHost')
 $CloseBtn   = $Window.FindName('CloseBtn')
 $CountText  = $Window.FindName('CountText')
 $ResizeGrip = $Window.FindName('ResizeGrip')
+$ResizeGripV = $Window.FindName('ResizeGripV')
 $OpacitySlider = $Window.FindName('OpacitySlider')
 $GifBtn     = $Window.FindName('GifBtn')
 $PinBtn     = $Window.FindName('PinBtn')
 
 # Persisted UI settings (width + opacity).
 $UISettingsFile = Join-Path $PSScriptRoot 'settings.json'
-$script:UI = @{ width = 340.0; opacity = 0.95; pinned = $true }
+$script:UI = @{ width = 340.0; opacity = 0.95; pinned = $true; visibleRows = 3 }
 
 # Per-state GIF config. Each path is user-configured (a local file path, or a
 # file:// / http(s) URL); an empty path means "no GIF for that state". The floating
@@ -310,6 +362,7 @@ if (Test-Path $UISettingsFile) {
     if ($cfg.width)   { $script:UI.width   = [double]$cfg.width }
     if ($cfg.opacity) { $script:UI.opacity = [double]$cfg.opacity }
     if ($null -ne $cfg.pinned) { $script:UI.pinned = [bool]$cfg.pinned }
+    if ($cfg.visibleRows) { $script:UI.visibleRows = [int]$cfg.visibleRows }
     # GIF settings are additive: missing keys fall back to the defaults above.
     if ($null -ne $cfg.gifEnabled) { $script:Gif.enabled = [bool]$cfg.gifEnabled }
     if ($cfg.gifPaths) {
@@ -327,10 +380,11 @@ if (Test-Path $UISettingsFile) {
 function Save-UISettings {
   try {
     [pscustomobject]@{
-      width      = $Window.Width
-      opacity    = $OpacitySlider.Value
-      pinned     = $script:UI.pinned
-      gifEnabled = $script:Gif.enabled
+      width       = $Window.Width
+      opacity     = $OpacitySlider.Value
+      pinned      = $script:UI.pinned
+      visibleRows = $script:UI.visibleRows
+      gifEnabled  = $script:Gif.enabled
       gifPaths   = [pscustomobject]$script:Gif.paths
       gifWindow  = [pscustomobject]$script:Gif.win
     } | ConvertTo-Json -Compress | Set-Content -Path $UISettingsFile -Encoding UTF8
@@ -342,6 +396,7 @@ $Window.Width = [Math]::Max(240, [Math]::Min(1000, $script:UI.width))
 $OpacitySlider.Value = [Math]::Max(0.25, [Math]::Min(1.0, $script:UI.opacity))
 $Window.Opacity = $OpacitySlider.Value
 $Window.Topmost = $script:UI.pinned   # honor persisted pin state from first paint
+$script:UI.visibleRows = [Math]::Max(1, [Math]::Min(12, [int]$script:UI.visibleRows))
 
 # Drag the window from the header — but not when interacting with the opacity slider.
 $Header.Add_MouseLeftButtonDown({
@@ -364,6 +419,112 @@ $ResizeGrip.Add_DragDelta({
   $Window.Width = [Math]::Max(240, [Math]::Min(1000, $w))
 })
 $ResizeGrip.Add_DragCompleted({ Save-UISettings })
+
+function Get-RowOuterHeight($item) {
+  if (-not $item) { return 66.0 }
+  $h = if ($item.ActualHeight -gt 0) { [double]$item.ActualHeight } else { 66.0 }
+  try { $h += [double]$item.Margin.Top + [double]$item.Margin.Bottom } catch {}
+  return [Math]::Max(42.0, $h)
+}
+
+function Get-RowSlotHeight {
+  $sum = 0.0; $count = 0
+  foreach ($item in $List.Items) {
+    if ($item -and $item.ActualHeight -gt 0) {
+      $sum += (Get-RowOuterHeight $item)
+      $count++
+    }
+  }
+  if ($count -gt 0) { return [Math]::Max(42.0, $sum / $count) }
+  return 66.0
+}
+
+function Get-ListHeightForRows([int]$rows) {
+  $rows = [Math]::Max(1, $rows)
+  if ($List.Items.Count -le 0) { return 48.0 }
+
+  $take = [Math]::Min($rows, $List.Items.Count)
+  $h = 0.0
+  for ($i = 0; $i -lt $take; $i++) { $h += (Get-RowOuterHeight $List.Items[$i]) }
+  return [Math]::Max(48.0, [Math]::Ceiling($h + 1.0))
+}
+
+function Get-SnappedRowsForHeight([double]$height) {
+  $count = [int]$List.Items.Count
+  if ($count -le 0) { return 1 }
+
+  $maxRows = [Math]::Max(1, [Math]::Min(12, $count))
+  $bestRows = 1
+  $bestDiff = [double]::PositiveInfinity
+
+  for ($rows = 1; $rows -le $maxRows; $rows++) {
+    $snapHeight = [double](Get-ListHeightForRows $rows)
+    $diff = [Math]::Abs($height - $snapHeight)
+    if ($diff -lt $bestDiff) {
+      $bestDiff = $diff
+      $bestRows = $rows
+    }
+  }
+
+  return $bestRows
+}
+
+function Apply-ListSnapHeight {
+  if (-not $ScrollHost) { return }
+
+  # During vertical dragging, do not snap on every refresh tick. Snapping while the
+  # mouse is still moving causes WPF to resize the content under the cursor, which
+  # can make DragDelta alternate and flicker. We only snap once on DragCompleted.
+  if ($script:IsVResizing) { return }
+
+  try { $ScrollHost.UpdateLayout(); $List.UpdateLayout() } catch {}
+
+  $count = [int]$List.Items.Count
+  if ($count -le 0) {
+    $ScrollHost.Height = 48.0
+    $ScrollHost.VerticalScrollBarVisibility = 'Disabled'
+    return
+  }
+
+  $maxRows = [Math]::Max(1, [Math]::Min(12, $count))
+  $script:UI.visibleRows = [Math]::Max(1, [Math]::Min($maxRows, [int]$script:UI.visibleRows))
+  $ScrollHost.Height = Get-ListHeightForRows $script:UI.visibleRows
+  $ScrollHost.VerticalScrollBarVisibility = if ($count -gt [int]$script:UI.visibleRows) { 'Auto' } else { 'Disabled' }
+}
+
+# Bottom-edge grip -> vertical resize. While dragging, preview the raw height;
+# when the mouse is released, snap to the nearest whole session row.
+$script:VResizeTargetHeight = 0.0
+$script:IsVResizing = $false
+$ResizeGripV.Add_DragStarted({
+  $script:IsVResizing = $true
+  try { $ScrollHost.UpdateLayout(); $List.UpdateLayout() } catch {}
+  $script:VResizeTargetHeight = if ($ScrollHost.ActualHeight -gt 0) { [double]$ScrollHost.ActualHeight } else { Get-ListHeightForRows $script:UI.visibleRows }
+})
+$ResizeGripV.Add_DragDelta({
+  if ($List.Items.Count -le 0) { return }
+
+  $count = [int]$List.Items.Count
+  $maxRows = [Math]::Max(1, [Math]::Min(12, $count))
+  $minH = [double](Get-ListHeightForRows 1)
+  $maxH = [double](Get-ListHeightForRows $maxRows)
+
+  $script:VResizeTargetHeight += [double]$_.VerticalChange
+  $script:VResizeTargetHeight = [Math]::Max($minH, [Math]::Min($maxH, $script:VResizeTargetHeight))
+
+  # Preview freely during drag to avoid snap-layout feedback flicker.
+  $ScrollHost.Height = [Math]::Ceiling($script:VResizeTargetHeight)
+  $ScrollHost.VerticalScrollBarVisibility = if ($count -gt 1) { 'Auto' } else { 'Disabled' }
+})
+$ResizeGripV.Add_DragCompleted({
+  if ($List.Items.Count -gt 0) {
+    $h = if ($script:VResizeTargetHeight -gt 0) { [double]$script:VResizeTargetHeight } else { [double]$ScrollHost.ActualHeight }
+    $script:UI.visibleRows = Get-SnappedRowsForHeight $h
+  }
+  $script:IsVResizing = $false
+  Apply-ListSnapHeight
+  Save-UISettings
+})
 
 # Capture the handle and make the overlay a no-activate window (never steals focus).
 $Window.Add_SourceInitialized({
@@ -825,6 +986,7 @@ function Update-List {
     $script:RowMap.Clear()
     $CountText.Text = '0'
     $script:OverallState = 'idle'
+    Apply-ListSnapHeight
     return
   }
   $alive = Get-AliveProcessIds
@@ -981,6 +1143,7 @@ function Update-List {
   $CountText.Text = "$aliveCount active" +
     $(if ($busyCount)  { " $sep $busyCount busy" } else { '' }) +
     $(if ($grandTotal) { " $sep ~$(Format-Tokens $grandTotal) tok" } else { '' })
+  Apply-ListSnapHeight
 }
 
 # ---------------------------------------------------------------------------
@@ -1186,9 +1349,32 @@ $gifPollTimer.Start()
 # Reconcile the GIF window with the current overall state. Cheap no-op when the
 # target GIF path hasn't changed. -force reloads even if the path is unchanged
 # (used after the settings dialog edits paths).
+function Get-GifPathForState([string]$state) {
+  if (-not $script:Gif.enabled) { return '' }
+
+  $primary = [string]$script:Gif.paths[$state]
+  if (-not [string]::IsNullOrWhiteSpace($primary)) { return $primary }
+
+  # Never blank the GIF just because Claude entered a state whose GIF is unset.
+  # For waiting, prefer the running GIF as a visual "attention" fallback, then idle.
+  $fallbackOrder = switch ($state) {
+    'waiting' { @('running','idle') }
+    'running' { @('waiting','idle') }
+    default   { @('running','waiting') }
+  }
+  foreach ($k in $fallbackOrder) {
+    $p = [string]$script:Gif.paths[$k]
+    if (-not [string]::IsNullOrWhiteSpace($p)) { return $p }
+  }
+  return ''
+}
+
+# Reconcile the GIF window with the current overall state. Cheap no-op when the
+# target GIF path hasn't changed. -force reloads even if the path is unchanged
+# (used after the settings dialog edits paths).
 function Update-Gif([bool]$force = $false) {
   if (-not $script:gifWindow) { return }
-  $want = if ($script:Gif.enabled) { [string]$script:Gif.paths[$script:OverallState] } else { '' }
+  $want = Get-GifPathForState $script:OverallState
   if (-not $force -and $want -eq $script:GifShownPath) { return }
 
   if ([string]::IsNullOrWhiteSpace($want)) { Hide-Gif; $script:GifShownPath = $want; return }
@@ -1196,12 +1382,18 @@ function Update-Gif([bool]$force = $false) {
   # Already decoded -> show instantly.
   if ($script:GifCache.ContainsKey($want)) { Show-GifPack $script:GifCache[$want]; $script:GifShownPath = $want; return }
 
-  # Local file -> decode now (no network, fast).
+  # Local file -> decode now (no network, fast). If the new state's GIF is missing or
+  # invalid, keep the previous GIF visible instead of flashing/disappearing.
   if ($want -notmatch '^https?://') {
     $pack = Get-LocalGifPack $want
-    if ($pack) { $script:GifCache[$want] = $pack; Show-GifPack $pack }
-    else { Hide-Gif }
-    $script:GifShownPath = $want
+    if ($pack) {
+      $script:GifCache[$want] = $pack
+      Show-GifPack $pack
+      $script:GifShownPath = $want
+    } elseif (-not $script:GifActive) {
+      Hide-Gif
+      $script:GifShownPath = ''
+    }
     return
   }
 
@@ -1210,12 +1402,22 @@ function Update-Gif([bool]$force = $false) {
   if ($b -is [byte[]]) {
     $ms = New-Object System.IO.MemoryStream(, $b)
     $pack = ConvertTo-GifPack $ms       # decode on UI thread (fast)
-    if ($pack) { $script:GifCache[$want] = $pack; Show-GifPack $pack }
-    else { Hide-Gif }                   # bytes weren't a valid GIF
-    $script:GifShownPath = $want
+    if ($pack) {
+      $script:GifCache[$want] = $pack
+      Show-GifPack $pack
+      $script:GifShownPath = $want
+    } elseif (-not $script:GifActive) {
+      Hide-Gif
+      $script:GifShownPath = ''
+    }
     return
   }
-  if ($b -eq 'FAILED') { Hide-Gif; $script:GifShownPath = $want; return }   # download failed; stop until state changes
+  if ($b -eq 'FAILED') {
+    # Keep the current GIF on screen. Do not set GifShownPath to the failed target,
+    # otherwise a waiting-state download failure blanks the GIF until the state changes.
+    if (-not $script:GifActive) { Hide-Gif; $script:GifShownPath = '' }
+    return
+  }
 
   # Bytes not here yet: enqueue the download once and LEAVE the current GIF on screen
   # (no freeze, no flicker). Do NOT advance GifShownPath -> the next poll re-checks and
