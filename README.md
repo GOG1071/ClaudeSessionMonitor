@@ -4,7 +4,7 @@ A lightweight, always-on-top Windows overlay that shows every running Claude Cod
 session globally — across all terminals, projects, and virtual desktops.
 
 > **Setting up on a new machine?** See [INSTALL.md](INSTALL.md) — it covers the one
-> step that isn't in the repo: registering the `needs_input` attention hook in
+> step that isn't in the repo: registering the `waiting` attention hook in
 > `~/.claude/settings.json`.
 
 ## Features
@@ -69,7 +69,7 @@ for it. The floating GIF window only appears when the current state has a GIF co
 - Busy and idle map directly from each session's native status (`busy` → **running**,
   otherwise → **idle**). Dead-process sessions are ignored.
 - **Needs-input requires the attention hook.** Claude Code's native `~/.claude/sessions`
-  files only ever report `busy`/`idle` — never `needs_input` — so the *waiting-for-you* state
+  files only ever report `busy`/`idle` — never `waiting` — so the *waiting-for-you* state
   comes from `scripts/session-attention.cjs`, wired into `~/.claude/settings.json` as a
   `Notification` hook (writes a marker when Claude needs input) and a `UserPromptSubmit` hook
   (clears it when you reply). The overlay shows **needs input** for any alive, non-busy session

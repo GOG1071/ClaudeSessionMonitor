@@ -16,9 +16,9 @@ move between busy / waiting-for-input / idle.
 |---|---|
 | Target codebase | Port into `overlay.ps1` (this repo), using MyClaudeMonitor as the design reference |
 | GIF placement | Separate floating, borderless, always-on-top window (not inline in the list panel) |
-| State set | `running` · `needs_input` · `idle` (**no `error`** state — dropped per user) |
-| State source | Read the session JSON `status` field directly (`busy`→running, `needs_input`→needs_input, else idle). No hooks, no transcript parsing. |
-| Aggregate priority | `needs_input` > `running` > `idle` (mirrors MyClaudeMonitor minus error) |
+| State set | `running` · `waiting` · `idle` (**no `error`** state — dropped per user) |
+| State source | Read the session JSON `status` field directly (`busy`→running, `waiting`→waiting, else idle). No hooks, no transcript parsing. |
+| Aggregate priority | `waiting` > `running` > `idle` (mirrors MyClaudeMonitor minus error) |
 | GIF source | User-configured file path/URL per state in `settings.json`; **empty by default** (no bundled assets) |
 | Animation engine | Zero-dependency WPF frame animator: `GifBitmapDecoder` → frames + `DispatcherTimer`. No external DLL (honors "built-in PowerShell 5.1 only"). |
 
@@ -31,18 +31,18 @@ move between busy / waiting-for-input / idle.
   reuses these for no-activate + show-on-all-desktops behavior.
 - `settings.json` load/save (overlay.ps1:270–284) — extend the same struct; no new persistence layer.
 - Per-session `status` already passes through untouched (`$color = $s.status`, overlay.ps1:634), so
-  `needs_input` already renders (currently as the default orange dot). We formalize it.
+  `waiting` already renders (currently as the default orange dot). We formalize it.
 
 ## Overall-state aggregation (the core mapping)
 
 ```
 foreach session:
   effective = if (process dead) -> "idle"            # 'stale' counts as not-active for the GIF
-              elif status == "needs_input" -> "needs_input"
+              elif status == "waiting" -> "waiting"
               elif status == "busy"        -> "running"
               else                         -> "idle"
 
-overall = if any "needs_input" -> "needs_input"
+overall = if any "waiting" -> "waiting"
           elif any "running"   -> "running"
           else                 -> "idle"
 ```
@@ -59,18 +59,18 @@ GIF shown = `settings.gifPaths[overall]`; if that path is empty/unloadable → w
 Tasks:
 1. Extend the `$script:UI` settings struct and `settings.json` shape with:
    - `gifEnabled` (bool, default `true`)
-   - `gifPaths` = `{ running = ""; needs_input = ""; idle = "" }` (empty default)
+   - `gifPaths` = `{ running = ""; waiting = ""; idle = "" }` (empty default)
    - `gifWindow` = `{ left; top; width=200; height=200 }` (persist GIF window position/size)
 2. Update `Save-UISettings` to round-trip the new fields (keep existing width/opacity).
 3. In `Update-List`, after building `$rows`, compute `$script:OverallState` using the mapping above.
    Expose it as a script-scope variable the GIF window timer reads (no extra disk scan).
-4. Recognize `needs_input` in `New-Row`'s dot-color switch (overlay.ps1:556) → distinct color
+4. Recognize `waiting` in `New-Row`'s dot-color switch (overlay.ps1:556) → distinct color
    (e.g. yellow `#FFE6A23C`) so the list and GIF agree.
 
 **Verify:** Launch overlay; with a real session, confirm `$script:OverallState` transitions
 busy↔idle correctly (temporary debug write to `CountText`). Confirm a session in an approval
-prompt reports `status:"needs_input"` in its `~/.claude/sessions/<pid>.json` — **this validates the
-core assumption that Claude Code emits `needs_input`** (see Risk R1).
+prompt reports `status:"waiting"` in its `~/.claude/sessions/<pid>.json` — **this validates the
+core assumption that Claude Code emits `waiting`** (see Risk R1).
 
 ## Phase 2 — Zero-dependency WPF GIF frame animator
 
@@ -120,7 +120,7 @@ focus (typing in the terminal is unaffected), and follows across virtual desktop
 
 Tasks:
 1. Add a small **GIF** button to the header (next to Close) opening a lightweight settings popup
-   (a child WPF window or an inline expander) with three path fields (running / needs_input / idle),
+   (a child WPF window or an inline expander) with three path fields (running / waiting / idle),
    a "GIF enabled" checkbox, and Save/Reset. Mirror MyClaudeMonitor's `SettingsModal` field layout.
    Reset → clears all three paths (empty = the documented default).
 2. Wire Save → update `$script:UI`, call `Save-UISettings`, and immediately re-evaluate the GIF.
@@ -135,7 +135,7 @@ shows for the current state on cold start.
 **Files:** `overlay.ps1`
 
 Tasks:
-1. Full run-through: 0 sessions (idle GIF / hidden), 1 busy, mixed busy+idle, a needs_input session.
+1. Full run-through: 0 sessions (idle GIF / hidden), 1 busy, mixed busy+idle, a waiting session.
 2. Confirm `Window.Add_Closed` stops the new GIF timer(s) + animator (extend overlay.ps1:698).
 3. Stale/dead-process sessions don't pin the GIF to a non-idle state.
 4. Bad GIF path, 1-frame GIF, huge GIF, and `file://` vs local path all degrade gracefully.
@@ -149,7 +149,7 @@ Tasks:
 
 | Risk | Likelihood (1-5) | Impact (1-5) | Score | Mitigation |
 |------|-----------------|--------------|-------|------------|
-| R1: Claude Code does **not** actually emit `needs_input` in `~/.claude/sessions/<pid>.json` (sample only showed busy/idle) | 3 | 4 | 12 | Phase 1 verify step confirms it live during an approval prompt. If absent, needs_input silently collapses into running — feature still ships with 2 visible states; revisit detection only if confirmed missing. |
+| R1: Claude Code does **not** actually emit `waiting` in `~/.claude/sessions/<pid>.json` (sample only showed busy/idle) | 3 | 4 | 12 | Phase 1 verify step confirms it live during an approval prompt. If absent, waiting silently collapses into running — feature still ships with 2 visible states; revisit detection only if confirmed missing. |
 | R2: GIF animation in WPF without an external DLL is fiddly (per-frame delay metadata, looping, disposal) | 3 | 3 | 9 | Phase 2 is an isolated, independently-testable animator. Fallback: fixed ~10fps if per-frame delay parse fails; last resort `WpfAnimatedGif.dll` (rejected unless 2 isolated attempts fail). |
 | R3: Transparent topmost window + GIFs with a baked (non-transparent) background look boxed. WPF has no CSS `mix-blend-mode: screen` (MyClaudeMonitor's trick) | 3 | 2 | 6 | Document: prefer transparent GIFs. Optionally add a configurable window background or an opacity-key; do NOT block the feature on it. |
 | R4: Second always-on-top no-activate window mis-pins / fights the main window for desktop-follow | 2 | 3 | 6 | Reuse the proven `Pinner`/`VD` path; pin both hwnds in the same one-shot timer; test across ≥2 virtual desktops. |
