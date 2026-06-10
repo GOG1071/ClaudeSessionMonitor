@@ -917,8 +917,12 @@ function Show-GifSettings {
   $rb.Text = $script:Gif.paths.running
   $nb.Text = $script:Gif.paths.needs_input
   $ib.Text = $script:Gif.paths.idle
-  $w.FindName('ResetBtn').Add_Click({ $rb.Text = ''; $nb.Text = ''; $ib.Text = '' }.GetNewClosure())
-  $w.FindName('CancelBtn').Add_Click({ $w.Close() }.GetNewClosure())
+  # NOTE: do NOT use .GetNewClosure() on these handlers. GetNewClosure wraps the block
+  # in a new module where $script: resolves to that module (so $script:Gif is $null and
+  # the handler throws). The dialog is modal, so these plain scriptblocks keep access to
+  # the function's local controls AND the real $script:Gif scope.
+  $w.FindName('ResetBtn').Add_Click({ $rb.Text = ''; $nb.Text = ''; $ib.Text = '' })
+  $w.FindName('CancelBtn').Add_Click({ $w.Close() })
   $w.FindName('SaveBtn').Add_Click({
     $script:Gif.enabled           = [bool]$en.IsChecked
     $script:Gif.paths.running     = $rb.Text.Trim()
@@ -927,7 +931,7 @@ function Show-GifSettings {
     Save-UISettings
     Update-Gif $true
     $w.Close()
-  }.GetNewClosure())
+  })
   # The overlay is a no-activate window, so a modal opened from it gets MOUSE clicks
   # but not KEYBOARD focus (typed text would go to the terminal). Force this dialog to
   # the foreground using the same AttachThreadInput trick the overlay uses elsewhere,
@@ -939,7 +943,7 @@ function Show-GifSettings {
     } catch {}
     $rb.Focus() | Out-Null
     [System.Windows.Input.Keyboard]::Focus($rb) | Out-Null
-  }.GetNewClosure())
+  })
   [void]$w.ShowDialog()
 }
 
