@@ -182,6 +182,17 @@ public static class Pinner {
       return pa.IsViewPinned(view);
     } catch { return false; }
   }
+  // Unpin the window from all virtual desktops. Returns true if Windows now reports it unpinned.
+  public static bool Unpin(IntPtr hwnd) {
+    try {
+      var s = Shell(); var vc = VC(s);
+      IApplicationView view; int hr = vc.GetViewForHwnd(hwnd, out view);
+      if (hr != 0 || view == null) return false;
+      var pa = PA(s);
+      if (pa.IsViewPinned(view)) pa.UnpinView(view);
+      return !pa.IsViewPinned(view);
+    } catch { return false; }
+  }
 }
 "@
 
@@ -228,6 +239,7 @@ function Save-Links {
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="Auto"/>
           </Grid.ColumnDefinitions>
           <TextBlock Grid.Column="0" Text="&#x25CF; Claude Sessions" Foreground="#FFE6A23C"
                      FontFamily="Segoe UI Semibold" FontSize="12" VerticalAlignment="Center"
@@ -237,10 +249,13 @@ function Save-Links {
                   ToolTip="Window opacity" IsMoveToPointEnabled="True"/>
           <TextBlock Grid.Column="2" x:Name="CountText" Text="" Foreground="#80FFFFFF"
                      FontFamily="Segoe UI" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
-          <Button Grid.Column="3" x:Name="GifBtn" Content="GIF" Width="34" Height="30"
+          <Button Grid.Column="3" x:Name="PinBtn" Content="&#x1F4CC;" Width="30" Height="30"
+                  Foreground="#FFE6A23C" Background="Transparent" BorderThickness="0"
+                  FontSize="13" Cursor="Hand" ToolTip="Pin on top / all desktops"/>
+          <Button Grid.Column="4" x:Name="GifBtn" Content="GIF" Width="34" Height="30"
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
                   FontSize="11" Cursor="Hand" ToolTip="Configure status GIFs"/>
-          <Button Grid.Column="4" x:Name="CloseBtn" Content="&#x2715;" Width="30" Height="30"
+          <Button Grid.Column="5" x:Name="CloseBtn" Content="&#x2715;" Width="30" Height="30"
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
                   FontSize="13" Cursor="Hand"/>
         </Grid>
@@ -270,10 +285,11 @@ $CountText  = $Window.FindName('CountText')
 $ResizeGrip = $Window.FindName('ResizeGrip')
 $OpacitySlider = $Window.FindName('OpacitySlider')
 $GifBtn     = $Window.FindName('GifBtn')
+$PinBtn     = $Window.FindName('PinBtn')
 
 # Persisted UI settings (width + opacity).
 $UISettingsFile = Join-Path $PSScriptRoot 'settings.json'
-$script:UI = @{ width = 340.0; opacity = 0.95 }
+$script:UI = @{ width = 340.0; opacity = 0.95; pinned = $true }
 
 # Per-state GIF config. Each path is user-configured (a local file path, or a
 # file:// / http(s) URL); an empty path means "no GIF for that state". The floating
@@ -289,6 +305,7 @@ if (Test-Path $UISettingsFile) {
     $cfg = Get-Content $UISettingsFile -Raw | ConvertFrom-Json
     if ($cfg.width)   { $script:UI.width   = [double]$cfg.width }
     if ($cfg.opacity) { $script:UI.opacity = [double]$cfg.opacity }
+    if ($null -ne $cfg.pinned) { $script:UI.pinned = [bool]$cfg.pinned }
     # GIF settings are additive: missing keys fall back to the defaults above.
     if ($null -ne $cfg.gifEnabled) { $script:Gif.enabled = [bool]$cfg.gifEnabled }
     if ($cfg.gifPaths) {
@@ -308,6 +325,7 @@ function Save-UISettings {
     [pscustomobject]@{
       width      = $Window.Width
       opacity    = $OpacitySlider.Value
+      pinned     = $script:UI.pinned
       gifEnabled = $script:Gif.enabled
       gifPaths   = [pscustomobject]$script:Gif.paths
       gifWindow  = [pscustomobject]$script:Gif.win
@@ -319,6 +337,7 @@ function Save-UISettings {
 $Window.Width = [Math]::Max(240, [Math]::Min(1000, $script:UI.width))
 $OpacitySlider.Value = [Math]::Max(0.25, [Math]::Min(1.0, $script:UI.opacity))
 $Window.Opacity = $OpacitySlider.Value
+$Window.Topmost = $script:UI.pinned   # honor persisted pin state from first paint
 
 # Drag the window from the header — but not when interacting with the opacity slider.
 $Header.Add_MouseLeftButtonDown({
@@ -431,7 +450,9 @@ function Show-RowFlash($row, $hex) {
   $ft = New-Object System.Windows.Threading.DispatcherTimer
   $ft.Interval = [TimeSpan]::FromMilliseconds(700)
   $ft.Add_Tick({
-    $row.Background = [Windows.Media.BrushConverter]::new().ConvertFrom('#1AFFFFFF')
+    # Restore the row's status tint (falls back to a neutral gray if unset).
+    $restore = if ($row.Tag -and $row.Tag.BaseBg) { $row.Tag.BaseBg } else { '#386E7681' }
+    $row.Background = [Windows.Media.BrushConverter]::new().ConvertFrom($restore)
     $this.Stop()
   }.GetNewClosure())
   $ft.Start()
@@ -542,10 +563,23 @@ function New-Row($session) {
   $border.CornerRadius = '7'
   $border.Margin = '0,3,0,0'
   $border.Padding = '10,7,10,7'
-  $border.Background = [Windows.Media.BrushConverter]::new().ConvertFrom('#1AFFFFFF')
+  # Row background encodes status (replaces the old colored dot): a translucent tint
+  # per state, with a slightly stronger tint on hover.
+  switch ($session.color) {
+    'busy'        { $baseBg = '#2E3FB950'; $hoverBg = '#4D3FB950' }   # green  = running
+    'needs_input' { $baseBg = '#38D29922'; $hoverBg = '#57D29922' }   # yellow = waiting for input
+    'stale'       { $baseBg = '#33F85149'; $hoverBg = '#52F85149' }   # red    = process ended
+    'idle'        { $baseBg = '#386E7681'; $hoverBg = '#576E7681' }   # gray   = idle
+    default       { $baseBg = '#386E7681'; $hoverBg = '#576E7681' }
+  }
+  $border.Background = [Windows.Media.BrushConverter]::new().ConvertFrom($baseBg)
 
-  # Left-click focuses the session's terminal; right-click links it to the current terminal.
-  $border.Tag = [pscustomobject]@{ Pid = $session.pid; Cwd = $session.cwd; SessionId = $session.sessionId }
+  # Tag carries focus/link identity plus the row's base/hover tints (read by the hover
+  # handlers and Show-RowFlash so they restore the right status color, not a flat gray).
+  $border.Tag = [pscustomobject]@{
+    Pid = $session.pid; Cwd = $session.cwd; SessionId = $session.sessionId
+    BaseBg = $baseBg; HoverBg = $hoverBg
+  }
   $border.Cursor = 'Hand'
   if ($session.tip) { $border.ToolTip = $session.tip }
 
@@ -573,35 +607,17 @@ function New-Row($session) {
     }
   })
 
-  $border.Add_MouseEnter({ $this.Background = [Windows.Media.BrushConverter]::new().ConvertFrom('#33FFFFFF') })
-  $border.Add_MouseLeave({ $this.Background = [Windows.Media.BrushConverter]::new().ConvertFrom('#1AFFFFFF') })
+  $border.Add_MouseEnter({ $this.Background = [Windows.Media.BrushConverter]::new().ConvertFrom($this.Tag.HoverBg) })
+  $border.Add_MouseLeave({ $this.Background = [Windows.Media.BrushConverter]::new().ConvertFrom($this.Tag.BaseBg) })
 
   $grid = New-Object System.Windows.Controls.Grid
-  $c0 = New-Object System.Windows.Controls.ColumnDefinition; $c0.Width = 'Auto'
-  $c1 = New-Object System.Windows.Controls.ColumnDefinition; $c1.Width = '*'
-  $c2 = New-Object System.Windows.Controls.ColumnDefinition; $c2.Width = 'Auto'
+  $c0 = New-Object System.Windows.Controls.ColumnDefinition; $c0.Width = '*'
+  $c1 = New-Object System.Windows.Controls.ColumnDefinition; $c1.Width = 'Auto'
   $grid.ColumnDefinitions.Add($c0)
   $grid.ColumnDefinitions.Add($c1)
-  $grid.ColumnDefinitions.Add($c2)
-
-  # status dot color
-  switch ($session.color) {
-    'busy'        { $dot = '#FF67C23A' }   # green = actively working
-    'needs_input' { $dot = '#FFE6A23C' }   # yellow = waiting for user input
-    'idle'        { $dot = '#FF909399' }   # gray = waiting
-    'stale'       { $dot = '#FFF56C6C' }   # red = process gone
-    default       { $dot = '#FFE6A23C' }
-  }
-
-  $ell = New-Object System.Windows.Shapes.Ellipse
-  $ell.Width = 9; $ell.Height = 9
-  $ell.VerticalAlignment = 'Center'
-  $ell.Margin = '0,0,9,0'
-  $ell.Fill = [Windows.Media.BrushConverter]::new().ConvertFrom($dot)
-  [Windows.Controls.Grid]::SetColumn($ell, 0)
 
   $stack = New-Object System.Windows.Controls.StackPanel
-  [Windows.Controls.Grid]::SetColumn($stack, 1)
+  [Windows.Controls.Grid]::SetColumn($stack, 0)
 
   $name = New-Object System.Windows.Controls.TextBlock
   $name.FontFamily = 'Segoe UI Semibold'
@@ -633,9 +649,8 @@ function New-Row($session) {
   $age.FontSize = 10
   $age.VerticalAlignment = 'Center'
   $age.Margin = '8,0,0,0'
-  [Windows.Controls.Grid]::SetColumn($age, 2)
+  [Windows.Controls.Grid]::SetColumn($age, 1)
 
-  $grid.Children.Add($ell)   | Out-Null
   $grid.Children.Add($stack) | Out-Null
   $grid.Children.Add($age)   | Out-Null
   $border.Child = $grid
@@ -968,9 +983,9 @@ $timer.Interval = [TimeSpan]::FromSeconds(2)
 $timer.Add_Tick({ Update-List; Update-Gif })
 $timer.Start()
 
-# Show on all desktops. Primary: ask Windows to pin the window (Windows-side, no
-# polling). Fallback: if pinning isn't available, a light timer keeps the overlay on
-# the active desktop so it still follows you everywhere.
+# Always-on-top + show-on-all-desktops, toggled by the header pin button. Primary: ask
+# Windows to pin the window (Windows-side, no polling). Fallback: if pinning isn't
+# available, a light timer keeps the overlay on the active desktop so it follows you.
 $script:overlayHwnd = [IntPtr]::Zero
 $script:pinned = $false
 
@@ -980,14 +995,36 @@ $followTimer.Add_Tick({
   if ($script:overlayHwnd -ne [IntPtr]::Zero) { [VD]::Follow($script:overlayHwnd) }
 })
 
-# One-shot pin, fired ~600ms after show so the shell has registered the window as a view.
+# Apply (and persist) the pin state. ON = always-on-top + pinned/followed across every
+# virtual desktop; OFF = a normal window that stays on its current desktop.
+function Set-Pinned([bool]$on) {
+  $script:UI.pinned = $on
+  $Window.Topmost = $on
+  $h = $script:overlayHwnd
+  if ($on) {
+    if ($h -ne [IntPtr]::Zero) { $script:pinned = [Pinner]::Pin($h) }
+    if ($script:pinned) { $followTimer.Stop() } else { $followTimer.Start() }
+    $PinBtn.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#FFE6A23C')  # accent = pinned
+    $PinBtn.ToolTip = 'Pinned: on top + all desktops (click to unpin)'
+  } else {
+    $followTimer.Stop()
+    if ($h -ne [IntPtr]::Zero) { [void][Pinner]::Unpin($h) }
+    $script:pinned = $false
+    $PinBtn.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#66FFFFFF')  # dim = unpinned
+    $PinBtn.ToolTip = 'Unpinned (click to pin on top + all desktops)'
+  }
+  Save-UISettings
+}
+$PinBtn.Add_Click({ Set-Pinned (-not $script:UI.pinned) })
+
+# One-shot, ~600ms after show (the shell has registered the window as a view by then):
+# apply the persisted pin state — pins, or leaves it unpinned.
 $pinTimer = New-Object System.Windows.Threading.DispatcherTimer
 $pinTimer.Interval = [TimeSpan]::FromMilliseconds(600)
 $pinTimer.Add_Tick({
   $pinTimer.Stop()
   $script:overlayHwnd = (New-Object System.Windows.Interop.WindowInteropHelper $Window).Handle
-  if ($script:overlayHwnd -ne [IntPtr]::Zero) { $script:pinned = [Pinner]::Pin($script:overlayHwnd) }
-  if (-not $script:pinned) { $followTimer.Start() }   # Windows-side pin unavailable -> follow
+  Set-Pinned $script:UI.pinned
 })
 $pinTimer.Start()
 

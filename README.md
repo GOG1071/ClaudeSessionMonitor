@@ -6,8 +6,8 @@ session globally — across all terminals, projects, and virtual desktops.
 ## Features
 
 - **Live session list** — reads `~/.claude/sessions/<pid>.json` and refreshes every 2s.
-  Each row shows the project folder, the session **PID**, and a coloured status dot
-  (🟢 busy · ⚪ idle · 🔴 ended).
+  Each row shows the project folder and the session **PID**, with a **status-coloured row
+  background** (🟢 busy · 🟡 needs-input · ⚪ idle · 🔴 ended).
 - **What each session is doing** — the second line summarises the session's current
   activity, read from its transcript (`~/.claude/projects/<cwd>/<sessionId>.jsonl`).
   Hover a row for the full text plus pid, version, status, and cwd.
@@ -18,6 +18,9 @@ session globally — across all terminals, projects, and virtual desktops.
   the row to link it. The link is remembered per session.
 - **Shown on all desktops** — pinned natively via the Windows virtual-desktop shell API
   (with an automatic "follow the active desktop" fallback if pinning is unavailable).
+- **Pin toggle** — the 📌 button in the header turns the always-on-top + show-on-all-desktops
+  behaviour on (default) or off. When off, the overlay is a normal window that stays on its
+  current desktop. The choice persists across restarts.
 - **Resizable & adjustable opacity** — drag the right edge to change width; use the
   header slider to change opacity. Both persist across restarts.
 - **Status GIF** — an optional separate floating window shows a different animated GIF
