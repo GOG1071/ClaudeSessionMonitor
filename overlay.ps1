@@ -334,22 +334,23 @@ function Format-Age([long]$ms) {
   return "${d}d"
 }
 
-# Read a session's transcript tail and summarise what it's currently doing, plus the
-# most recent user prompt. Cached per session keyed on updatedAt, so idle sessions
-# aren't re-parsed every tick. Returns @{ activity = <what it's doing>; prompt = <last user prompt> }.
+# Read a session's transcript tail and summarise what it's currently doing, the most
+# recent user prompt, and the model in use. Cached per session keyed on updatedAt, so
+# idle sessions aren't re-parsed every tick.
+# Returns @{ activity = <what it's doing>; prompt = <last user prompt>; model = <model id> }.
 $script:ActivityCache = @{}
 function Get-SessionActivity($cwd, $sessionId, $updatedAt) {
-  $empty = @{ activity = ''; prompt = '' }
+  $empty = @{ activity = ''; prompt = ''; model = '' }
   if (-not $sessionId -or -not $cwd) { return $empty }
   $cached = $script:ActivityCache[$sessionId]
   if ($cached -and $cached.upd -eq $updatedAt) { return $cached.val }
 
   $enc  = ($cwd -replace '[^A-Za-z0-9]', '-')
   $path = Join-Path $env:USERPROFILE ".claude\projects\$enc\$sessionId.jsonl"
-  $val  = @{ activity = ''; prompt = '' }
+  $val  = @{ activity = ''; prompt = ''; model = '' }
   if (Test-Path $path) {
     try {
-      $lastUser = ''; $lastAsst = ''; $lastTool = ''
+      $lastUser = ''; $lastAsst = ''; $lastTool = ''; $lastModel = ''
       foreach ($ln in (Get-Content -Path $path -Tail 80 -Encoding UTF8 -ErrorAction Stop)) {
         if ([string]::IsNullOrWhiteSpace($ln)) { continue }
         try { $d = $ln | ConvertFrom-Json } catch { continue }
@@ -363,6 +364,7 @@ function Get-SessionActivity($cwd, $sessionId, $updatedAt) {
           if ($t -and -not $t.StartsWith('<') -and -not $t.StartsWith('Caveat') -and $t -notmatch 'tool_result') { $lastUser = $t }
         }
         elseif ($m.role -eq 'assistant' -and $c) {
+          if ($m.model) { $lastModel = "$($m.model)" }    # model can change mid-session; last wins
           foreach ($b in $c) {
             if ($b.type -eq 'text' -and "$($b.text)".Trim()) { $lastAsst = $b.text }
             elseif ($b.type -eq 'tool_use') { $lastTool = $b.name }
@@ -374,11 +376,20 @@ function Get-SessionActivity($cwd, $sessionId, $updatedAt) {
       if ($act.Length -gt 200) { $act = $act.Substring(0, 200) }
       $prompt = ($lastUser -replace '\s+', ' ').Trim()
       if ($prompt.Length -gt 200) { $prompt = $prompt.Substring(0, 200) }
-      $val = @{ activity = $act; prompt = $prompt }
+      $val = @{ activity = $act; prompt = $prompt; model = $lastModel }
     } catch {}
   }
   $script:ActivityCache[$sessionId] = @{ upd = $updatedAt; val = $val }
   return $val
+}
+
+# Shorten a model id for display: "claude-opus-4-8" -> "opus 4.8",
+# "claude-sonnet-4-6" -> "sonnet 4.6", "claude-haiku-4-5-20251001" -> "haiku 4.5".
+function Format-Model([string]$m) {
+  if (-not $m) { return '' }
+  $x = $m -replace '^claude-', '' -replace '-\d{8}$', ''   # strip prefix + trailing date stamp
+  if ($x -match '^([a-z]+)-(\d+)-(\d+)') { return "$($matches[1]) $($matches[2]).$($matches[3])" }
+  return $x
 }
 
 # Token consumption per session. Sums message.usage across the whole transcript
@@ -660,6 +671,14 @@ function New-Row {
   $sub.TextTrimming = 'CharacterEllipsis'
   $stack.Children.Add($sub) | Out-Null
 
+  # Model + CLI version (e.g. "opus 4.8 · v2.1.170"), dim. Collapsed when unknown.
+  $meta = New-Object System.Windows.Controls.TextBlock
+  $meta.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#807AC2FF')
+  $meta.FontFamily = 'Segoe UI'
+  $meta.FontSize = 10
+  $meta.TextTrimming = 'CharacterEllipsis'
+  $stack.Children.Add($meta) | Out-Null
+
   # Right column: age on top, cumulative token consumption below.
   $right = New-Object System.Windows.Controls.StackPanel
   $right.VerticalAlignment = 'Center'
@@ -697,7 +716,7 @@ function New-Row {
 
   return @{
     Border = $border; Dot = $ell; RunName = $runName; RunPid = $runPid
-    Prompt = $promptTb; Sub = $sub; Age = $age; Ctx = $ctx; Tok = $tok
+    Prompt = $promptTb; Sub = $sub; Meta = $meta; Age = $age; Ctx = $ctx; Tok = $tok
   }
 }
 
@@ -727,6 +746,14 @@ function Set-RowData($e, $r) {
   }
 
   if ($e.Sub.Text -ne $r.sub)           { $e.Sub.Text = $r.sub }
+
+  if ($r.metaTxt) {
+    if ($e.Meta.Text -ne $r.metaTxt)    { $e.Meta.Text = $r.metaTxt }
+    if ($e.Meta.Visibility -ne 'Visible') { $e.Meta.Visibility = 'Visible' }
+  } elseif ($e.Meta.Visibility -ne 'Collapsed') {
+    $e.Meta.Visibility = 'Collapsed'
+  }
+
   if ($e.Age.Text -ne $r.age)           { $e.Age.Text = $r.age }
   if ($e.Ctx.Text -ne $r.ctxTxt)        { $e.Ctx.Text = $r.ctxTxt }
   if ($e.Tok.Text -ne $r.tokTxt)        { $e.Tok.Text = $r.tokTxt }
@@ -766,10 +793,19 @@ function Update-List {
 
     $age = Format-Age ($now - [long]$s.updatedAt)
 
-    $act = if ($isAlive) { Get-SessionActivity $s.cwd $s.sessionId $s.updatedAt } else { @{ activity = ''; prompt = '' } }
+    $act = if ($isAlive) { Get-SessionActivity $s.cwd $s.sessionId $s.updatedAt } else { @{ activity = ''; prompt = ''; model = '' } }
     $activity = $act.activity
     $prompt   = $act.prompt
     $sub = if ($activity) { $activity } else { "$statusTxt $sep pid $($s.pid)" }
+
+    # Model (from transcript) + CLI version (from session JSON). Effort/reasoning level
+    # is not recorded anywhere in the session or transcript, so it can't be shown.
+    $modelTxt  = Format-Model $act.model
+    $ver       = "$($s.version)"
+    $metaParts = @()
+    if ($modelTxt) { $metaParts += $modelTxt }
+    if ($ver)      { $metaParts += "v$ver" }
+    $metaTxt   = ($metaParts -join " $sep ")
     $tip = "pid $($s.pid) $sep v$($s.version) $sep $statusTxt`n$($s.cwd)" +
       $(if ($prompt)   { "`n`nprompt: $prompt" } else { '' }) +
       $(if ($activity) { "`n`n$activity" } else { '' })
@@ -797,6 +833,7 @@ function Update-List {
       name   = $proj
       prompt = $prompt
       sub    = $sub
+      metaTxt = $metaTxt
       tip    = $tip
       age    = $age
       color  = $color
