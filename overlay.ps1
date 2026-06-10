@@ -182,10 +182,25 @@ public static class Pinner {
       return pa.IsViewPinned(view);
     } catch { return false; }
   }
+  // Unpin the window from all virtual desktops. Returns true if Windows now reports it unpinned.
+  public static bool Unpin(IntPtr hwnd) {
+    try {
+      var s = Shell(); var vc = VC(s);
+      IApplicationView view; int hr = vc.GetViewForHwnd(hwnd, out view);
+      if (hr != 0 || view == null) return false;
+      var pa = PA(s);
+      if (pa.IsViewPinned(view)) pa.UnpinView(view);
+      return !pa.IsViewPinned(view);
+    } catch { return false; }
+  }
 }
 "@
 
 $SessionsDir = Join-Path $env:USERPROFILE '.claude\sessions'
+# needs_input markers written by scripts\session-attention.cjs (Notification hook).
+# The native session JSON only ever carries busy/idle, so this sidecar is the sole
+# source for the "Claude is waiting for the user" state.
+$AttentionDir = Join-Path $env:USERPROFILE '.claude\session-attention'
 $sep = [char]0x00B7   # middle dot, defined via char code so file encoding never mangles it
 
 # Persisted "links": sessionId -> terminal window handle, for sessions whose window
@@ -227,6 +242,8 @@ function Save-Links {
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="Auto"/>
           </Grid.ColumnDefinitions>
           <TextBlock Grid.Column="0" Text="&#x25CF; Claude Sessions" Foreground="#FFE6A23C"
                      FontFamily="Segoe UI Semibold" FontSize="12" VerticalAlignment="Center"
@@ -236,7 +253,13 @@ function Save-Links {
                   ToolTip="Window opacity" IsMoveToPointEnabled="True"/>
           <TextBlock Grid.Column="2" x:Name="CountText" Text="" Foreground="#80FFFFFF"
                      FontFamily="Segoe UI" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
-          <Button Grid.Column="3" x:Name="CloseBtn" Content="&#x2715;" Width="30" Height="30"
+          <Button Grid.Column="3" x:Name="PinBtn" Content="&#x1F4CC;" Width="30" Height="30"
+                  Foreground="#FFE6A23C" Background="Transparent" BorderThickness="0"
+                  FontSize="13" Cursor="Hand" ToolTip="Pin on top / all desktops"/>
+          <Button Grid.Column="4" x:Name="GifBtn" Content="GIF" Width="34" Height="30"
+                  Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
+                  FontSize="11" Cursor="Hand" ToolTip="Configure status GIFs"/>
+          <Button Grid.Column="5" x:Name="CloseBtn" Content="&#x2715;" Width="30" Height="30"
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
                   FontSize="13" Cursor="Hand"/>
         </Grid>
@@ -265,21 +288,52 @@ $CloseBtn   = $Window.FindName('CloseBtn')
 $CountText  = $Window.FindName('CountText')
 $ResizeGrip = $Window.FindName('ResizeGrip')
 $OpacitySlider = $Window.FindName('OpacitySlider')
+$GifBtn     = $Window.FindName('GifBtn')
+$PinBtn     = $Window.FindName('PinBtn')
 
 # Persisted UI settings (width + opacity).
 $UISettingsFile = Join-Path $PSScriptRoot 'settings.json'
-$script:UI = @{ width = 340.0; opacity = 0.95 }
+$script:UI = @{ width = 340.0; opacity = 0.95; pinned = $true }
+
+# Per-state GIF config. Each path is user-configured (a local file path, or a
+# file:// / http(s) URL); an empty path means "no GIF for that state". The floating
+# GIF window shows the GIF for the current overall Claude state, aggregated across all
+# sessions with priority needs_input > running > idle. Empty default = feature off.
+$script:Gif = @{
+  enabled = $true
+  paths   = @{ running = ''; needs_input = ''; idle = '' }
+  win     = @{ left = 60.0; top = 360.0; width = 200.0; height = 200.0 }
+}
 if (Test-Path $UISettingsFile) {
   try {
     $cfg = Get-Content $UISettingsFile -Raw | ConvertFrom-Json
     if ($cfg.width)   { $script:UI.width   = [double]$cfg.width }
     if ($cfg.opacity) { $script:UI.opacity = [double]$cfg.opacity }
+    if ($null -ne $cfg.pinned) { $script:UI.pinned = [bool]$cfg.pinned }
+    # GIF settings are additive: missing keys fall back to the defaults above.
+    if ($null -ne $cfg.gifEnabled) { $script:Gif.enabled = [bool]$cfg.gifEnabled }
+    if ($cfg.gifPaths) {
+      foreach ($k in 'running','needs_input','idle') {
+        if ($cfg.gifPaths.$k) { $script:Gif.paths[$k] = [string]$cfg.gifPaths.$k }
+      }
+    }
+    if ($cfg.gifWindow) {
+      foreach ($k in 'left','top','width','height') {
+        if ($null -ne $cfg.gifWindow.$k) { $script:Gif.win[$k] = [double]$cfg.gifWindow.$k }
+      }
+    }
   } catch {}
 }
 function Save-UISettings {
   try {
-    [pscustomobject]@{ width = $Window.Width; opacity = $OpacitySlider.Value } |
-      ConvertTo-Json -Compress | Set-Content -Path $UISettingsFile -Encoding UTF8
+    [pscustomobject]@{
+      width      = $Window.Width
+      opacity    = $OpacitySlider.Value
+      pinned     = $script:UI.pinned
+      gifEnabled = $script:Gif.enabled
+      gifPaths   = [pscustomobject]$script:Gif.paths
+      gifWindow  = [pscustomobject]$script:Gif.win
+    } | ConvertTo-Json -Compress | Set-Content -Path $UISettingsFile -Encoding UTF8
   } catch {}
 }
 
@@ -287,6 +341,7 @@ function Save-UISettings {
 $Window.Width = [Math]::Max(240, [Math]::Min(1000, $script:UI.width))
 $OpacitySlider.Value = [Math]::Max(0.25, [Math]::Min(1.0, $script:UI.opacity))
 $Window.Opacity = $OpacitySlider.Value
+$Window.Topmost = $script:UI.pinned   # honor persisted pin state from first paint
 
 # Drag the window from the header — but not when interacting with the opacity slider.
 $Header.Add_MouseLeftButtonDown({
@@ -466,7 +521,9 @@ function Show-RowFlash($row, $hex) {
   $ft = New-Object System.Windows.Threading.DispatcherTimer
   $ft.Interval = [TimeSpan]::FromMilliseconds(700)
   $ft.Add_Tick({
-    $row.Background = [Windows.Media.BrushConverter]::new().ConvertFrom('#1AFFFFFF')
+    # Restore the row's status tint (falls back to a neutral gray if unset).
+    $restore = if ($row.Tag -and $row.Tag.BaseBg) { $row.Tag.BaseBg } else { '#386E7681' }
+    $row.Background = [Windows.Media.BrushConverter]::new().ConvertFrom($restore)
     $this.Stop()
   }.GetNewClosure())
   $ft.Start()
@@ -572,13 +629,15 @@ function Select-WTTabInWindow($hwnd, $folder) {
   } catch {}
 }
 
-# Map a session status to its dot color.
-function Get-DotColor($color) {
+# Map a session status to its row background tint (base + hover shades). Replaces the
+# old status dot — the whole row is tinted by status instead.
+function Get-RowTint($color) {
   switch ($color) {
-    'busy'  { return '#FF67C23A' }   # green = actively working
-    'idle'  { return '#FF909399' }   # gray = waiting
-    'stale' { return '#FFF56C6C' }   # red = process gone
-    default { return '#FFE6A23C' }
+    'busy'        { return @{ base = '#2E3FB950'; hover = '#4D3FB950' } }   # green  = running
+    'needs_input' { return @{ base = '#38D29922'; hover = '#57D29922' } }   # yellow = waiting for input
+    'stale'       { return @{ base = '#33F85149'; hover = '#52F85149' } }   # red    = process ended
+    'idle'        { return @{ base = '#386E7681'; hover = '#576E7681' } }   # gray   = idle
+    default       { return @{ base = '#386E7681'; hover = '#57D29922' } }
   }
 }
 
@@ -592,7 +651,9 @@ function New-Row {
   $border.CornerRadius = '7'
   $border.Margin = '0,3,0,0'
   $border.Padding = '10,7,10,7'
-  $border.Background = [Windows.Media.BrushConverter]::new().ConvertFrom('#1AFFFFFF')
+  # Default tint until Set-RowData re-tints by status (New-Row is a parameterless
+  # template; per-session content/colour is filled in by Set-RowData each tick).
+  $border.Background = [Windows.Media.BrushConverter]::new().ConvertFrom('#386E7681')
   $border.Cursor = 'Hand'
 
   # Left-click focuses the session's terminal; right-click links it to the current terminal.
@@ -620,25 +681,17 @@ function New-Row {
     }
   })
 
-  $border.Add_MouseEnter({ $this.Background = [Windows.Media.BrushConverter]::new().ConvertFrom('#33FFFFFF') })
-  $border.Add_MouseLeave({ $this.Background = [Windows.Media.BrushConverter]::new().ConvertFrom('#1AFFFFFF') })
+  $border.Add_MouseEnter({ $this.Background = [Windows.Media.BrushConverter]::new().ConvertFrom($this.Tag.HoverBg) })
+  $border.Add_MouseLeave({ $this.Background = [Windows.Media.BrushConverter]::new().ConvertFrom($this.Tag.BaseBg) })
 
   $grid = New-Object System.Windows.Controls.Grid
-  $c0 = New-Object System.Windows.Controls.ColumnDefinition; $c0.Width = 'Auto'
-  $c1 = New-Object System.Windows.Controls.ColumnDefinition; $c1.Width = '*'
-  $c2 = New-Object System.Windows.Controls.ColumnDefinition; $c2.Width = 'Auto'
+  $c0 = New-Object System.Windows.Controls.ColumnDefinition; $c0.Width = '*'
+  $c1 = New-Object System.Windows.Controls.ColumnDefinition; $c1.Width = 'Auto'
   $grid.ColumnDefinitions.Add($c0)
   $grid.ColumnDefinitions.Add($c1)
-  $grid.ColumnDefinitions.Add($c2)
-
-  $ell = New-Object System.Windows.Shapes.Ellipse
-  $ell.Width = 9; $ell.Height = 9
-  $ell.VerticalAlignment = 'Center'
-  $ell.Margin = '0,0,9,0'
-  [Windows.Controls.Grid]::SetColumn($ell, 0)
 
   $stack = New-Object System.Windows.Controls.StackPanel
-  [Windows.Controls.Grid]::SetColumn($stack, 1)
+  [Windows.Controls.Grid]::SetColumn($stack, 0)
 
   $name = New-Object System.Windows.Controls.TextBlock
   $name.FontFamily = 'Segoe UI Semibold'
@@ -683,7 +736,7 @@ function New-Row {
   $right = New-Object System.Windows.Controls.StackPanel
   $right.VerticalAlignment = 'Center'
   $right.Margin = '8,0,0,0'
-  [Windows.Controls.Grid]::SetColumn($right, 2)
+  [Windows.Controls.Grid]::SetColumn($right, 1)
 
   $age = New-Object System.Windows.Controls.TextBlock
   $age.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#66FFFFFF')
@@ -709,13 +762,12 @@ function New-Row {
   $right.Children.Add($ctx) | Out-Null
   $right.Children.Add($tok) | Out-Null
 
-  $grid.Children.Add($ell)   | Out-Null
   $grid.Children.Add($stack) | Out-Null
   $grid.Children.Add($right) | Out-Null
   $border.Child = $grid
 
   return @{
-    Border = $border; Dot = $ell; RunName = $runName; RunPid = $runPid
+    Border = $border; RunName = $runName; RunPid = $runPid
     Prompt = $promptTb; Sub = $sub; Meta = $meta; Age = $age; Ctx = $ctx; Tok = $tok
   }
 }
@@ -725,14 +777,16 @@ function New-Row {
 # row under the cursor is never disturbed. Background is intentionally untouched so
 # the hover tint (set by MouseEnter/Leave) survives every refresh.
 function Set-RowData($e, $r) {
-  $e.Border.Tag = [pscustomobject]@{ Pid = $r.pid; Cwd = $r.cwd; SessionId = $r.sessionId }
+  # Status -> row background tint (replaces the old dot). Carry base/hover on the Tag so
+  # the MouseEnter/Leave handlers (and Show-RowFlash) restore the right shade.
+  $tint = Get-RowTint $r.color
+  $e.Border.Tag = [pscustomobject]@{ Pid = $r.pid; Cwd = $r.cwd; SessionId = $r.sessionId; BaseBg = $tint.base; HoverBg = $tint.hover }
   if ($e.Border.ToolTip -ne $r.tip) { $e.Border.ToolTip = $r.tip }
 
-  $dot = Get-DotColor $r.color
-  if ($e.Dot.Tag -ne $dot) {   # cache last color string in the Ellipse's Tag to avoid rebuilding the brush
-    $e.Dot.Tag = $dot
-    $e.Dot.Fill = [Windows.Media.BrushConverter]::new().ConvertFrom($dot)
-  }
+  # Re-apply the background only when the tint or hover state actually changed, so an
+  # unchanged row never churns its brush (keeps the in-place update blink-free).
+  $bg = if ($e.Border.IsMouseOver) { $tint.hover } else { $tint.base }
+  if ($e.LastBg -ne $bg) { $e.LastBg = $bg; $e.Border.Background = [Windows.Media.BrushConverter]::new().ConvertFrom($bg) }
 
   if ($e.RunName.Text -ne $r.name)      { $e.RunName.Text = $r.name }
   $pidTxt = "  $($r.pid)"
@@ -770,11 +824,13 @@ function Update-List {
     foreach ($e in $script:RowMap.Values) { [void]$List.Items.Remove($e.Border) }
     $script:RowMap.Clear()
     $CountText.Text = '0'
+    $script:OverallState = 'idle'
     return
   }
   $alive = Get-AliveProcessIds
   $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
   $rows = @()
+  $nativeSids = @{}   # sessionIds seen this tick, for reaping orphaned attention markers
 
   foreach ($file in Get-ChildItem -Path $SessionsDir -Filter '*.json' -ErrorAction SilentlyContinue) {
     try { $s = Get-Content $file.FullName -Raw | ConvertFrom-Json } catch { continue }
@@ -789,6 +845,26 @@ function Update-List {
     } else {
       $color = $s.status
       $statusTxt = $s.status
+    }
+
+    # needs_input is a refinement of the idle state. The native session file only ever
+    # carries busy/idle; the Notification hook (scripts\session-attention.cjs) drops a
+    # marker when Claude is waiting for the user. Show needs_input when an ALIVE session
+    # is NOT busy and has a marker. We deliberately do NOT compare timestamps: the native
+    # updatedAt is a heartbeat that keeps advancing while a session runs (verified), so a
+    # "marker newer than updatedAt" test would be raced by the heartbeat. The rule is
+    # purely state-based — a busy (working) or dead session can't need input, so its
+    # marker is reaped on sight, which also self-heals a missed `clear`.
+    if ($s.sessionId) {
+      $nativeSids[$s.sessionId] = $true
+      $mk = Join-Path $AttentionDir "$($s.sessionId).json"
+      if (Test-Path $mk) {
+        if ($isAlive -and $s.status -ne 'busy') {
+          $color = 'needs_input'; $statusTxt = 'needs input'
+        } else {
+          Remove-Item $mk -ErrorAction SilentlyContinue   # busy or dead: can't need input
+        }
+      }
     }
 
     $age = Format-Age ($now - [long]$s.updatedAt)
@@ -847,8 +923,27 @@ function Update-List {
     }
   }
 
+  # Reap orphaned attention markers whose native session file is gone entirely (the
+  # per-row reap above only covers sessions still present in $SessionsDir). Keeps
+  # ~/.claude/session-attention from growing without bound across many sessions.
+  if (Test-Path $AttentionDir) {
+    foreach ($mf in Get-ChildItem -Path $AttentionDir -Filter '*.json' -ErrorAction SilentlyContinue) {
+      if (-not $nativeSids.ContainsKey($mf.BaseName)) { Remove-Item $mf.FullName -ErrorAction SilentlyContinue }
+    }
+  }
+
   # Sort: busy first, then alive, then most recently updated
   $rows = @($rows | Sort-Object @{e={ -([int]$_.busy) }}, @{e={ -([int]$_.alive) }}, @{e={ -$_.upd }})
+
+  # Overall Claude state drives the status GIF: needs_input > running > idle.
+  # A dead-process ('stale') session counts as not-active and is ignored here.
+  $st = 'idle'
+  foreach ($r in $rows) {
+    if (-not $r.alive) { continue }
+    if ($r.color -eq 'needs_input') { $st = 'needs_input'; break }
+    if ($r.color -eq 'busy')        { $st = 'running' }
+  }
+  $script:OverallState = $st
 
   # Reconcile the live list against $rows without clearing it. Reuse each session's
   # existing Border (updating its content in place), create one only for new sessions,
@@ -888,16 +983,339 @@ function Update-List {
     $(if ($grandTotal) { " $sep ~$(Format-Tokens $grandTotal) tok" } else { '' })
 }
 
+# ---------------------------------------------------------------------------
+# Status GIF subsystem: a separate borderless/transparent/topmost/no-activate
+# floating window that shows a different animated GIF per overall Claude state.
+# ---------------------------------------------------------------------------
+$script:OverallState   = 'idle'
+$script:GifShownPath   = ''      # path currently DISPLAYED (dedup; stays put while a load is in flight)
+$script:GifCache       = @{}     # path -> @{ frames; delays }  (decoded packs; UI thread only)
+$script:GifActive      = $null   # @{ frames; delays; idx } currently animating
+$script:gifHwnd        = [IntPtr]::Zero
+$script:gifPinned      = $false
+# Async loading: a background runspace downloads GIF bytes (the slow part, ~seconds for
+# large remote GIFs) OFF the UI thread; the UI thread decodes the bytes (fast, ~150ms)
+# when they arrive. The overlay never freezes on a download.
+$script:GifBytes  = [hashtable]::Synchronized(@{})   # path -> byte[] OR 'FAILED'  (bg writes, UI reads)
+$script:GifQueue  = [System.Collections.Queue]::Synchronized((New-Object System.Collections.Queue))
+$script:GifQueued = @{}           # paths already enqueued this lifetime (UI thread only)
+
+[xml]$gifXaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Claude GIF" Width="200" Height="200"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        Topmost="True" ShowInTaskbar="False" ResizeMode="CanResizeWithGrip"
+        WindowStartupLocation="Manual" Left="60" Top="360" Visibility="Hidden">
+  <!-- Near-transparent (not fully) so the surface still hit-tests for dragging. -->
+  <Grid x:Name="GifRoot" Background="#01000000">
+    <Image x:Name="GifImage" Stretch="Uniform"/>
+  </Grid>
+</Window>
+"@
+$gifReader = New-Object System.Xml.XmlNodeReader $gifXaml
+$script:gifWindow = [Windows.Markup.XamlReader]::Load($gifReader)
+$script:GifImage  = $script:gifWindow.FindName('GifImage')
+$gifRoot          = $script:gifWindow.FindName('GifRoot')
+
+# Apply persisted geometry.
+$script:gifWindow.Left   = $script:Gif.win.left
+$script:gifWindow.Top    = $script:Gif.win.top
+$script:gifWindow.Width  = [Math]::Max(60, $script:Gif.win.width)
+$script:gifWindow.Height = [Math]::Max(60, $script:Gif.win.height)
+
+# No-activate so clicking the GIF never steals foreground from the terminal.
+$script:gifWindow.Add_SourceInitialized({
+  $h = (New-Object System.Windows.Interop.WindowInteropHelper $script:gifWindow).Handle
+  if ($h -ne [IntPtr]::Zero) { [WinTools]::SetNoActivate($h); $script:gifHwnd = $h }
+})
+# Drag anywhere on the surface to move it; persist the new position.
+$gifRoot.Add_MouseLeftButtonDown({
+  $ol = $script:gifWindow.Left; $ot = $script:gifWindow.Top
+  $script:gifWindow.DragMove()
+  if ($script:gifWindow.Left -ne $ol -or $script:gifWindow.Top -ne $ot) {
+    $script:Gif.win.left = $script:gifWindow.Left
+    $script:Gif.win.top  = $script:gifWindow.Top
+    Save-UISettings   # only when an actual move happened, not a bare click
+  }
+})
+$script:gifWindow.Add_SizeChanged({
+  $script:Gif.win.width  = $script:gifWindow.Width
+  $script:Gif.win.height = $script:gifWindow.Height
+  # Persist only on real user resizes; initial layout fires this while still hidden.
+  if ($script:gifWindow.IsVisible) { Save-UISettings }
+})
+
+# Single shared animation timer: advances whichever decoded frame pack is active.
+# One timer (instead of one-per-load) means a state switch only re-points it at the
+# cached frames — no timer churn, no leaks, no re-decode.
+$script:GifTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:GifTimer.Add_Tick({
+  $a = $script:GifActive
+  if (-not $a -or $a.frames.Count -le 1) { $script:GifTimer.Stop(); return }
+  $a.idx = ($a.idx + 1) % $a.frames.Count
+  $script:GifImage.Source = $a.frames[$a.idx]
+  $script:GifTimer.Interval = [TimeSpan]::FromMilliseconds([Math]::Max(20, [int]$a.delays[$a.idx] * 10))
+})
+
+# Decode an already-fetched GIF stream into reusable frozen frames by compositing each
+# differenced frame over the accumulated canvas (RenderTargetBitmap). Runs on the UI
+# thread; ~1ms/frame (~900ms for 300 frames, one-time, then cached). Returns
+# @{ frames; delays } or $null. Does NO network I/O (that's the background downloader).
+function ConvertTo-GifPack($stream) {
+  try {
+    $decoder = New-Object System.Windows.Media.Imaging.GifBitmapDecoder(
+      $stream,
+      [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat,
+      [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
+    $count = $decoder.Frames.Count
+    if ($count -le 0) { return $null }
+    $fw = $decoder.Frames[0].PixelWidth
+    $fh = $decoder.Frames[0].PixelHeight
+    if ($fw -le 0 -or $fh -le 0) { return $null }
+
+    $frames = New-Object System.Collections.ArrayList
+    $delays = New-Object System.Collections.ArrayList
+    $prev = $null
+    for ($i = 0; $i -lt $count; $i++) {
+      $fr = $decoder.Frames[$i]
+      $left = 0; $top = 0; $delay = 10
+      try {
+        $md = [System.Windows.Media.Imaging.BitmapMetadata]$fr.Metadata
+        try { $left  = [int]$md.GetQuery('/imgdesc/Left') }  catch {}
+        try { $top   = [int]$md.GetQuery('/imgdesc/Top') }   catch {}
+        try { $d = $md.GetQuery('/grctlext/Delay'); if ($d) { $delay = [int]$d } } catch {}
+      } catch {}
+      if ($delay -le 0) { $delay = 10 }   # delay is in centiseconds (1/100s)
+
+      # EVERY frame must be composited over the accumulated canvas. GIF frames are
+      # differenced and use disposal method 1 ("do not dispose"): each frame is drawn
+      # OVER the previous one and is mostly transparent (only ~20% changed pixels). Using
+      # a frame raw -- even a full-canvas one -- shows just those changed pixels as holes
+      # over transparency and looks broken. Compositing each frame over the prior result
+      # is correct (verified: 100% opaque content per frame) and costs ~1ms/frame.
+      $dv = New-Object System.Windows.Media.DrawingVisual
+      $dc = $dv.RenderOpen()
+      if ($prev) { $dc.DrawImage($prev, (New-Object System.Windows.Rect(0, 0, $fw, $fh))) }
+      $dc.DrawImage($fr, (New-Object System.Windows.Rect($left, $top, $fr.PixelWidth, $fr.PixelHeight)))
+      $dc.Close()
+      $rtb = New-Object System.Windows.Media.Imaging.RenderTargetBitmap(
+        $fw, $fh, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
+      $rtb.Render($dv)
+      $rtb.Freeze()
+      [void]$frames.Add($rtb)
+      $prev = $rtb
+      [void]$delays.Add($delay)
+    }
+    return [pscustomobject]@{ frames = $frames; delays = $delays }
+  } catch { return $null }
+}
+
+# Decode a GIF already present on disk (a file path or file:// URL). Local files are
+# read directly on the UI thread (no network), so no async download is needed.
+function Get-LocalGifPack($path) {
+  $local = $path -replace '^file:///?', ''
+  if (-not (Test-Path -LiteralPath $local)) { return $null }
+  $fs = $null
+  try {
+    $fs = [System.IO.File]::OpenRead((Resolve-Path -LiteralPath $local).ProviderPath)
+    return ConvertTo-GifPack $fs
+  } catch { return $null } finally { if ($fs) { $fs.Dispose() } }
+}
+
+# Point the shared timer at a decoded pack and reveal the window.
+function Show-GifPack($pack) {
+  $script:GifTimer.Stop()
+  $script:GifActive = [pscustomobject]@{ frames = $pack.frames; delays = $pack.delays; idx = 0 }
+  $script:GifImage.Source = $pack.frames[0]
+  if (-not $script:gifWindow.IsVisible) { $script:gifWindow.Show() }
+  if ($pack.frames.Count -gt 1) {
+    $script:GifTimer.Interval = [TimeSpan]::FromMilliseconds([Math]::Max(20, [int]$pack.delays[0] * 10))
+    $script:GifTimer.Start()
+  }
+}
+
+function Hide-Gif {
+  $script:GifTimer.Stop(); $script:GifActive = $null
+  $script:GifImage.Source = $null
+  $script:gifWindow.Hide()
+}
+
+# Background downloader runspace: drains $GifQueue, fetching GIF bytes off the UI thread
+# (pure HTTP I/O, no WPF) so the overlay never blocks on a slow download. Writes the
+# resulting byte[] (or the string 'FAILED') into the synchronized $GifBytes map; the UI
+# thread decodes it on its next poll.
+$script:DlRunspace = [runspacefactory]::CreateRunspace()
+$script:DlRunspace.Open()
+$script:DlRunspace.SessionStateProxy.SetVariable('q', $script:GifQueue)
+$script:DlRunspace.SessionStateProxy.SetVariable('bytesMap', $script:GifBytes)
+$script:DlPs = [powershell]::Create()
+$script:DlPs.Runspace = $script:DlRunspace
+[void]$script:DlPs.AddScript({
+  try {
+    [System.Net.ServicePointManager]::SecurityProtocol =
+      [System.Net.SecurityProtocolType]::Tls12 -bor
+      [System.Net.SecurityProtocolType]::Tls11 -bor
+      [System.Net.SecurityProtocolType]::Tls
+  } catch {}
+  while ($true) {
+    $path = $null
+    try { if ($q.Count -gt 0) { $path = $q.Dequeue() } } catch {}
+    if (-not $path) { Start-Sleep -Milliseconds 120; continue }
+    if ($bytesMap.ContainsKey($path)) { continue }
+    try {
+      $req = [System.Net.HttpWebRequest]::Create($path)
+      $req.Timeout = 20000; $req.ReadWriteTimeout = 20000; $req.UserAgent = 'Mozilla/5.0'
+      $resp = $req.GetResponse()
+      $ms = New-Object System.IO.MemoryStream
+      $resp.GetResponseStream().CopyTo($ms)
+      $resp.Close()
+      $bytesMap[$path] = $ms.ToArray()
+    } catch { $bytesMap[$path] = 'FAILED' }
+  }
+})
+$script:DlHandle = $script:DlPs.BeginInvoke()
+
+# Fast poll so a freshly-downloaded GIF appears promptly (Update-Gif dedups to a cheap
+# no-op when nothing has changed).
+$gifPollTimer = New-Object System.Windows.Threading.DispatcherTimer
+$gifPollTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+$gifPollTimer.Add_Tick({ Update-Gif })
+$gifPollTimer.Start()
+
+# Reconcile the GIF window with the current overall state. Cheap no-op when the
+# target GIF path hasn't changed. -force reloads even if the path is unchanged
+# (used after the settings dialog edits paths).
+function Update-Gif([bool]$force = $false) {
+  if (-not $script:gifWindow) { return }
+  $want = if ($script:Gif.enabled) { [string]$script:Gif.paths[$script:OverallState] } else { '' }
+  if (-not $force -and $want -eq $script:GifShownPath) { return }
+
+  if ([string]::IsNullOrWhiteSpace($want)) { Hide-Gif; $script:GifShownPath = $want; return }
+
+  # Already decoded -> show instantly.
+  if ($script:GifCache.ContainsKey($want)) { Show-GifPack $script:GifCache[$want]; $script:GifShownPath = $want; return }
+
+  # Local file -> decode now (no network, fast).
+  if ($want -notmatch '^https?://') {
+    $pack = Get-LocalGifPack $want
+    if ($pack) { $script:GifCache[$want] = $pack; Show-GifPack $pack }
+    else { Hide-Gif }
+    $script:GifShownPath = $want
+    return
+  }
+
+  # Remote -> have the downloaded bytes arrived (from the background runspace)?
+  $b = $script:GifBytes[$want]
+  if ($b -is [byte[]]) {
+    $ms = New-Object System.IO.MemoryStream(, $b)
+    $pack = ConvertTo-GifPack $ms       # decode on UI thread (fast)
+    if ($pack) { $script:GifCache[$want] = $pack; Show-GifPack $pack }
+    else { Hide-Gif }                   # bytes weren't a valid GIF
+    $script:GifShownPath = $want
+    return
+  }
+  if ($b -eq 'FAILED') { Hide-Gif; $script:GifShownPath = $want; return }   # download failed; stop until state changes
+
+  # Bytes not here yet: enqueue the download once and LEAVE the current GIF on screen
+  # (no freeze, no flicker). Do NOT advance GifShownPath -> the next poll re-checks and
+  # shows it the instant the bytes arrive.
+  if (-not $script:GifQueued.ContainsKey($want)) { $script:GifQueued[$want] = $true; $script:GifQueue.Enqueue($want) }
+}
+
+# Lightweight settings dialog: per-state GIF paths + an enable toggle.
+function Show-GifSettings {
+  [xml]$sx = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Status GIFs" Width="380" SizeToContent="Height"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen">
+  <Border CornerRadius="10" Background="#F2161616" BorderBrush="#33FFFFFF" BorderThickness="1" Padding="14">
+    <StackPanel>
+      <TextBlock Text="Status GIF paths" Foreground="#FFE6A23C" FontFamily="Segoe UI Semibold" FontSize="13" Margin="0,0,0,10"/>
+      <CheckBox x:Name="EnabledChk" Content="Show status GIF" Foreground="#FFFFFFFF" Margin="0,0,0,10"/>
+      <TextBlock Text="Running (busy)" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
+      <TextBox x:Name="RunBox" Margin="0,2,0,8"/>
+      <TextBlock Text="Needs input" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
+      <TextBox x:Name="NeedBox" Margin="0,2,0,8"/>
+      <TextBlock Text="Idle" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
+      <TextBox x:Name="IdleBox" Margin="0,2,0,12"/>
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+        <Button x:Name="ResetBtn" Content="Reset" Width="70" Margin="0,0,8,0"/>
+        <Button x:Name="CancelBtn" Content="Cancel" Width="70" Margin="0,0,8,0"/>
+        <Button x:Name="SaveBtn" Content="Save" Width="70"/>
+      </StackPanel>
+    </StackPanel>
+  </Border>
+</Window>
+"@
+  $r = New-Object System.Xml.XmlNodeReader $sx
+  $w = [Windows.Markup.XamlReader]::Load($r)
+  $en = $w.FindName('EnabledChk')
+  $rb = $w.FindName('RunBox'); $nb = $w.FindName('NeedBox'); $ib = $w.FindName('IdleBox')
+  $en.IsChecked = $script:Gif.enabled
+  $rb.Text = $script:Gif.paths.running
+  $nb.Text = $script:Gif.paths.needs_input
+  $ib.Text = $script:Gif.paths.idle
+  # NOTE: do NOT use .GetNewClosure() on these handlers. GetNewClosure wraps the block
+  # in a new module where $script: resolves to that module (so $script:Gif is $null and
+  # the handler throws). The dialog is modal, so these plain scriptblocks keep access to
+  # the function's local controls AND the real $script:Gif scope.
+  $w.FindName('ResetBtn').Add_Click({ $rb.Text = ''; $nb.Text = ''; $ib.Text = '' })
+  $w.FindName('CancelBtn').Add_Click({ $w.Close() })
+  $w.FindName('SaveBtn').Add_Click({
+    $script:Gif.enabled           = [bool]$en.IsChecked
+    $script:Gif.paths.running     = $rb.Text.Trim()
+    $script:Gif.paths.needs_input = $nb.Text.Trim()
+    $script:Gif.paths.idle        = $ib.Text.Trim()
+    Save-UISettings
+    # Paths may have changed -> drop stale decodes + downloaded bytes so new paths reload.
+    $script:GifCache.Clear(); $script:GifBytes.Clear(); $script:GifQueued.Clear()
+    $script:GifShownPath = ''
+    Update-Gif $true
+    $w.Close()
+  })
+  # The overlay is a no-activate window, so a modal opened from it gets MOUSE clicks
+  # but not KEYBOARD focus (typed text would go to the terminal). Force this dialog to
+  # the foreground using the same AttachThreadInput trick the overlay uses elsewhere,
+  # then drop the caret into the first field so typing works immediately.
+  $w.Add_Loaded({
+    try {
+      $hh = (New-Object System.Windows.Interop.WindowInteropHelper $w).Handle
+      if ($hh -ne [IntPtr]::Zero) { [WinTools]::Focus($hh) }
+    } catch {}
+    $rb.Focus() | Out-Null
+    [System.Windows.Input.Keyboard]::Focus($rb) | Out-Null
+  })
+  [void]$w.ShowDialog()
+}
+
+$GifBtn.Add_Click({ Show-GifSettings })
+
+# Keep the GIF window on every virtual desktop: pin it (Windows-side) once visible;
+# if pinning is unavailable, fall back to following the active desktop.
+$gifDesktopTimer = New-Object System.Windows.Threading.DispatcherTimer
+$gifDesktopTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+$gifDesktopTimer.Add_Tick({
+  if (-not $script:gifWindow.IsVisible -or $script:gifHwnd -eq [IntPtr]::Zero) { return }
+  if (-not $script:gifPinned) { $script:gifPinned = [Pinner]::Pin($script:gifHwnd) }
+  if (-not $script:gifPinned) { [VD]::Follow($script:gifHwnd) }
+})
+$gifDesktopTimer.Start()
+
 # Initial render + refresh timer
 Update-List
+Update-Gif   # lazy-loads the current state's GIF; cached + instant on later switches
 $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromSeconds(2)
-$timer.Add_Tick({ Update-List })
+$timer.Add_Tick({ Update-List; Update-Gif })
 $timer.Start()
 
-# Show on all desktops. Primary: ask Windows to pin the window (Windows-side, no
-# polling). Fallback: if pinning isn't available, a light timer keeps the overlay on
-# the active desktop so it still follows you everywhere.
+# Always-on-top + show-on-all-desktops, toggled by the header pin button. Primary: ask
+# Windows to pin the window (Windows-side, no polling). Fallback: if pinning isn't
+# available, a light timer keeps the overlay on the active desktop so it follows you.
 $script:overlayHwnd = [IntPtr]::Zero
 $script:pinned = $false
 
@@ -907,16 +1325,55 @@ $followTimer.Add_Tick({
   if ($script:overlayHwnd -ne [IntPtr]::Zero) { [VD]::Follow($script:overlayHwnd) }
 })
 
-# One-shot pin, fired ~600ms after show so the shell has registered the window as a view.
+# Apply (and persist) the pin state. ON = always-on-top + pinned/followed across every
+# virtual desktop; OFF = a normal window that stays on its current desktop.
+function Set-Pinned([bool]$on) {
+  $script:UI.pinned = $on
+  $Window.Topmost = $on
+  $h = $script:overlayHwnd
+  if ($on) {
+    if ($h -ne [IntPtr]::Zero) { $script:pinned = [Pinner]::Pin($h) }
+    if ($script:pinned) { $followTimer.Stop() } else { $followTimer.Start() }
+    $PinBtn.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#FFE6A23C')  # accent = pinned
+    $PinBtn.ToolTip = 'Pinned: on top + all desktops (click to unpin)'
+  } else {
+    $followTimer.Stop()
+    if ($h -ne [IntPtr]::Zero) { [void][Pinner]::Unpin($h) }
+    $script:pinned = $false
+    $PinBtn.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#66FFFFFF')  # dim = unpinned
+    $PinBtn.ToolTip = 'Unpinned (click to pin on top + all desktops)'
+  }
+  Save-UISettings
+}
+$PinBtn.Add_Click({ Set-Pinned (-not $script:UI.pinned) })
+
+# One-shot, ~600ms after show (the shell has registered the window as a view by then):
+# apply the persisted pin state — pins, or leaves it unpinned.
 $pinTimer = New-Object System.Windows.Threading.DispatcherTimer
 $pinTimer.Interval = [TimeSpan]::FromMilliseconds(600)
 $pinTimer.Add_Tick({
   $pinTimer.Stop()
   $script:overlayHwnd = (New-Object System.Windows.Interop.WindowInteropHelper $Window).Handle
-  if ($script:overlayHwnd -ne [IntPtr]::Zero) { $script:pinned = [Pinner]::Pin($script:overlayHwnd) }
-  if (-not $script:pinned) { $followTimer.Start() }   # Windows-side pin unavailable -> follow
+  Set-Pinned $script:UI.pinned
 })
 $pinTimer.Start()
 
-$Window.Add_Closed({ $timer.Stop(); $followTimer.Stop(); $pinTimer.Stop() })
+$Window.Add_Closed({
+  $timer.Stop(); $followTimer.Stop(); $pinTimer.Stop(); $gifDesktopTimer.Stop()
+  if ($gifPollTimer) { $gifPollTimer.Stop() }
+  if ($script:GifTimer) { $script:GifTimer.Stop() }
+  $script:GifActive = $null
+  if ($script:GifCache) { $script:GifCache.Clear() }
+  # Stop the background downloader runspace so it doesn't outlive the window.
+  try { if ($script:DlPs) { $script:DlPs.Stop(); $script:DlPs.Dispose() } } catch {}
+  try { if ($script:DlRunspace) { $script:DlRunspace.Close(); $script:DlRunspace.Dispose() } } catch {}
+  try {
+    if ($script:gifWindow) {
+      $script:Gif.win.width  = $script:gifWindow.Width
+      $script:Gif.win.height = $script:gifWindow.Height
+      Save-UISettings
+      $script:gifWindow.Close()
+    }
+  } catch {}
+})
 [void]$Window.ShowDialog()

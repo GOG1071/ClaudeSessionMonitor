@@ -3,11 +3,15 @@
 A lightweight, always-on-top Windows overlay that shows every running Claude Code
 session globally — across all terminals, projects, and virtual desktops.
 
+> **Setting up on a new machine?** See [INSTALL.md](INSTALL.md) — it covers the one
+> step that isn't in the repo: registering the `needs_input` attention hook in
+> `~/.claude/settings.json`.
+
 ## Features
 
 - **Live session list** — reads `~/.claude/sessions/<pid>.json` and refreshes every 2s.
-  Each row shows the project folder, the session **PID**, and a coloured status dot
-  (🟢 busy · ⚪ idle · 🔴 ended).
+  Each row shows the project folder and the session **PID**, with a **status-coloured row
+  background** (🟢 busy · 🟡 needs-input · ⚪ idle · 🔴 ended).
 - **What each session is doing** — under the session name, the **recent prompt** line
   (italic amber) shows the most recent user prompt, and the activity line summarises what
   the session is currently doing, read from its transcript
@@ -26,8 +30,15 @@ session globally — across all terminals, projects, and virtual desktops.
   the row to link it. The link is remembered per session.
 - **Shown on all desktops** — pinned natively via the Windows virtual-desktop shell API
   (with an automatic "follow the active desktop" fallback if pinning is unavailable).
+- **Pin toggle** — the 📌 button in the header turns the always-on-top + show-on-all-desktops
+  behaviour on (default) or off. When off, the overlay is a normal window that stays on its
+  current desktop. The choice persists across restarts.
 - **Resizable & adjustable opacity** — drag the right edge to change width; use the
   header slider to change opacity. Both persist across restarts.
+- **Status GIF** — an optional separate floating window shows a different animated GIF
+  depending on the overall Claude state across all sessions: **needs-input** (a session
+  waiting for you) takes priority over **running** (any busy session), which takes
+  priority over **idle**. Click the **GIF** button in the header to set a GIF per state.
 
 ## Install / run
 
@@ -43,8 +54,31 @@ Startup folder (`shell:startup`).
 |------|---------|
 | `overlay.ps1` | The overlay (WPF in Windows PowerShell 5.1). |
 | `Start Overlay.vbs` | Launches `overlay.ps1` hidden. |
-| `settings.json` | Saved width + opacity (local, git-ignored). |
+| `settings.json` | Saved width, opacity + status-GIF config (local, git-ignored). |
 | `links.json` | Saved session→window links (local, git-ignored). |
+
+## Status GIF
+
+Click the **GIF** button in the header to open the settings dialog and paste a GIF for each
+state (**Running**, **Needs input**, **Idle**). Each value is a local file path (e.g.
+`D:\gifs\working.gif`) or a `file://` / `http(s)://` URL; leave a state blank to show nothing
+for it. The floating GIF window only appears when the current state has a GIF configured.
+
+- Drag the GIF window anywhere to move it; drag its bottom-right corner to resize. Position
+  and size persist across restarts.
+- Busy and idle map directly from each session's native status (`busy` → **running**,
+  otherwise → **idle**). Dead-process sessions are ignored.
+- **Needs-input requires the attention hook.** Claude Code's native `~/.claude/sessions`
+  files only ever report `busy`/`idle` — never `needs_input` — so the *waiting-for-you* state
+  comes from `scripts/session-attention.cjs`, wired into `~/.claude/settings.json` as a
+  `Notification` hook (writes a marker when Claude needs input) and a `UserPromptSubmit` hook
+  (clears it when you reply). The overlay shows **needs input** for any alive, non-busy session
+  that has a marker; markers are reaped automatically when the session goes busy or ends. Without
+  these hooks installed, sessions only ever show running/idle.
+- GIFs are decoded and animated natively (no external dependencies). For best results use GIFs
+  with a transparent background — the window itself is transparent and always-on-top, and shows
+  on every virtual desktop like the main overlay.
+- Per-state GIF paths are saved in `settings.json` alongside width/opacity.
 
 ## Notes / limitations
 
