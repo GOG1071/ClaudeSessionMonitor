@@ -11,6 +11,16 @@
 //   UserPromptSubmit  -> node session-attention.cjs clear          (user replied)
 //   PreToolUse        -> node session-attention.cjs clear          (Claude resumed work)
 //
+// The Notification hook fires for TWO distinct reasons:
+//   1. Claude is blocked needing the user to continue — e.g. "Claude needs your
+//      permission to use Bash". This is a genuine needs_input.
+//   2. The prompt input has been idle ~60s after Claude FINISHED its turn — e.g.
+//      "Claude is waiting for your input". This is NOT needs_input; Claude isn't
+//      blocked, it just finished and is sitting idle. Treating it as needs_input
+//      turns a completed task yellow, which is the bug this filter fixes.
+// We distinguish them by the notification `message`: idle-reminder messages are
+// ignored, everything else (permission / approval prompts) sets the marker.
+//
 // It reads the Claude Code hook payload from stdin (JSON with session_id, cwd,
 // ...) and writes/removes a marker file at
 //   ~/.claude/session-attention/<session_id>.json
@@ -60,12 +70,22 @@ function main() {
   }
 
   if (action === 'needs_input') {
+    // Ignore the idle-timeout reminder ("Claude is waiting for your input"),
+    // which fires ~60s after Claude finishes a turn — Claude isn't blocked, so
+    // this must NOT turn the row yellow. Only genuine blocking notifications
+    // (permission / approval prompts) get through. We do NOT clear an existing
+    // marker here: a real pending prompt that the user ignores for 60s would
+    // also emit this reminder, and that marker should survive.
+    const message = String(payload.message || '');
+    if (/waiting for your input/i.test(message)) return;
+
     try {
       fs.mkdirSync(dir, { recursive: true });
       const obj = {
         sessionId,
         cwd: payload.cwd || '',
         kind: 'needs_input',
+        message,
         updatedAt: Date.now(),
       };
       const tmp = file + '.tmp';
