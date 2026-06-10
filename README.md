@@ -20,6 +20,10 @@ session globally — across all terminals, projects, and virtual desktops.
   (with an automatic "follow the active desktop" fallback if pinning is unavailable).
 - **Resizable & adjustable opacity** — drag the right edge to change width; use the
   header slider to change opacity. Both persist across restarts.
+- **Status GIF** — an optional separate floating window shows a different animated GIF
+  depending on the overall Claude state across all sessions: **needs-input** (a session
+  waiting for you) takes priority over **running** (any busy session), which takes
+  priority over **idle**. Click the **GIF** button in the header to set a GIF per state.
 
 ## Install / run
 
@@ -35,8 +39,24 @@ Startup folder (`shell:startup`).
 |------|---------|
 | `overlay.ps1` | The overlay (WPF in Windows PowerShell 5.1). |
 | `Start Overlay.vbs` | Launches `overlay.ps1` hidden. |
-| `settings.json` | Saved width + opacity (local, git-ignored). |
+| `settings.json` | Saved width, opacity + status-GIF config (local, git-ignored). |
 | `links.json` | Saved session→window links (local, git-ignored). |
+
+## Status GIF
+
+Click the **GIF** button in the header to open the settings dialog and paste a GIF for each
+state (**Running**, **Needs input**, **Idle**). Each value is a local file path (e.g.
+`D:\gifs\working.gif`) or a `file://` / `http(s)://` URL; leave a state blank to show nothing
+for it. The floating GIF window only appears when the current state has a GIF configured.
+
+- Drag the GIF window anywhere to move it; drag its bottom-right corner to resize. Position
+  and size persist across restarts.
+- The state set maps directly from each session's reported status: `busy` → **running**,
+  `needs_input` → **needs input**, everything else → **idle**. Dead-process sessions are ignored.
+- GIFs are decoded and animated natively (no external dependencies). For best results use GIFs
+  with a transparent background — the window itself is transparent and always-on-top, and shows
+  on every virtual desktop like the main overlay.
+- Per-state GIF paths are saved in `settings.json` alongside width/opacity.
 
 ## Notes / limitations
 

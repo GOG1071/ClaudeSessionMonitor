@@ -227,6 +227,7 @@ function Save-Links {
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="Auto"/>
           </Grid.ColumnDefinitions>
           <TextBlock Grid.Column="0" Text="&#x25CF; Claude Sessions" Foreground="#FFE6A23C"
                      FontFamily="Segoe UI Semibold" FontSize="12" VerticalAlignment="Center"
@@ -236,7 +237,10 @@ function Save-Links {
                   ToolTip="Window opacity" IsMoveToPointEnabled="True"/>
           <TextBlock Grid.Column="2" x:Name="CountText" Text="" Foreground="#80FFFFFF"
                      FontFamily="Segoe UI" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
-          <Button Grid.Column="3" x:Name="CloseBtn" Content="&#x2715;" Width="30" Height="30"
+          <Button Grid.Column="3" x:Name="GifBtn" Content="GIF" Width="34" Height="30"
+                  Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
+                  FontSize="11" Cursor="Hand" ToolTip="Configure status GIFs"/>
+          <Button Grid.Column="4" x:Name="CloseBtn" Content="&#x2715;" Width="30" Height="30"
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
                   FontSize="13" Cursor="Hand"/>
         </Grid>
@@ -265,21 +269,49 @@ $CloseBtn   = $Window.FindName('CloseBtn')
 $CountText  = $Window.FindName('CountText')
 $ResizeGrip = $Window.FindName('ResizeGrip')
 $OpacitySlider = $Window.FindName('OpacitySlider')
+$GifBtn     = $Window.FindName('GifBtn')
 
 # Persisted UI settings (width + opacity).
 $UISettingsFile = Join-Path $PSScriptRoot 'settings.json'
 $script:UI = @{ width = 340.0; opacity = 0.95 }
+
+# Per-state GIF config. Each path is user-configured (a local file path, or a
+# file:// / http(s) URL); an empty path means "no GIF for that state". The floating
+# GIF window shows the GIF for the current overall Claude state, aggregated across all
+# sessions with priority needs_input > running > idle. Empty default = feature off.
+$script:Gif = @{
+  enabled = $true
+  paths   = @{ running = ''; needs_input = ''; idle = '' }
+  win     = @{ left = 60.0; top = 360.0; width = 200.0; height = 200.0 }
+}
 if (Test-Path $UISettingsFile) {
   try {
     $cfg = Get-Content $UISettingsFile -Raw | ConvertFrom-Json
     if ($cfg.width)   { $script:UI.width   = [double]$cfg.width }
     if ($cfg.opacity) { $script:UI.opacity = [double]$cfg.opacity }
+    # GIF settings are additive: missing keys fall back to the defaults above.
+    if ($null -ne $cfg.gifEnabled) { $script:Gif.enabled = [bool]$cfg.gifEnabled }
+    if ($cfg.gifPaths) {
+      foreach ($k in 'running','needs_input','idle') {
+        if ($cfg.gifPaths.$k) { $script:Gif.paths[$k] = [string]$cfg.gifPaths.$k }
+      }
+    }
+    if ($cfg.gifWindow) {
+      foreach ($k in 'left','top','width','height') {
+        if ($null -ne $cfg.gifWindow.$k) { $script:Gif.win[$k] = [double]$cfg.gifWindow.$k }
+      }
+    }
   } catch {}
 }
 function Save-UISettings {
   try {
-    [pscustomobject]@{ width = $Window.Width; opacity = $OpacitySlider.Value } |
-      ConvertTo-Json -Compress | Set-Content -Path $UISettingsFile -Encoding UTF8
+    [pscustomobject]@{
+      width      = $Window.Width
+      opacity    = $OpacitySlider.Value
+      gifEnabled = $script:Gif.enabled
+      gifPaths   = [pscustomobject]$script:Gif.paths
+      gifWindow  = [pscustomobject]$script:Gif.win
+    } | ConvertTo-Json -Compress | Set-Content -Path $UISettingsFile -Encoding UTF8
   } catch {}
 }
 
@@ -554,10 +586,11 @@ function New-Row($session) {
 
   # status dot color
   switch ($session.color) {
-    'busy'  { $dot = '#FF67C23A' }   # green = actively working
-    'idle'  { $dot = '#FF909399' }   # gray = waiting
-    'stale' { $dot = '#FFF56C6C' }   # red = process gone
-    default { $dot = '#FFE6A23C' }
+    'busy'        { $dot = '#FF67C23A' }   # green = actively working
+    'needs_input' { $dot = '#FFE6A23C' }   # yellow = waiting for user input
+    'idle'        { $dot = '#FF909399' }   # gray = waiting
+    'stale'       { $dot = '#FFF56C6C' }   # red = process gone
+    default       { $dot = '#FFE6A23C' }
   }
 
   $ell = New-Object System.Windows.Shapes.Ellipse
@@ -613,6 +646,7 @@ function Update-List {
   $List.Items.Clear()
   if (-not (Test-Path $SessionsDir)) {
     $CountText.Text = '0'
+    $script:OverallState = 'idle'
     return
   }
   $alive = Get-AliveProcessIds
@@ -658,6 +692,16 @@ function Update-List {
   # Sort: busy first, then alive, then most recently updated
   $rows = $rows | Sort-Object @{e={ -([int]$_.busy) }}, @{e={ -([int]$_.alive) }}, @{e={ -$_.upd }}
 
+  # Overall Claude state drives the status GIF: needs_input > running > idle.
+  # A dead-process ('stale') session counts as not-active and is ignored here.
+  $st = 'idle'
+  foreach ($r in $rows) {
+    if (-not $r.alive) { continue }
+    if ($r.color -eq 'needs_input') { $st = 'needs_input'; break }
+    if ($r.color -eq 'busy')        { $st = 'running' }
+  }
+  $script:OverallState = $st
+
   foreach ($r in $rows) { $List.Items.Add((New-Row $r)) | Out-Null }
 
   $aliveCount = ($rows | Where-Object { $_.alive }).Count
@@ -665,11 +709,229 @@ function Update-List {
   $CountText.Text = "$aliveCount active" + $(if ($busyCount) { " $sep $busyCount busy" } else { '' })
 }
 
+# ---------------------------------------------------------------------------
+# Status GIF subsystem: a separate borderless/transparent/topmost/no-activate
+# floating window that shows a different animated GIF per overall Claude state.
+# ---------------------------------------------------------------------------
+$script:OverallState   = 'idle'
+$script:GifAnim        = $null   # current frame-animator controller
+$script:GifCurrentPath = ''      # path currently loaded (avoids needless reloads)
+$script:gifHwnd        = [IntPtr]::Zero
+$script:gifPinned      = $false
+
+[xml]$gifXaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Claude GIF" Width="200" Height="200"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        Topmost="True" ShowInTaskbar="False" ResizeMode="CanResizeWithGrip"
+        WindowStartupLocation="Manual" Left="60" Top="360" Visibility="Hidden">
+  <!-- Near-transparent (not fully) so the surface still hit-tests for dragging. -->
+  <Grid x:Name="GifRoot" Background="#01000000">
+    <Image x:Name="GifImage" Stretch="Uniform"/>
+  </Grid>
+</Window>
+"@
+$gifReader = New-Object System.Xml.XmlNodeReader $gifXaml
+$script:gifWindow = [Windows.Markup.XamlReader]::Load($gifReader)
+$script:GifImage  = $script:gifWindow.FindName('GifImage')
+$gifRoot          = $script:gifWindow.FindName('GifRoot')
+
+# Apply persisted geometry.
+$script:gifWindow.Left   = $script:Gif.win.left
+$script:gifWindow.Top    = $script:Gif.win.top
+$script:gifWindow.Width  = [Math]::Max(60, $script:Gif.win.width)
+$script:gifWindow.Height = [Math]::Max(60, $script:Gif.win.height)
+
+# No-activate so clicking the GIF never steals foreground from the terminal.
+$script:gifWindow.Add_SourceInitialized({
+  $h = (New-Object System.Windows.Interop.WindowInteropHelper $script:gifWindow).Handle
+  if ($h -ne [IntPtr]::Zero) { [WinTools]::SetNoActivate($h); $script:gifHwnd = $h }
+})
+# Drag anywhere on the surface to move it; persist the new position.
+$gifRoot.Add_MouseLeftButtonDown({
+  $ol = $script:gifWindow.Left; $ot = $script:gifWindow.Top
+  $script:gifWindow.DragMove()
+  if ($script:gifWindow.Left -ne $ol -or $script:gifWindow.Top -ne $ot) {
+    $script:Gif.win.left = $script:gifWindow.Left
+    $script:Gif.win.top  = $script:gifWindow.Top
+    Save-UISettings   # only when an actual move happened, not a bare click
+  }
+})
+$script:gifWindow.Add_SizeChanged({
+  $script:Gif.win.width  = $script:gifWindow.Width
+  $script:Gif.win.height = $script:gifWindow.Height
+  # Persist only on real user resizes; initial layout fires this while still hidden.
+  if ($script:gifWindow.IsVisible) { Save-UISettings }
+})
+
+# Build a looping frame animator for a GIF. Zero external deps: GifBitmapDecoder
+# decodes frames, each frame is composited over the previous one (so frame-
+# differenced GIFs render correctly), and a DispatcherTimer cycles them honoring
+# each frame's own delay metadata. Returns a controller with a .timer field, or
+# $null when the path is empty/unreadable/not a GIF.
+function New-GifAnimator($image, $path) {
+  try {
+    if ([string]::IsNullOrWhiteSpace($path)) { return $null }
+    if ($path -match '^[a-zA-Z][a-zA-Z0-9+.-]*://') {
+      $uri = New-Object System.Uri($path)
+    } else {
+      if (-not (Test-Path -LiteralPath $path)) { return $null }
+      $uri = New-Object System.Uri((Resolve-Path -LiteralPath $path).Path)
+    }
+    $decoder = New-Object System.Windows.Media.Imaging.GifBitmapDecoder(
+      $uri,
+      [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat,
+      [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
+    $count = $decoder.Frames.Count
+    if ($count -le 0) { return $null }
+
+    $fw = $decoder.Frames[0].PixelWidth
+    $fh = $decoder.Frames[0].PixelHeight
+    if ($fw -le 0 -or $fh -le 0) { return $null }
+
+    $frames = New-Object System.Collections.ArrayList
+    $delays = New-Object System.Collections.ArrayList
+    $prev = $null
+    for ($i = 0; $i -lt $count; $i++) {
+      $fr = $decoder.Frames[$i]
+      $left = 0; $top = 0; $delay = 10
+      try {
+        $md = [System.Windows.Media.Imaging.BitmapMetadata]$fr.Metadata
+        try { $left  = [int]$md.GetQuery('/imgdesc/Left') }  catch {}
+        try { $top   = [int]$md.GetQuery('/imgdesc/Top') }   catch {}
+        try { $d = $md.GetQuery('/grctlext/Delay'); if ($d) { $delay = [int]$d } } catch {}
+      } catch {}
+      if ($delay -le 0) { $delay = 10 }   # delay is in centiseconds (1/100s)
+
+      $dv = New-Object System.Windows.Media.DrawingVisual
+      $dc = $dv.RenderOpen()
+      if ($prev) { $dc.DrawImage($prev, (New-Object System.Windows.Rect(0, 0, $fw, $fh))) }
+      $dc.DrawImage($fr, (New-Object System.Windows.Rect($left, $top, $fr.PixelWidth, $fr.PixelHeight)))
+      $dc.Close()
+      $rtb = New-Object System.Windows.Media.Imaging.RenderTargetBitmap(
+        $fw, $fh, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
+      $rtb.Render($dv)
+      $rtb.Freeze()
+      [void]$frames.Add($rtb)
+      [void]$delays.Add($delay)
+      $prev = $rtb
+    }
+
+    if ($frames.Count -eq 1) { $image.Source = $frames[0]; return [pscustomobject]@{ timer = $null; frames = $frames } }
+
+    $st = [pscustomobject]@{ idx = 0 }
+    $image.Source = $frames[0]
+    $timer = New-Object System.Windows.Threading.DispatcherTimer
+    $timer.Interval = [TimeSpan]::FromMilliseconds([Math]::Max(20, [int]$delays[0] * 10))
+    $timer.Add_Tick({
+      $st.idx = ($st.idx + 1) % $frames.Count
+      $image.Source = $frames[$st.idx]
+      $this.Interval = [TimeSpan]::FromMilliseconds([Math]::Max(20, [int]$delays[$st.idx] * 10))
+    }.GetNewClosure())
+    $timer.Start()
+    return [pscustomobject]@{ timer = $timer; frames = $frames }
+  } catch { return $null }
+}
+
+# Reconcile the GIF window with the current overall state. Cheap no-op when the
+# target GIF path hasn't changed. -force reloads even if the path is unchanged
+# (used after the settings dialog edits paths).
+function Update-Gif([bool]$force = $false) {
+  if (-not $script:gifWindow) { return }
+  $want = if ($script:Gif.enabled) { [string]$script:Gif.paths[$script:OverallState] } else { '' }
+  if (-not $force -and $want -eq $script:GifCurrentPath) { return }
+  $script:GifCurrentPath = $want
+
+  # Tear down the previous animator before loading the next (prevents two timers
+  # fighting over Image.Source and leaking DispatcherTimers / frozen frames).
+  if ($script:GifAnim) {
+    if ($script:GifAnim.timer)  { $script:GifAnim.timer.Stop() }
+    if ($script:GifAnim.frames) { $script:GifAnim.frames.Clear() }   # release frozen RenderTargetBitmaps
+  }
+  $script:GifAnim = $null
+  $script:GifImage.Source = $null
+
+  if ([string]::IsNullOrWhiteSpace($want)) { $script:gifWindow.Hide(); return }
+
+  $anim = New-GifAnimator $script:GifImage $want
+  if ($anim) {
+    $script:GifAnim = $anim
+    if (-not $script:gifWindow.IsVisible) { $script:gifWindow.Show() }
+  } else {
+    $script:gifWindow.Hide()   # bad path / unloadable
+  }
+}
+
+# Lightweight settings dialog: per-state GIF paths + an enable toggle.
+function Show-GifSettings {
+  [xml]$sx = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Status GIFs" Width="380" SizeToContent="Height"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen">
+  <Border CornerRadius="10" Background="#F2161616" BorderBrush="#33FFFFFF" BorderThickness="1" Padding="14">
+    <StackPanel>
+      <TextBlock Text="Status GIF paths" Foreground="#FFE6A23C" FontFamily="Segoe UI Semibold" FontSize="13" Margin="0,0,0,10"/>
+      <CheckBox x:Name="EnabledChk" Content="Show status GIF" Foreground="#FFFFFFFF" Margin="0,0,0,10"/>
+      <TextBlock Text="Running (busy)" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
+      <TextBox x:Name="RunBox" Margin="0,2,0,8"/>
+      <TextBlock Text="Needs input" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
+      <TextBox x:Name="NeedBox" Margin="0,2,0,8"/>
+      <TextBlock Text="Idle" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
+      <TextBox x:Name="IdleBox" Margin="0,2,0,12"/>
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+        <Button x:Name="ResetBtn" Content="Reset" Width="70" Margin="0,0,8,0"/>
+        <Button x:Name="CancelBtn" Content="Cancel" Width="70" Margin="0,0,8,0"/>
+        <Button x:Name="SaveBtn" Content="Save" Width="70"/>
+      </StackPanel>
+    </StackPanel>
+  </Border>
+</Window>
+"@
+  $r = New-Object System.Xml.XmlNodeReader $sx
+  $w = [Windows.Markup.XamlReader]::Load($r)
+  $en = $w.FindName('EnabledChk')
+  $rb = $w.FindName('RunBox'); $nb = $w.FindName('NeedBox'); $ib = $w.FindName('IdleBox')
+  $en.IsChecked = $script:Gif.enabled
+  $rb.Text = $script:Gif.paths.running
+  $nb.Text = $script:Gif.paths.needs_input
+  $ib.Text = $script:Gif.paths.idle
+  $w.FindName('ResetBtn').Add_Click({ $rb.Text = ''; $nb.Text = ''; $ib.Text = '' }.GetNewClosure())
+  $w.FindName('CancelBtn').Add_Click({ $w.Close() }.GetNewClosure())
+  $w.FindName('SaveBtn').Add_Click({
+    $script:Gif.enabled           = [bool]$en.IsChecked
+    $script:Gif.paths.running     = $rb.Text.Trim()
+    $script:Gif.paths.needs_input = $nb.Text.Trim()
+    $script:Gif.paths.idle        = $ib.Text.Trim()
+    Save-UISettings
+    Update-Gif $true
+    $w.Close()
+  }.GetNewClosure())
+  [void]$w.ShowDialog()
+}
+
+$GifBtn.Add_Click({ Show-GifSettings })
+
+# Keep the GIF window on every virtual desktop: pin it (Windows-side) once visible;
+# if pinning is unavailable, fall back to following the active desktop.
+$gifDesktopTimer = New-Object System.Windows.Threading.DispatcherTimer
+$gifDesktopTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+$gifDesktopTimer.Add_Tick({
+  if (-not $script:gifWindow.IsVisible -or $script:gifHwnd -eq [IntPtr]::Zero) { return }
+  if (-not $script:gifPinned) { $script:gifPinned = [Pinner]::Pin($script:gifHwnd) }
+  if (-not $script:gifPinned) { [VD]::Follow($script:gifHwnd) }
+})
+$gifDesktopTimer.Start()
+
 # Initial render + refresh timer
 Update-List
+Update-Gif
 $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromSeconds(2)
-$timer.Add_Tick({ Update-List })
+$timer.Add_Tick({ Update-List; Update-Gif })
 $timer.Start()
 
 # Show on all desktops. Primary: ask Windows to pin the window (Windows-side, no
@@ -695,5 +957,19 @@ $pinTimer.Add_Tick({
 })
 $pinTimer.Start()
 
-$Window.Add_Closed({ $timer.Stop(); $followTimer.Stop(); $pinTimer.Stop() })
+$Window.Add_Closed({
+  $timer.Stop(); $followTimer.Stop(); $pinTimer.Stop(); $gifDesktopTimer.Stop()
+  if ($script:GifAnim) {
+    if ($script:GifAnim.timer)  { $script:GifAnim.timer.Stop() }
+    if ($script:GifAnim.frames) { $script:GifAnim.frames.Clear() }
+  }
+  try {
+    if ($script:gifWindow) {
+      $script:Gif.win.width  = $script:gifWindow.Width
+      $script:Gif.win.height = $script:gifWindow.Height
+      Save-UISettings
+      $script:gifWindow.Close()
+    }
+  } catch {}
+})
 [void]$Window.ShowDialog()
