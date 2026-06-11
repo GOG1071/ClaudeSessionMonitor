@@ -277,6 +277,7 @@ function Save-Links {
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="Auto"/>
           </Grid.ColumnDefinitions>
           <TextBlock Grid.Column="0" Text="&#x25CF; Claude Sessions" Foreground="#FFE6A23C"
                      FontFamily="Segoe UI Semibold" FontSize="12" VerticalAlignment="Center"
@@ -292,7 +293,10 @@ function Save-Links {
           <Button Grid.Column="4" x:Name="GifBtn" Content="GIF" Width="34" Height="30"
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
                   FontSize="11" Cursor="Hand" ToolTip="Configure status GIFs"/>
-          <Button Grid.Column="5" x:Name="CloseBtn" Content="&#x2715;" Width="30" Height="30"
+          <Button Grid.Column="5" x:Name="FitBtn" Content="&#x2922;3" Width="34" Height="30"
+                  Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
+                  FontSize="11" Cursor="Hand" ToolTip="Auto-fit cap: max sessions the list auto-grows to fit"/>
+          <Button Grid.Column="6" x:Name="CloseBtn" Content="&#x2715;" Width="30" Height="30"
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
                   FontSize="13" Cursor="Hand"/>
         </Grid>
@@ -341,11 +345,12 @@ $ResizeGrip = $Window.FindName('ResizeGrip')
 $ResizeGripV = $Window.FindName('ResizeGripV')
 $OpacitySlider = $Window.FindName('OpacitySlider')
 $GifBtn     = $Window.FindName('GifBtn')
+$FitBtn     = $Window.FindName('FitBtn')
 $PinBtn     = $Window.FindName('PinBtn')
 
 # Persisted UI settings (width + opacity).
 $UISettingsFile = Join-Path $PSScriptRoot 'settings.json'
-$script:UI = @{ width = 340.0; opacity = 0.95; pinned = $true; visibleRows = 3 }
+$script:UI = @{ width = 340.0; opacity = 0.95; pinned = $true; visibleRows = 3; autoFitCap = 3 }
 
 # Per-state GIF config. Each path is user-configured (a local file path, or a
 # file:// / http(s) URL); an empty path means "no GIF for that state". The floating
@@ -363,6 +368,7 @@ if (Test-Path $UISettingsFile) {
     if ($cfg.opacity) { $script:UI.opacity = [double]$cfg.opacity }
     if ($null -ne $cfg.pinned) { $script:UI.pinned = [bool]$cfg.pinned }
     if ($cfg.visibleRows) { $script:UI.visibleRows = [int]$cfg.visibleRows }
+    if ($null -ne $cfg.autoFitCap) { $script:UI.autoFitCap = [int]$cfg.autoFitCap }
     # GIF settings are additive: missing keys fall back to the defaults above.
     if ($null -ne $cfg.gifEnabled) { $script:Gif.enabled = [bool]$cfg.gifEnabled }
     if ($cfg.gifPaths) {
@@ -384,6 +390,7 @@ function Save-UISettings {
       opacity     = $OpacitySlider.Value
       pinned      = $script:UI.pinned
       visibleRows = $script:UI.visibleRows
+      autoFitCap  = $script:UI.autoFitCap
       gifEnabled  = $script:Gif.enabled
       gifPaths   = [pscustomobject]$script:Gif.paths
       gifWindow  = [pscustomobject]$script:Gif.win
@@ -397,6 +404,13 @@ $OpacitySlider.Value = [Math]::Max(0.25, [Math]::Min(1.0, $script:UI.opacity))
 $Window.Opacity = $OpacitySlider.Value
 $Window.Topmost = $script:UI.pinned   # honor persisted pin state from first paint
 $script:UI.visibleRows = [Math]::Max(1, [Math]::Min(12, [int]$script:UI.visibleRows))
+
+# Auto-fit: when a new session appears, grow the list to show all sessions -- but
+# only while the total stays at or below the cap (settings.json -> autoFitCap).
+# Past the cap, the user-set (or scrollable) height is left alone.
+# -1 means "not yet measured".
+$script:UI.autoFitCap = [Math]::Max(1, [Math]::Min(12, [int]$script:UI.autoFitCap))
+$script:LastSessionCount = -1
 
 # Drag the window from the header — but not when interacting with the opacity slider.
 $Header.Add_MouseLeftButtonDown({
@@ -487,6 +501,15 @@ function Apply-ListSnapHeight {
   }
 
   $maxRows = [Math]::Max(1, [Math]::Min(12, $count))
+
+  # Auto-extend on a newly added session: if the count grew and is still within the
+  # cap, raise visibleRows to fit every row. Grow-only -- a manual shrink afterward,
+  # or counts above the cap, are never overridden here.
+  if ($script:LastSessionCount -ge 0 -and $count -gt $script:LastSessionCount -and $count -le [int]$script:UI.autoFitCap) {
+    if ([int]$script:UI.visibleRows -lt $count) { $script:UI.visibleRows = $count }
+  }
+  $script:LastSessionCount = $count
+
   $script:UI.visibleRows = [Math]::Max(1, [Math]::Min($maxRows, [int]$script:UI.visibleRows))
   $ScrollHost.Height = Get-ListHeightForRows $script:UI.visibleRows
   $ScrollHost.VerticalScrollBarVisibility = if ($count -gt [int]$script:UI.visibleRows) { 'Auto' } else { 'Disabled' }
@@ -1495,6 +1518,68 @@ function Show-GifSettings {
 }
 
 $GifBtn.Add_Click({ Show-GifSettings })
+
+# Reflect the current auto-fit cap on the header button (e.g. "⤢3").
+function Update-FitButton {
+  if ($FitBtn) { $FitBtn.Content = ([char]0x2922).ToString() + [int]$script:UI.autoFitCap }
+}
+
+function Show-FitSettings {
+  [xml]$fx = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Auto-fit" Width="300" SizeToContent="Height"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen">
+  <Border CornerRadius="10" Background="#F2161616" BorderBrush="#33FFFFFF" BorderThickness="1" Padding="14">
+    <StackPanel>
+      <TextBlock Text="Auto-fit cap" Foreground="#FFE6A23C" FontFamily="Segoe UI Semibold" FontSize="13" Margin="0,0,0,8"/>
+      <TextBlock Text="The list auto-grows to show every session, but only while the total is at or below this many. Above it, extra rows scroll." Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,12"/>
+      <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
+        <Slider x:Name="CapSlider" Minimum="1" Maximum="12" Width="200" VerticalAlignment="Center"
+                TickFrequency="1" IsSnapToTickEnabled="True" IsMoveToPointEnabled="True"/>
+        <TextBlock x:Name="CapVal" Text="3" Foreground="#FFFFFFFF" FontFamily="Segoe UI Semibold" FontSize="14" VerticalAlignment="Center" Margin="10,0,0,0" Width="24" TextAlignment="Center"/>
+      </StackPanel>
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+        <Button x:Name="CancelBtn" Content="Cancel" Width="70" Margin="0,0,8,0"/>
+        <Button x:Name="SaveBtn" Content="Save" Width="70"/>
+      </StackPanel>
+    </StackPanel>
+  </Border>
+</Window>
+"@
+  $r = New-Object System.Xml.XmlNodeReader $fx
+  $w = [Windows.Markup.XamlReader]::Load($r)
+  $sl = $w.FindName('CapSlider'); $lbl = $w.FindName('CapVal')
+  $sl.Value = [Math]::Max(1, [Math]::Min(12, [int]$script:UI.autoFitCap))
+  $lbl.Text = [string][int]$sl.Value
+  # Plain scriptblocks (no GetNewClosure) so $script: stays the real overlay scope.
+  $sl.Add_ValueChanged({ $lbl.Text = [string][int]$sl.Value })
+  $w.FindName('CancelBtn').Add_Click({ $w.Close() })
+  $w.FindName('SaveBtn').Add_Click({
+    $script:UI.autoFitCap = [Math]::Max(1, [Math]::Min(12, [int]$sl.Value))
+    Save-UISettings
+    Update-FitButton
+    # Apply the new cap immediately (grow-only): fit the current rows if within cap.
+    if ($List.Items.Count -le [int]$script:UI.autoFitCap -and [int]$script:UI.visibleRows -lt $List.Items.Count) {
+      $script:UI.visibleRows = [int]$List.Items.Count
+    }
+    Apply-ListSnapHeight
+    $w.Close()
+  })
+  $w.Add_Loaded({
+    try {
+      $hh = (New-Object System.Windows.Interop.WindowInteropHelper $w).Handle
+      if ($hh -ne [IntPtr]::Zero) { [WinTools]::Focus($hh) }
+    } catch {}
+    $sl.Focus() | Out-Null
+  })
+  [void]$w.ShowDialog()
+}
+
+$FitBtn.Add_Click({ Show-FitSettings })
+Update-FitButton
 
 # Keep the GIF window on every virtual desktop: pin it (Windows-side) once visible;
 # if pinning is unavailable, fall back to following the active desktop.
