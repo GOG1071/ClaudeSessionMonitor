@@ -470,9 +470,17 @@ function Save-Links {
           <TextBlock Grid.Column="0" Text="&#x25CF; Claude Sessions" Foreground="#FFE6A23C"
                      FontFamily="Segoe UI Semibold" FontSize="12" VerticalAlignment="Center"
                      Margin="12,0,0,0"/>
-          <Slider Grid.Column="1" x:Name="OpacitySlider" Minimum="0.25" Maximum="1.0" Value="0.95"
-                  Width="58" VerticalAlignment="Center" Margin="0,0,8,0"
-                  ToolTip="Window opacity" IsMoveToPointEnabled="True"/>
+          <Button Grid.Column="1" x:Name="OpacityBtn" Content="&#x25D1;" Width="30" Height="30" Margin="0,0,8,0"
+                  Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
+                  FontSize="13" Cursor="Hand" ToolTip="Window opacity"/>
+          <Popup Grid.Column="1" x:Name="OpacityPopup" PlacementTarget="{Binding ElementName=OpacityBtn}"
+                 Placement="Bottom" StaysOpen="False" AllowsTransparency="True" VerticalOffset="2">
+            <Border CornerRadius="8" Background="#F2161616" BorderBrush="#33FFFFFF" BorderThickness="1" Padding="12,8">
+              <Slider x:Name="OpacitySlider" Minimum="0.25" Maximum="1.0" Value="0.95"
+                      Width="130" VerticalAlignment="Center"
+                      ToolTip="Window opacity" IsMoveToPointEnabled="True"/>
+            </Border>
+          </Popup>
           <TextBlock Grid.Column="2" x:Name="CountText" Text="" Foreground="#80FFFFFF"
                      FontFamily="Segoe UI" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
           <Button Grid.Column="3" x:Name="GifBtn" Content="GIF" Width="34" Height="30"
@@ -529,6 +537,8 @@ $CountText  = $Window.FindName('CountText')
 $ResizeGrip = $Window.FindName('ResizeGrip')
 $ResizeGripV = $Window.FindName('ResizeGripV')
 $OpacitySlider = $Window.FindName('OpacitySlider')
+$OpacityBtn = $Window.FindName('OpacityBtn')
+$OpacityPopup = $Window.FindName('OpacityPopup')
 $GifBtn     = $Window.FindName('GifBtn')
 $FitBtn     = $Window.FindName('FitBtn')
 
@@ -552,8 +562,11 @@ $script:Gif = @{
 # audio analogue of the status GIF. Empty default = feature off.
 $script:Snd = @{
   enabled = $true
+  volume  = 0.8                       # 0.0-1.0, applied to every sound played
   paths   = @{ running = ''; waiting = ''; idle = '' }
 }
+$script:SndNagSeconds = 60            # waiting-state sound re-nag interval
+$script:SndNagTimer  = $null          # repeats the waiting sound until you respond
 $script:SndLastState = $null          # last state a sound was reconciled against
 $script:SndPlayer    = $null          # reused MediaPlayer (created lazily on UI thread)
 # Remote sounds can't be streamed reliably through MediaPlayer (hotlink/UA/TLS), so they
@@ -583,6 +596,7 @@ if (Test-Path $UISettingsFile) {
     }
     # Sound settings are additive: missing keys fall back to the defaults above.
     if ($null -ne $cfg.sndEnabled) { $script:Snd.enabled = [bool]$cfg.sndEnabled }
+    if ($null -ne $cfg.sndVolume) { $script:Snd.volume = [Math]::Max(0.0, [Math]::Min(1.0, [double]$cfg.sndVolume)) }
     if ($cfg.sndPaths) {
       foreach ($k in 'running','waiting','idle') {
         if ($cfg.sndPaths.$k) { $script:Snd.paths[$k] = [string]$cfg.sndPaths.$k }
@@ -601,6 +615,7 @@ function Save-UISettings {
       gifPaths   = [pscustomobject]$script:Gif.paths
       gifWindow  = [pscustomobject]$script:Gif.win
       sndEnabled  = $script:Snd.enabled
+      sndVolume   = $script:Snd.volume
       sndPaths    = [pscustomobject]$script:Snd.paths
     } | ConvertTo-Json -Compress | Set-Content -Path $UISettingsFile -Encoding UTF8
   } catch {}
@@ -634,6 +649,11 @@ $CloseBtn.Add_Click({ $Window.Close() })
 # Opacity slider -> window opacity.
 $OpacitySlider.Add_ValueChanged({ $Window.Opacity = $_.NewValue })
 $OpacitySlider.Add_PreviewMouseUp({ Save-UISettings })
+
+# Opacity slider is hidden by default; the button drops it down. StaysOpen="False" on the
+# popup auto-hides it on any click outside. Open-only here so the outside-click-then-button
+# sequence (the button click counts as the outside click that closes it) doesn't fight.
+$OpacityBtn.Add_Click({ $OpacityPopup.IsOpen = $true })
 
 # Right-edge grip -> horizontal resize.
 $ResizeGrip.Add_DragDelta({
@@ -1653,6 +1673,7 @@ function Play-SoundFile([string]$file) {
   try {
     if (-not $script:SndPlayer) { $script:SndPlayer = New-Object System.Windows.Media.MediaPlayer }
     $script:SndPlayer.Open([Uri]$file)
+    $script:SndPlayer.Volume = [Math]::Max(0.0, [Math]::Min(1.0, [double]$script:Snd.volume))
     $script:SndPlayer.Position = [TimeSpan]::Zero
     $script:SndPlayer.Play()
   } catch {}
@@ -1687,17 +1708,40 @@ function Get-SoundFileSync([string]$path) {
 
 # Reconcile audio with the current overall state. Fires the new state's sound exactly
 # once per transition. The very first call only records the baseline (no startup sound).
+# Start (reset) or stop the waiting re-nag timer to match the current state. Called on
+# every transition so the 60s countdown restarts each time waiting is (re)entered and
+# halts the instant the state leaves waiting.
+function Sync-SndNag([string]$state) {
+  if (-not $script:SndNagTimer) { return }
+  if ($state -eq 'waiting' -and $script:Snd.enabled) {
+    $script:SndNagTimer.Stop(); $script:SndNagTimer.Start()   # restart the countdown
+  } else {
+    $script:SndNagTimer.Stop()
+  }
+}
+
 function Update-Sound {
   $state = $script:OverallState
   if ($state -eq $script:SndLastState) { return }   # no transition -> nothing to do
 
   $prev = $script:SndLastState
   $script:SndLastState = $state
-  if ($null -eq $prev) { return }                   # baseline only: don't sound on startup
+  Sync-SndNag $state
+  if ($null -eq $prev) { return }                   # baseline only: startup is handled separately
 
   $file = Resolve-SoundFile (Get-SoundPathForState $state)
   if (-not $file) { return }                        # unset, or remote not downloaded yet
   Play-SoundFile $file
+}
+
+# Play the current state's sound at launch (synchronously resolving a remote file so it's
+# audible immediately), record it as the baseline, and arm the waiting re-nag if needed.
+function Start-StartupSound {
+  $state = $script:OverallState
+  $script:SndLastState = $state
+  $file = Get-SoundFileSync (Get-SoundPathForState $state)
+  if ($file) { Play-SoundFile $file }
+  Sync-SndNag $state
 }
 
 # Lightweight settings dialog: per-state GIF paths + an enable toggle.
@@ -1727,7 +1771,13 @@ function Show-GifSettings {
       <TextBlock Text="Needs input" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
       <TextBox x:Name="SndNeedBox" Margin="0,2,0,8"/>
       <TextBlock Text="Idle" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
-      <TextBox x:Name="SndIdleBox" Margin="0,2,0,12"/>
+      <TextBox x:Name="SndIdleBox" Margin="0,2,0,10"/>
+      <TextBlock Text="Volume" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
+      <StackPanel Orientation="Horizontal" Margin="0,2,0,12">
+        <Slider x:Name="SndVolSlider" Minimum="0" Maximum="1" Width="270" VerticalAlignment="Center"
+                TickFrequency="0.05" IsMoveToPointEnabled="True"/>
+        <TextBlock x:Name="SndVolVal" Text="80%" Foreground="#FFFFFFFF" FontFamily="Segoe UI Semibold" FontSize="13" VerticalAlignment="Center" Margin="10,0,0,0" Width="40" TextAlignment="Center"/>
+      </StackPanel>
       <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
         <Button x:Name="TestBtn" Content="Test ▶" Width="70" Margin="0,0,8,0"/>
         <Button x:Name="ResetBtn" Content="Reset" Width="70" Margin="0,0,8,0"/>
@@ -1744,6 +1794,7 @@ function Show-GifSettings {
   $rb = $w.FindName('RunBox'); $nb = $w.FindName('NeedBox'); $ib = $w.FindName('IdleBox')
   $sen = $w.FindName('SndEnabledChk')
   $srb = $w.FindName('SndRunBox'); $snb = $w.FindName('SndNeedBox'); $sib = $w.FindName('SndIdleBox')
+  $svol = $w.FindName('SndVolSlider'); $svval = $w.FindName('SndVolVal')
   $en.IsChecked = $script:Gif.enabled
   $rb.Text = $script:Gif.paths.running
   $nb.Text = $script:Gif.paths.waiting
@@ -1752,6 +1803,9 @@ function Show-GifSettings {
   $srb.Text = $script:Snd.paths.running
   $snb.Text = $script:Snd.paths.waiting
   $sib.Text = $script:Snd.paths.idle
+  $svol.Value = [Math]::Max(0.0, [Math]::Min(1.0, [double]$script:Snd.volume))
+  $svval.Text = [string][int]([Math]::Round($svol.Value * 100)) + '%'
+  $svol.Add_ValueChanged({ $svval.Text = [string][int]([Math]::Round($svol.Value * 100)) + '%' })
   # NOTE: do NOT use .GetNewClosure() on these handlers. GetNewClosure wraps the block
   # in a new module where $script: resolves to that module (so $script:Gif is $null and
   # the handler throws). The dialog is modal, so these plain scriptblocks keep access to
@@ -1761,6 +1815,7 @@ function Show-GifSettings {
   # so a freshly-typed URL is fetched and heard without needing to Save or wait.
   $w.FindName('TestBtn').Add_Click({
     $p = $srb.Text.Trim(); if (-not $p) { $p = $snb.Text.Trim() }; if (-not $p) { $p = $sib.Text.Trim() }
+    $script:Snd.volume = [Math]::Max(0.0, [Math]::Min(1.0, [double]$svol.Value))  # Test honors the slider live
     $f = Get-SoundFileSync $p
     if ($f) { Play-SoundFile $f }
   })
@@ -1771,11 +1826,13 @@ function Show-GifSettings {
     $script:Gif.paths.waiting = $nb.Text.Trim()
     $script:Gif.paths.idle        = $ib.Text.Trim()
     $script:Snd.enabled       = [bool]$sen.IsChecked
+    $script:Snd.volume        = [Math]::Max(0.0, [Math]::Min(1.0, [double]$svol.Value))
     $script:Snd.paths.running = $srb.Text.Trim()
     $script:Snd.paths.waiting = $snb.Text.Trim()
     $script:Snd.paths.idle    = $sib.Text.Trim()
     Save-UISettings
-    Prewarm-Sounds   # fetch any newly-entered remote sounds so the next transition plays
+    Prewarm-Sounds      # fetch any newly-entered remote sounds so the next transition plays
+    Sync-SndNag $script:OverallState   # (re)arm or disarm the waiting re-nag per new settings
     # Paths may have changed -> drop stale decodes + downloaded bytes so new paths reload.
     $script:GifCache.Clear(); $script:GifBytes.Clear(); $script:GifQueued.Clear()
     $script:GifShownPath = ''
@@ -1873,10 +1930,21 @@ $gifDesktopTimer.Add_Tick({
 $gifDesktopTimer.Start()
 
 # Initial render + refresh timer
+# Waiting re-nag: re-plays the waiting sound every $SndNagSeconds while a session still
+# needs input. Armed/disarmed by Sync-SndNag on each transition; the tick self-stops if
+# the state has since left waiting (belt-and-suspenders).
+$script:SndNagTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:SndNagTimer.Interval = [TimeSpan]::FromSeconds($script:SndNagSeconds)
+$script:SndNagTimer.Add_Tick({
+  if ($script:OverallState -ne 'waiting' -or -not $script:Snd.enabled) { $script:SndNagTimer.Stop(); return }
+  $f = Resolve-SoundFile (Get-SoundPathForState 'waiting')
+  if ($f) { Play-SoundFile $f }
+})
+
 Update-List
-Update-Gif   # lazy-loads the current state's GIF; cached + instant on later switches
-Update-Sound   # records the startup state as baseline (no sound until the first change)
-Prewarm-Sounds # pre-download remote sounds so the first transition isn't silent
+Update-Gif         # lazy-loads the current state's GIF; cached + instant on later switches
+Prewarm-Sounds     # pre-download remote sounds so transitions aren't silent
+Start-StartupSound # play the current state's sound on launch + arm the waiting re-nag
 $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromSeconds(2)
 $timer.Add_Tick({ Update-List; Update-Gif; Update-Sound })
@@ -1919,6 +1987,7 @@ $Window.Add_Closed({
   if ($script:GifTimer) { $script:GifTimer.Stop() }
   $script:GifActive = $null
   if ($script:GifCache) { $script:GifCache.Clear() }
+  try { if ($script:SndNagTimer) { $script:SndNagTimer.Stop() } } catch {}
   try { if ($script:SndPlayer) { $script:SndPlayer.Stop(); $script:SndPlayer.Close() } } catch {}
   try { if ($script:SndDlPs) { $script:SndDlPs.Stop(); $script:SndDlPs.Dispose() } } catch {}
   try { if ($script:SndDlRunspace) { $script:SndDlRunspace.Close(); $script:SndDlRunspace.Dispose() } } catch {}
