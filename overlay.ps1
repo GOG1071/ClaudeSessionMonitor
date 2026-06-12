@@ -196,12 +196,201 @@ public static class Pinner {
 }
 "@
 
+# ===========================================================================
+# SessionState — typed model for ONE Claude Code session row.
+#
+# Single source of truth for both the FACTS of a session (read from
+# ~/.claude/sessions/<pid>.json) and how it is PRESENTED (every string the row
+# renders). Update-List builds one [SessionState] per session instead of a loose
+# pscustomobject, so the row pipeline is: construct -> enrich -> render.
+#
+# PowerShell-class scope note: class methods cannot see script-scoped functions
+# or variables. So the two cache-backed enrichers (transcript activity + token
+# tallies) run in script scope and push their results in via the property setters
+# below; everything that is PURE (formatting, tinting, lifecycle classification)
+# lives here as instance/static members.
+# ===========================================================================
+class SessionState {
+  static [char] $Sep   = [char]0x00B7   # middle dot separator (char code => encoding-safe)
+  static [char] $Sigma = [char]0x03A3   # Σ — marks the cumulative-tokens figure
+
+  # --- Raw session facts ---
+  [int]    $Pid
+  [string] $Cwd
+  [string] $SessionId
+  [string] $Status        # native status, only ever 'busy' | 'idle'
+  [long]   $UpdatedAt
+  [string] $Version
+
+  # --- Derived lifecycle state ---
+  [bool]   $IsAlive
+  [bool]   $IsBusy
+  [string] $Color         # row-tint key: 'busy' | 'waiting' | 'stale' | 'idle'
+  [string] $StatusText
+
+  # --- Transcript-derived (filled by Enrich) ---
+  [string] $Activity = ''
+  [string] $Prompt   = ''
+  [string] $Model    = ''
+
+  # --- Token tallies (filled by SetTokens) ---
+  [long]   $InputTokens
+  [long]   $CacheCreate
+  [long]   $CacheRead
+  [long]   $OutputTokens
+  [long]   $ContextTokens
+  [long]   $TotalTokens
+
+  # --- Per-tick snapshot (relative-time string is recomputed each refresh) ---
+  [string] $AgeText = ''
+
+  # Construct from the parsed session JSON plus the liveness verdict (the alive
+  # set is a script-scope lookup, so the caller resolves it and passes the bool).
+  SessionState([object]$json, [bool]$isAlive) {
+    $this.Pid       = [int]$json.pid
+    $this.Cwd       = "$($json.cwd)"
+    $this.SessionId = "$($json.sessionId)"
+    $this.Status    = "$($json.status)"
+    $this.UpdatedAt = [long]$json.updatedAt
+    $this.Version   = "$($json.version)"
+    $this.IsAlive   = $isAlive
+    $this.IsBusy    = ($this.Status -eq 'busy')
+
+    if (-not $isAlive) {
+      $this.Color = 'stale'; $this.StatusText = 'ended'
+    } else {
+      $this.Color = $this.Status; $this.StatusText = $this.Status
+    }
+  }
+
+  # Promote an alive, non-busy session to the waiting state. The attention-marker
+  # file check is script-scope IO; the model only owns the resulting label.
+  [void] MarkWaiting() {
+    $this.Color = 'waiting'; $this.StatusText = 'needs input'
+  }
+
+  # Push transcript-derived fields in (computed by Get-SessionActivity).
+  [void] Enrich([object]$activity) {
+    if (-not $activity) { return }
+    $this.Activity = "$($activity.activity)"
+    $this.Prompt   = "$($activity.prompt)"
+    $this.Model    = "$($activity.model)"
+  }
+
+  # Push the token tallies in (computed by Get-SessionTokens).
+  [void] SetTokens([object]$tk) {
+    if (-not $tk) { return }
+    $this.InputTokens   = [long]$tk.inTok
+    $this.CacheCreate   = [long]$tk.cacheCreate
+    $this.CacheRead     = [long]$tk.cacheRead
+    $this.OutputTokens  = [long]$tk.outTok
+    $this.ContextTokens = [long]$tk.ctx
+    $this.TotalTokens   = $this.InputTokens + $this.CacheCreate + $this.CacheRead + $this.OutputTokens
+  }
+
+  # Refresh the relative-age snapshot against the current clock (called per tick).
+  [void] StampAge([long]$now) {
+    $this.AgeText = [SessionState]::FormatAge($now - $this.UpdatedAt)
+  }
+
+  # --- Display projections (consumed by Set-RowData) ---
+
+  [string] Name() {
+    if ([string]::IsNullOrWhiteSpace($this.Cwd)) { return 'unknown' }
+    $leaf = [System.IO.Path]::GetFileName($this.Cwd.TrimEnd([char]'\', [char]'/'))
+    if (-not [string]::IsNullOrWhiteSpace($leaf)) { return $leaf }
+    return $this.Cwd
+  }
+
+  [string] Sub() {
+    if ($this.Activity) { return $this.Activity }
+    return "$($this.StatusText) $([SessionState]::Sep) pid $($this.Pid)"
+  }
+
+  [string] MetaText() {
+    $parts = @()
+    $m = [SessionState]::FormatModel($this.Model)
+    if ($m)            { $parts += $m }
+    if ($this.Version) { $parts += "v$($this.Version)" }
+    return ($parts -join " $([SessionState]::Sep) ")
+  }
+
+  [string] Tip() {
+    $tip = "pid $($this.Pid) $([SessionState]::Sep) v$($this.Version) $([SessionState]::Sep) $($this.StatusText)`n$($this.Cwd)"
+    if ($this.Prompt)   { $tip += "`n`nprompt: $($this.Prompt)" }
+    if ($this.Activity) { $tip += "`n`n$($this.Activity)" }
+    return $tip
+  }
+
+  [string] CtxText() {
+    if ($this.ContextTokens -gt 0) { return 'ctx ' + [SessionState]::FormatTokens($this.ContextTokens) }
+    return ''
+  }
+
+  [string] TokText() {
+    if ($this.TotalTokens -gt 0) { return "$([SessionState]::Sigma) " + [SessionState]::FormatTokens($this.TotalTokens) }
+    return ''
+  }
+
+  [string] TokTip() {
+    if ($this.TotalTokens -le 0) { return '' }
+    return "tokens this session" +
+      "`n  context now : $([SessionState]::FormatTokens($this.ContextTokens))" +
+      "`n  output      : $([SessionState]::FormatTokens($this.OutputTokens))" +
+      "`n  input       : $([SessionState]::FormatTokens($this.InputTokens))" +
+      "`n  cache write : $([SessionState]::FormatTokens($this.CacheCreate))" +
+      "`n  cache read  : $([SessionState]::FormatTokens($this.CacheRead))" +
+      "`n  total       : $([SessionState]::FormatTokens($this.TotalTokens))"
+  }
+
+  # --- Pure static formatters (folded in from the old script-level Format-* fns) ---
+
+  static [string] FormatAge([long]$ms) {
+    if ($ms -le 0) { return 'now' }
+    $s = [int]($ms / 1000)
+    if ($s -lt 60) { return "${s}s" }
+    $m = [int]($s / 60)
+    if ($m -lt 60) { return "${m}m" }
+    $h = [int]($m / 60)
+    if ($h -lt 24) { return "${h}h" }
+    $d = [int]($h / 24)
+    return "${d}d"
+  }
+
+  # 945 -> "945", 12_300 -> "12.3K", 3_450_000 -> "3.45M".
+  static [string] FormatTokens([long]$n) {
+    if ($n -le 0)       { return '0' }
+    if ($n -lt 1000)    { return "$n" }
+    if ($n -lt 1000000) { return ('{0:0.0}K' -f ($n / 1000.0)) }
+    return ('{0:0.00}M' -f ($n / 1000000.0))
+  }
+
+  # "claude-opus-4-8" -> "opus 4.8"; "claude-haiku-4-5-20251001" -> "haiku 4.5".
+  static [string] FormatModel([string]$m) {
+    if (-not $m) { return '' }
+    $x = $m -replace '^claude-', '' -replace '-\d{8}$', ''   # strip prefix + trailing date stamp
+    $mt = [regex]::Match($x, '^([a-z]+)-(\d+)-(\d+)')
+    if ($mt.Success) { return "$($mt.Groups[1].Value) $($mt.Groups[2].Value).$($mt.Groups[3].Value)" }
+    return $x
+  }
+
+  # Status -> row background tint (base + hover shades). Replaces the old status dot.
+  static [hashtable] Tint([string]$color) {
+    switch ($color) {
+      'busy'    { return @{ base = '#2E3FB950'; hover = '#4D3FB950' } }   # green  = running
+      'waiting' { return @{ base = '#38D29922'; hover = '#57D29922' } }   # yellow = waiting for input
+      'stale'   { return @{ base = '#33F85149'; hover = '#52F85149' } }   # red    = process ended
+      'idle'    { return @{ base = '#386E7681'; hover = '#576E7681' } }   # gray   = idle
+    }
+    return @{ base = '#386E7681'; hover = '#57D29922' }                   # default / unknown
+  }
+}
+
 $SessionsDir = Join-Path $env:USERPROFILE '.claude\sessions'
 # waiting markers written by scripts\session-attention.cjs (Notification hook).
 # The native session JSON only ever carries busy/idle, so this sidecar is the sole
 # source for the "Claude is waiting for the user" state.
 $AttentionDir = Join-Path $env:USERPROFILE '.claude\session-attention'
-$sep = [char]0x00B7   # middle dot, defined via char code so file encoding never mangles it
 
 # Persisted "links": sessionId -> terminal window handle, for sessions whose window
 # title can't be auto-matched (right-click a row to link it to the current terminal).
@@ -554,18 +743,6 @@ function Get-AliveProcessIds {
   return $set
 }
 
-function Format-Age([long]$ms) {
-  if ($ms -le 0) { return 'now' }
-  $s = [int]($ms / 1000)
-  if ($s -lt 60)    { return "${s}s" }
-  $m = [int]($s / 60)
-  if ($m -lt 60)    { return "${m}m" }
-  $h = [int]($m / 60)
-  if ($h -lt 24)    { return "${h}h" }
-  $d = [int]($h / 24)
-  return "${d}d"
-}
-
 # Read a session's transcript tail and summarise what it's currently doing, the most
 # recent user prompt, and the model in use. Cached per session keyed on updatedAt, so
 # idle sessions aren't re-parsed every tick.
@@ -615,15 +792,6 @@ function Get-SessionActivity($cwd, $sessionId, $updatedAt) {
   return $val
 }
 
-# Shorten a model id for display: "claude-opus-4-8" -> "opus 4.8",
-# "claude-sonnet-4-6" -> "sonnet 4.6", "claude-haiku-4-5-20251001" -> "haiku 4.5".
-function Format-Model([string]$m) {
-  if (-not $m) { return '' }
-  $x = $m -replace '^claude-', '' -replace '-\d{8}$', ''   # strip prefix + trailing date stamp
-  if ($x -match '^([a-z]+)-(\d+)-(\d+)') { return "$($matches[1]) $($matches[2]).$($matches[3])" }
-  return $x
-}
-
 # Token consumption per session. Sums message.usage across the whole transcript
 # (input + cache-create + cache-read + output) and also tracks the latest turn's
 # prompt size as the current context-window fill. Reads incrementally: the cache
@@ -665,14 +833,6 @@ function Get-SessionTokens($cwd, $sessionId) {
     $c.size = $len
   } catch {}
   return $c
-}
-
-# Compact human token count: 945 -> "945", 12_300 -> "12.3K", 3_450_000 -> "3.45M".
-function Format-Tokens([long]$n) {
-  if ($n -le 0)        { return '0' }
-  if ($n -lt 1000)     { return "$n" }
-  if ($n -lt 1000000)  { return ('{0:0.0}K' -f ($n / 1000.0)) }
-  return ('{0:0.00}M' -f ($n / 1000000.0))
 }
 
 # Score how well a Windows Terminal tab/window title identifies a session.
@@ -804,18 +964,6 @@ function Select-WTTabInWindow($hwnd, $folder) {
       [void]$sip.Select()
     }
   } catch {}
-}
-
-# Map a session status to its row background tint (base + hover shades). Replaces the
-# old status dot — the whole row is tinted by status instead.
-function Get-RowTint($color) {
-  switch ($color) {
-    'busy'        { return @{ base = '#2E3FB950'; hover = '#4D3FB950' } }   # green  = running
-    'waiting' { return @{ base = '#38D29922'; hover = '#57D29922' } }   # yellow = waiting for input
-    'stale'       { return @{ base = '#33F85149'; hover = '#52F85149' } }   # red    = process ended
-    'idle'        { return @{ base = '#386E7681'; hover = '#576E7681' } }   # gray   = idle
-    default       { return @{ base = '#386E7681'; hover = '#57D29922' } }
-  }
 }
 
 # Build a row once and return a hashtable of the Border plus references to every
@@ -953,43 +1101,48 @@ function New-Row {
 # property when it actually changed, so unchanged rows incur no layout work and the
 # row under the cursor is never disturbed. Background is intentionally untouched so
 # the hover tint (set by MouseEnter/Leave) survives every refresh.
-function Set-RowData($e, $r) {
+function Set-RowData($e, [SessionState]$s) {
   # Status -> row background tint (replaces the old dot). Carry base/hover on the Tag so
   # the MouseEnter/Leave handlers (and Show-RowFlash) restore the right shade.
-  $tint = Get-RowTint $r.color
-  $e.Border.Tag = [pscustomobject]@{ Pid = $r.pid; Cwd = $r.cwd; SessionId = $r.sessionId; BaseBg = $tint.base; HoverBg = $tint.hover }
-  if ($e.Border.ToolTip -ne $r.tip) { $e.Border.ToolTip = $r.tip }
+  $tint = [SessionState]::Tint($s.Color)
+  $e.Border.Tag = [pscustomobject]@{ Pid = $s.Pid; Cwd = $s.Cwd; SessionId = $s.SessionId; BaseBg = $tint.base; HoverBg = $tint.hover }
+  $tip = $s.Tip()
+  if ($e.Border.ToolTip -ne $tip) { $e.Border.ToolTip = $tip }
 
   # Re-apply the background only when the tint or hover state actually changed, so an
   # unchanged row never churns its brush (keeps the in-place update blink-free).
   $bg = if ($e.Border.IsMouseOver) { $tint.hover } else { $tint.base }
   if ($e.LastBg -ne $bg) { $e.LastBg = $bg; $e.Border.Background = [Windows.Media.BrushConverter]::new().ConvertFrom($bg) }
 
-  if ($e.RunName.Text -ne $r.name)      { $e.RunName.Text = $r.name }
-  $pidTxt = "  $($r.pid)"
+  $name = $s.Name()
+  if ($e.RunName.Text -ne $name)        { $e.RunName.Text = $name }
+  $pidTxt = "  $($s.Pid)"
   if ($e.RunPid.Text -ne $pidTxt)       { $e.RunPid.Text = $pidTxt }
 
-  if ($r.prompt) {
-    if ($e.Prompt.Text -ne $r.prompt)   { $e.Prompt.Text = $r.prompt }
+  if ($s.Prompt) {
+    if ($e.Prompt.Text -ne $s.Prompt)   { $e.Prompt.Text = $s.Prompt }
     if ($e.Prompt.Visibility -ne 'Visible') { $e.Prompt.Visibility = 'Visible' }
   } elseif ($e.Prompt.Visibility -ne 'Collapsed') {
     $e.Prompt.Visibility = 'Collapsed'
   }
 
-  if ($e.Sub.Text -ne $r.sub)           { $e.Sub.Text = $r.sub }
+  $sub = $s.Sub()
+  if ($e.Sub.Text -ne $sub)             { $e.Sub.Text = $sub }
 
-  if ($r.metaTxt) {
-    if ($e.Meta.Text -ne $r.metaTxt)    { $e.Meta.Text = $r.metaTxt }
+  $metaTxt = $s.MetaText()
+  if ($metaTxt) {
+    if ($e.Meta.Text -ne $metaTxt)      { $e.Meta.Text = $metaTxt }
     if ($e.Meta.Visibility -ne 'Visible') { $e.Meta.Visibility = 'Visible' }
   } elseif ($e.Meta.Visibility -ne 'Collapsed') {
     $e.Meta.Visibility = 'Collapsed'
   }
 
-  if ($e.Age.Text -ne $r.age)           { $e.Age.Text = $r.age }
-  if ($e.Ctx.Text -ne $r.ctxTxt)        { $e.Ctx.Text = $r.ctxTxt }
-  if ($e.Tok.Text -ne $r.tokTxt)        { $e.Tok.Text = $r.tokTxt }
-  if ($e.Ctx.ToolTip -ne $r.tokTip)     { $e.Ctx.ToolTip = $r.tokTip }
-  if ($e.Tok.ToolTip -ne $r.tokTip)     { $e.Tok.ToolTip = $r.tokTip }
+  $ctxTxt = $s.CtxText(); $tokTxt = $s.TokText(); $tokTip = $s.TokTip()
+  if ($e.Age.Text -ne $s.AgeText)       { $e.Age.Text = $s.AgeText }
+  if ($e.Ctx.Text -ne $ctxTxt)          { $e.Ctx.Text = $ctxTxt }
+  if ($e.Tok.Text -ne $tokTxt)          { $e.Tok.Text = $tokTxt }
+  if ($e.Ctx.ToolTip -ne $tokTip)       { $e.Ctx.ToolTip = $tokTip }
+  if ($e.Tok.ToolTip -ne $tokTip)       { $e.Tok.ToolTip = $tokTip }
 }
 
 # Reused row elements, keyed by sessionId, so a session's row is built once and then
@@ -1011,20 +1164,14 @@ function Update-List {
   $nativeSids = @{}   # sessionIds seen this tick, for reaping orphaned attention markers
 
   foreach ($file in Get-ChildItem -Path $SessionsDir -Filter '*.json' -ErrorAction SilentlyContinue) {
-    try { $s = Get-Content $file.FullName -Raw | ConvertFrom-Json } catch { continue }
-    if (-not $s.pid) { continue }
+    try { $json = Get-Content $file.FullName -Raw | ConvertFrom-Json } catch { continue }
+    if (-not $json.pid) { continue }
 
-    $isAlive = $alive.ContainsKey([int]$s.pid)
-    $proj = if ($s.cwd) { Split-Path $s.cwd -Leaf } else { 'unknown' }
-    if ([string]::IsNullOrWhiteSpace($proj)) { $proj = $s.cwd }
+    # 1. Construct the model from the raw facts + liveness.
+    $isAlive = $alive.ContainsKey([int]$json.pid)
+    $session = [SessionState]::new($json, $isAlive)
 
-    if (-not $isAlive) {
-      $color = 'stale'; $statusTxt = 'ended'
-    } else {
-      $color = $s.status
-      $statusTxt = $s.status
-    }
-
+    # 2. waiting-state refinement (script-scope IO the model can't do itself).
     # waiting is a refinement of the idle state. The native session file only ever
     # carries busy/idle; the Notification hook (scripts\session-attention.cjs) drops a
     # marker when Claude is waiting for the user. Show waiting when an ALIVE session
@@ -1033,72 +1180,26 @@ function Update-List {
     # "marker newer than updatedAt" test would be raced by the heartbeat. The rule is
     # purely state-based — a busy (working) or dead session can't need input, so its
     # marker is reaped on sight, which also self-heals a missed `clear`.
-    if ($s.sessionId) {
-      $nativeSids[$s.sessionId] = $true
-      $mk = Join-Path $AttentionDir "$($s.sessionId).json"
+    if ($session.SessionId) {
+      $nativeSids[$session.SessionId] = $true
+      $mk = Join-Path $AttentionDir "$($session.SessionId).json"
       if (Test-Path $mk) {
-        if ($isAlive -and $s.status -ne 'busy') {
-          $color = 'waiting'; $statusTxt = 'needs input'
+        if ($isAlive -and -not $session.IsBusy) {
+          $session.MarkWaiting()
         } else {
           Remove-Item $mk -ErrorAction SilentlyContinue   # busy or dead: can't need input
         }
       }
     }
 
-    $age = Format-Age ($now - [long]$s.updatedAt)
+    # 3. Enrich with cache-backed transcript + token data, then stamp relative age.
+    #    (Model (from transcript) + CLI version (from session JSON); effort/reasoning
+    #    level is not recorded anywhere, so it can't be shown.)
+    if ($isAlive) { $session.Enrich((Get-SessionActivity $session.Cwd $session.SessionId $session.UpdatedAt)) }
+    $session.SetTokens((Get-SessionTokens $session.Cwd $session.SessionId))
+    $session.StampAge($now)
 
-    $act = if ($isAlive) { Get-SessionActivity $s.cwd $s.sessionId $s.updatedAt } else { @{ activity = ''; prompt = ''; model = '' } }
-    $activity = $act.activity
-    $prompt   = $act.prompt
-    $sub = if ($activity) { $activity } else { "$statusTxt $sep pid $($s.pid)" }
-
-    # Model (from transcript) + CLI version (from session JSON). Effort/reasoning level
-    # is not recorded anywhere in the session or transcript, so it can't be shown.
-    $modelTxt  = Format-Model $act.model
-    $ver       = "$($s.version)"
-    $metaParts = @()
-    if ($modelTxt) { $metaParts += $modelTxt }
-    if ($ver)      { $metaParts += "v$ver" }
-    $metaTxt   = ($metaParts -join " $sep ")
-    $tip = "pid $($s.pid) $sep v$($s.version) $sep $statusTxt`n$($s.cwd)" +
-      $(if ($prompt)   { "`n`nprompt: $prompt" } else { '' }) +
-      $(if ($activity) { "`n`n$activity" } else { '' })
-
-    # Token consumption (cumulative throughput across the session + current context fill).
-    $tk = Get-SessionTokens $s.cwd $s.sessionId
-    $total = 0L; $tokTxt = ''; $ctxTxt = ''; $tokTip = ''
-    if ($tk) {
-      $total  = [long]$tk.inTok + [long]$tk.cacheCreate + [long]$tk.cacheRead + [long]$tk.outTok
-      $ctxTxt = if ([long]$tk.ctx -gt 0) { 'ctx ' + (Format-Tokens $tk.ctx) } else { '' }
-      $tokTxt = if ($total -gt 0) { ([char]0x03A3) + ' ' + (Format-Tokens $total) } else { '' }   # Σ = cumulative
-      $tokTip = "tokens this session" +
-        "`n  context now : $(Format-Tokens $tk.ctx)" +
-        "`n  output      : $(Format-Tokens $tk.outTok)" +
-        "`n  input       : $(Format-Tokens $tk.inTok)" +
-        "`n  cache write : $(Format-Tokens $tk.cacheCreate)" +
-        "`n  cache read  : $(Format-Tokens $tk.cacheRead)" +
-        "`n  total       : $(Format-Tokens $total)"
-    }
-
-    $rows += [pscustomobject]@{
-      pid       = [int]$s.pid
-      cwd       = "$($s.cwd)"
-      sessionId = "$($s.sessionId)"
-      name   = $proj
-      prompt = $prompt
-      sub    = $sub
-      metaTxt = $metaTxt
-      tip    = $tip
-      age    = $age
-      color  = $color
-      alive  = $isAlive
-      busy   = ($s.status -eq 'busy')
-      upd    = [long]$s.updatedAt
-      ctxTxt = $ctxTxt
-      tokTxt = $tokTxt
-      tokTip = $tokTip
-      total  = $total
-    }
+    $rows += $session
   }
 
   # Reap orphaned attention markers whose native session file is gone entirely (the
@@ -1111,15 +1212,15 @@ function Update-List {
   }
 
   # Sort: busy first, then alive, then most recently updated
-  $rows = @($rows | Sort-Object @{e={ -([int]$_.busy) }}, @{e={ -([int]$_.alive) }}, @{e={ -$_.upd }})
+  $rows = @($rows | Sort-Object @{e={ -([int]$_.IsBusy) }}, @{e={ -([int]$_.IsAlive) }}, @{e={ -$_.UpdatedAt }})
 
   # Overall Claude state drives the status GIF: waiting > running > idle.
   # A dead-process ('stale') session counts as not-active and is ignored here.
   $st = 'idle'
   foreach ($r in $rows) {
-    if (-not $r.alive) { continue }
-    if ($r.color -eq 'waiting') { $st = 'waiting'; break }
-    if ($r.color -eq 'busy')        { $st = 'running' }
+    if (-not $r.IsAlive) { continue }
+    if ($r.Color -eq 'waiting') { $st = 'waiting'; break }
+    if ($r.Color -eq 'busy')    { $st = 'running' }
   }
   $script:OverallState = $st
 
@@ -1130,7 +1231,7 @@ function Update-List {
   $seen = @{}
   for ($i = 0; $i -lt $rows.Count; $i++) {
     $r = $rows[$i]
-    $sid = $r.sessionId
+    $sid = $r.SessionId
     $e = $script:RowMap[$sid]
     if (-not $e) { $e = New-Row; $script:RowMap[$sid] = $e }
     Set-RowData $e $r
@@ -1153,12 +1254,13 @@ function Update-List {
     $script:RowMap.Remove($sid)
   }
 
-  $aliveCount = ($rows | Where-Object { $_.alive }).Count
-  $busyCount  = ($rows | Where-Object { $_.busy -and $_.alive }).Count
-  $grandTotal = 0L; foreach ($r in $rows) { $grandTotal += [long]$r.total }
+  $aliveCount = ($rows | Where-Object { $_.IsAlive }).Count
+  $busyCount  = ($rows | Where-Object { $_.IsBusy -and $_.IsAlive }).Count
+  $grandTotal = 0L; foreach ($r in $rows) { $grandTotal += [long]$r.TotalTokens }
+  $sep = [SessionState]::Sep
   $CountText.Text = "$aliveCount active" +
     $(if ($busyCount)  { " $sep $busyCount busy" } else { '' }) +
-    $(if ($grandTotal) { " $sep ~$(Format-Tokens $grandTotal) tok" } else { '' })
+    $(if ($grandTotal) { " $sep ~$([SessionState]::FormatTokens($grandTotal)) tok" } else { '' })
   Apply-ListSnapHeight
 }
 
