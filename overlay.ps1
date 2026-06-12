@@ -277,7 +277,6 @@ function Save-Links {
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
-            <ColumnDefinition Width="Auto"/>
           </Grid.ColumnDefinitions>
           <TextBlock Grid.Column="0" Text="&#x25CF; Claude Sessions" Foreground="#FFE6A23C"
                      FontFamily="Segoe UI Semibold" FontSize="12" VerticalAlignment="Center"
@@ -287,16 +286,13 @@ function Save-Links {
                   ToolTip="Window opacity" IsMoveToPointEnabled="True"/>
           <TextBlock Grid.Column="2" x:Name="CountText" Text="" Foreground="#80FFFFFF"
                      FontFamily="Segoe UI" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
-          <Button Grid.Column="3" x:Name="PinBtn" Content="&#x1F4CC;" Width="30" Height="30"
-                  Foreground="#FFE6A23C" Background="Transparent" BorderThickness="0"
-                  FontSize="13" Cursor="Hand" ToolTip="Pin on top / all desktops"/>
-          <Button Grid.Column="4" x:Name="GifBtn" Content="GIF" Width="34" Height="30"
+          <Button Grid.Column="3" x:Name="GifBtn" Content="GIF" Width="34" Height="30"
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
                   FontSize="11" Cursor="Hand" ToolTip="Configure status GIFs"/>
-          <Button Grid.Column="5" x:Name="FitBtn" Content="&#x2922;3" Width="34" Height="30"
+          <Button Grid.Column="4" x:Name="FitBtn" Content="&#x2922;3" Width="34" Height="30"
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
                   FontSize="11" Cursor="Hand" ToolTip="Auto-fit cap: max sessions the list auto-grows to fit"/>
-          <Button Grid.Column="6" x:Name="CloseBtn" Content="&#x2715;" Width="30" Height="30"
+          <Button Grid.Column="5" x:Name="CloseBtn" Content="&#x2715;" Width="30" Height="30"
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
                   FontSize="13" Cursor="Hand"/>
         </Grid>
@@ -346,11 +342,10 @@ $ResizeGripV = $Window.FindName('ResizeGripV')
 $OpacitySlider = $Window.FindName('OpacitySlider')
 $GifBtn     = $Window.FindName('GifBtn')
 $FitBtn     = $Window.FindName('FitBtn')
-$PinBtn     = $Window.FindName('PinBtn')
 
 # Persisted UI settings (width + opacity).
 $UISettingsFile = Join-Path $PSScriptRoot 'settings.json'
-$script:UI = @{ width = 340.0; opacity = 0.95; pinned = $true; visibleRows = 3; autoFitCap = 3 }
+$script:UI = @{ width = 340.0; opacity = 0.95; visibleRows = 3; autoFitCap = 3 }
 
 # Per-state GIF config. Each path is user-configured (a local file path, or a
 # file:// / http(s) URL); an empty path means "no GIF for that state". The floating
@@ -366,7 +361,6 @@ if (Test-Path $UISettingsFile) {
     $cfg = Get-Content $UISettingsFile -Raw | ConvertFrom-Json
     if ($cfg.width)   { $script:UI.width   = [double]$cfg.width }
     if ($cfg.opacity) { $script:UI.opacity = [double]$cfg.opacity }
-    if ($null -ne $cfg.pinned) { $script:UI.pinned = [bool]$cfg.pinned }
     if ($cfg.visibleRows) { $script:UI.visibleRows = [int]$cfg.visibleRows }
     if ($null -ne $cfg.autoFitCap) { $script:UI.autoFitCap = [int]$cfg.autoFitCap }
     # GIF settings are additive: missing keys fall back to the defaults above.
@@ -388,7 +382,6 @@ function Save-UISettings {
     [pscustomobject]@{
       width       = $Window.Width
       opacity     = $OpacitySlider.Value
-      pinned      = $script:UI.pinned
       visibleRows = $script:UI.visibleRows
       autoFitCap  = $script:UI.autoFitCap
       gifEnabled  = $script:Gif.enabled
@@ -402,7 +395,7 @@ function Save-UISettings {
 $Window.Width = [Math]::Max(240, [Math]::Min(1000, $script:UI.width))
 $OpacitySlider.Value = [Math]::Max(0.25, [Math]::Min(1.0, $script:UI.opacity))
 $Window.Opacity = $OpacitySlider.Value
-$Window.Topmost = $script:UI.pinned   # honor persisted pin state from first paint
+$Window.Topmost = $true   # always pinned on top from first paint
 $script:UI.visibleRows = [Math]::Max(1, [Math]::Min(12, [int]$script:UI.visibleRows))
 
 # Auto-fit: when a new session appears, grow the list to show all sessions -- but
@@ -1600,9 +1593,9 @@ $timer.Interval = [TimeSpan]::FromSeconds(2)
 $timer.Add_Tick({ Update-List; Update-Gif })
 $timer.Start()
 
-# Always-on-top + show-on-all-desktops, toggled by the header pin button. Primary: ask
-# Windows to pin the window (Windows-side, no polling). Fallback: if pinning isn't
-# available, a light timer keeps the overlay on the active desktop so it follows you.
+# Always-on-top + show-on-all-desktops. Primary: ask Windows to pin the window
+# (Windows-side, no polling). Fallback: if pinning isn't available, a light timer
+# keeps the overlay on the active desktop so it follows you across desktops.
 $script:overlayHwnd = [IntPtr]::Zero
 $script:pinned = $false
 
@@ -1612,36 +1605,22 @@ $followTimer.Add_Tick({
   if ($script:overlayHwnd -ne [IntPtr]::Zero) { [VD]::Follow($script:overlayHwnd) }
 })
 
-# Apply (and persist) the pin state. ON = always-on-top + pinned/followed across every
-# virtual desktop; OFF = a normal window that stays on its current desktop.
-function Set-Pinned([bool]$on) {
-  $script:UI.pinned = $on
-  $Window.Topmost = $on
+# Pin the overlay: always-on-top + pinned/followed across every virtual desktop.
+function Set-Pinned {
+  $Window.Topmost = $true
   $h = $script:overlayHwnd
-  if ($on) {
-    if ($h -ne [IntPtr]::Zero) { $script:pinned = [Pinner]::Pin($h) }
-    if ($script:pinned) { $followTimer.Stop() } else { $followTimer.Start() }
-    $PinBtn.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#FFE6A23C')  # accent = pinned
-    $PinBtn.ToolTip = 'Pinned: on top + all desktops (click to unpin)'
-  } else {
-    $followTimer.Stop()
-    if ($h -ne [IntPtr]::Zero) { [void][Pinner]::Unpin($h) }
-    $script:pinned = $false
-    $PinBtn.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#66FFFFFF')  # dim = unpinned
-    $PinBtn.ToolTip = 'Unpinned (click to pin on top + all desktops)'
-  }
-  Save-UISettings
+  if ($h -ne [IntPtr]::Zero) { $script:pinned = [Pinner]::Pin($h) }
+  if ($script:pinned) { $followTimer.Stop() } else { $followTimer.Start() }
 }
-$PinBtn.Add_Click({ Set-Pinned (-not $script:UI.pinned) })
 
 # One-shot, ~600ms after show (the shell has registered the window as a view by then):
-# apply the persisted pin state — pins, or leaves it unpinned.
+# pin the overlay.
 $pinTimer = New-Object System.Windows.Threading.DispatcherTimer
 $pinTimer.Interval = [TimeSpan]::FromMilliseconds(600)
 $pinTimer.Add_Tick({
   $pinTimer.Stop()
   $script:overlayHwnd = (New-Object System.Windows.Interop.WindowInteropHelper $Window).Handle
-  Set-Pinned $script:UI.pinned
+  Set-Pinned
 })
 $pinTimer.Start()
 
