@@ -6,3 +6,4 @@ _*.txt
 _vendor/
 .claude/
 .t1k-module-summary.txt
+.idea/

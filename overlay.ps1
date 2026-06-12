@@ -545,6 +545,23 @@ $script:Gif = @{
   paths   = @{ running = ''; waiting = ''; idle = '' }
   win     = @{ left = 60.0; top = 360.0; width = 200.0; height = 200.0 }
 }
+
+# Per-state sound config. Each path is a user-configured local file (.wav/.mp3/...) or
+# file:// / http(s) URL; an empty path means "no sound for that state". A sound fires
+# ONCE on each transition into its state (it's an event, not a looping display) — the
+# audio analogue of the status GIF. Empty default = feature off.
+$script:Snd = @{
+  enabled = $true
+  paths   = @{ running = ''; waiting = ''; idle = '' }
+}
+$script:SndLastState = $null          # last state a sound was reconciled against
+$script:SndPlayer    = $null          # reused MediaPlayer (created lazily on UI thread)
+# Remote sounds can't be streamed reliably through MediaPlayer (hotlink/UA/TLS), so they
+# are fetched to a temp file off the UI thread (same approach as the GIF downloader) and
+# played from disk. These mirror the $Gif* download plumbing.
+$script:SndFiles  = [hashtable]::Synchronized(@{})                     # url -> local temp path | 'FAILED'
+$script:SndQueue  = [System.Collections.Queue]::Synchronized([System.Collections.Queue]::new())
+$script:SndQueued = @{}                # urls already enqueued (UI-thread only)
 if (Test-Path $UISettingsFile) {
   try {
     $cfg = Get-Content $UISettingsFile -Raw | ConvertFrom-Json
@@ -564,6 +581,13 @@ if (Test-Path $UISettingsFile) {
         if ($null -ne $cfg.gifWindow.$k) { $script:Gif.win[$k] = [double]$cfg.gifWindow.$k }
       }
     }
+    # Sound settings are additive: missing keys fall back to the defaults above.
+    if ($null -ne $cfg.sndEnabled) { $script:Snd.enabled = [bool]$cfg.sndEnabled }
+    if ($cfg.sndPaths) {
+      foreach ($k in 'running','waiting','idle') {
+        if ($cfg.sndPaths.$k) { $script:Snd.paths[$k] = [string]$cfg.sndPaths.$k }
+      }
+    }
   } catch {}
 }
 function Save-UISettings {
@@ -576,6 +600,8 @@ function Save-UISettings {
       gifEnabled  = $script:Gif.enabled
       gifPaths   = [pscustomobject]$script:Gif.paths
       gifWindow  = [pscustomobject]$script:Gif.win
+      sndEnabled  = $script:Snd.enabled
+      sndPaths    = [pscustomobject]$script:Snd.paths
     } | ConvertTo-Json -Compress | Set-Content -Path $UISettingsFile -Encoding UTF8
   } catch {}
 }
@@ -1457,6 +1483,44 @@ $script:DlPs.Runspace = $script:DlRunspace
 })
 $script:DlHandle = $script:DlPs.BeginInvoke()
 
+# Background sound downloader: drains $SndQueue, fetching each remote sound to a temp file
+# off the UI thread (browser User-Agent defeats hotlink blocks), then records the local
+# path in $SndFiles for Resolve-SoundFile to play. Mirrors the GIF downloader above.
+$script:SndDlRunspace = [runspacefactory]::CreateRunspace()
+$script:SndDlRunspace.Open()
+$script:SndDlRunspace.SessionStateProxy.SetVariable('q', $script:SndQueue)
+$script:SndDlRunspace.SessionStateProxy.SetVariable('filesMap', $script:SndFiles)
+$script:SndDlPs = [powershell]::Create()
+$script:SndDlPs.Runspace = $script:SndDlRunspace
+[void]$script:SndDlPs.AddScript({
+  try {
+    [System.Net.ServicePointManager]::SecurityProtocol =
+      [System.Net.SecurityProtocolType]::Tls12 -bor
+      [System.Net.SecurityProtocolType]::Tls11 -bor
+      [System.Net.SecurityProtocolType]::Tls
+  } catch {}
+  $tmp = [System.IO.Path]::GetTempPath()
+  while ($true) {
+    $url = $null
+    try { if ($q.Count -gt 0) { $url = $q.Dequeue() } } catch {}
+    if (-not $url) { Start-Sleep -Milliseconds 120; continue }
+    if ($filesMap.ContainsKey($url)) { continue }
+    try {
+      $req = [System.Net.HttpWebRequest]::Create($url)
+      $req.Timeout = 20000; $req.ReadWriteTimeout = 20000; $req.UserAgent = 'Mozilla/5.0'
+      $resp = $req.GetResponse()
+      $ext = [System.IO.Path]::GetExtension(([Uri]$url).AbsolutePath); if (-not $ext) { $ext = '.mp3' }
+      $name = 'overlay-snd-' + ([Math]::Abs($url.GetHashCode())) + $ext
+      $dest = Join-Path $tmp $name
+      $fs = [System.IO.File]::Create($dest)
+      $resp.GetResponseStream().CopyTo($fs)
+      $fs.Close(); $resp.Close()
+      $filesMap[$url] = $dest
+    } catch { $filesMap[$url] = 'FAILED' }
+  }
+})
+$script:SndDlHandle = $script:SndDlPs.BeginInvoke()
+
 # Fast poll so a freshly-downloaded GIF appears promptly (Update-Gif dedups to a cheap
 # no-op when nothing has changed).
 $gifPollTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -1543,12 +1607,105 @@ function Update-Gif([bool]$force = $false) {
   if (-not $script:GifQueued.ContainsKey($want)) { $script:GifQueued[$want] = $true; $script:GifQueue.Enqueue($want) }
 }
 
+# ---------------------------------------------------------------------------
+# Status sound subsystem: plays a one-shot sound on each transition of the
+# overall Claude state (waiting > running > idle), mirroring the status GIF.
+# ---------------------------------------------------------------------------
+
+# The configured sound path for a state, or '' when none / feature disabled.
+# Unlike the GIF, sounds do NOT cross-fall back between states: a transition into a
+# state with no configured sound is silent (playing another state's sound on the wrong
+# transition would be misleading).
+function Get-SoundPathForState([string]$state) {
+  if (-not $script:Snd.enabled) { return '' }
+  return [string]$script:Snd.paths[$state]
+}
+
+# Resolve a configured sound path to a local file ready for MediaPlayer, or $null if not
+# (yet) available. Local paths / file:// URLs resolve immediately; http(s) URLs resolve to
+# a downloaded temp file once the background fetcher has it (enqueues the fetch otherwise).
+function Resolve-SoundFile([string]$path) {
+  if ([string]::IsNullOrWhiteSpace($path)) { return $null }
+  if ($path -match '^https?://') {
+    $f = $script:SndFiles[$path]
+    if ($f -is [string] -and $f -ne 'FAILED' -and (Test-Path -LiteralPath $f)) { return $f }
+    if ($f -ne 'FAILED' -and -not $script:SndQueued.ContainsKey($path)) {
+      $script:SndQueued[$path] = $true; $script:SndQueue.Enqueue($path)
+    }
+    return $null
+  }
+  $local = $path -replace '^file:///?', ''
+  try { $local = [System.IO.Path]::GetFullPath($local) } catch { return $null }
+  if (Test-Path -LiteralPath $local) { return $local }
+  return $null
+}
+
+# Kick off background downloads for every configured remote sound so a temp file is ready
+# before the first transition into that state. Local paths need no prewarm.
+function Prewarm-Sounds {
+  if (-not $script:Snd.enabled) { return }
+  foreach ($k in 'running','waiting','idle') { [void](Resolve-SoundFile ([string]$script:Snd.paths[$k])) }
+}
+
+# Play a local sound file through the reused MediaPlayer (restarts from the top each call).
+function Play-SoundFile([string]$file) {
+  if ([string]::IsNullOrWhiteSpace($file)) { return }
+  try {
+    if (-not $script:SndPlayer) { $script:SndPlayer = New-Object System.Windows.Media.MediaPlayer }
+    $script:SndPlayer.Open([Uri]$file)
+    $script:SndPlayer.Position = [TimeSpan]::Zero
+    $script:SndPlayer.Play()
+  } catch {}
+}
+
+# Resolve a sound path to a local file SYNCHRONOUSLY (used by the settings "Test" button,
+# where blocking briefly on a user click is fine). Remote URLs are fetched inline if not
+# already cached. Returns $null if the path is empty or the fetch fails.
+function Get-SoundFileSync([string]$path) {
+  if ([string]::IsNullOrWhiteSpace($path)) { return $null }
+  if ($path -match '^https?://') {
+    $f = $script:SndFiles[$path]
+    if ($f -is [string] -and $f -ne 'FAILED' -and (Test-Path -LiteralPath $f)) { return $f }
+    try {
+      try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+      $req = [System.Net.HttpWebRequest]::Create($path)
+      $req.Timeout = 15000; $req.ReadWriteTimeout = 15000; $req.UserAgent = 'Mozilla/5.0'
+      $resp = $req.GetResponse()
+      $ext = [System.IO.Path]::GetExtension(([Uri]$path).AbsolutePath); if (-not $ext) { $ext = '.mp3' }
+      $dest = Join-Path ([System.IO.Path]::GetTempPath()) ('overlay-snd-' + ([Math]::Abs($path.GetHashCode())) + $ext)
+      $fs = [System.IO.File]::Create($dest)
+      $resp.GetResponseStream().CopyTo($fs); $fs.Close(); $resp.Close()
+      $script:SndFiles[$path] = $dest
+      return $dest
+    } catch { return $null }
+  }
+  $local = $path -replace '^file:///?', ''
+  try { $local = [System.IO.Path]::GetFullPath($local) } catch { return $null }
+  if (Test-Path -LiteralPath $local) { return $local }
+  return $null
+}
+
+# Reconcile audio with the current overall state. Fires the new state's sound exactly
+# once per transition. The very first call only records the baseline (no startup sound).
+function Update-Sound {
+  $state = $script:OverallState
+  if ($state -eq $script:SndLastState) { return }   # no transition -> nothing to do
+
+  $prev = $script:SndLastState
+  $script:SndLastState = $state
+  if ($null -eq $prev) { return }                   # baseline only: don't sound on startup
+
+  $file = Resolve-SoundFile (Get-SoundPathForState $state)
+  if (-not $file) { return }                        # unset, or remote not downloaded yet
+  Play-SoundFile $file
+}
+
 # Lightweight settings dialog: per-state GIF paths + an enable toggle.
 function Show-GifSettings {
   [xml]$sx = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Status GIFs" Width="380" SizeToContent="Height"
+        Title="Status GIF &amp; Sound" Width="380" SizeToContent="Height"
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize"
         WindowStartupLocation="CenterScreen">
@@ -1562,7 +1719,17 @@ function Show-GifSettings {
       <TextBox x:Name="NeedBox" Margin="0,2,0,8"/>
       <TextBlock Text="Idle" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
       <TextBox x:Name="IdleBox" Margin="0,2,0,12"/>
+      <Border Height="1" Background="#22FFFFFF" Margin="0,0,0,12"/>
+      <TextBlock Text="Status sound paths (.wav / .mp3)" Foreground="#FFE6A23C" FontFamily="Segoe UI Semibold" FontSize="13" Margin="0,0,0,10"/>
+      <CheckBox x:Name="SndEnabledChk" Content="Play sound on state change" Foreground="#FFFFFFFF" Margin="0,0,0,10"/>
+      <TextBlock Text="Running (busy)" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
+      <TextBox x:Name="SndRunBox" Margin="0,2,0,8"/>
+      <TextBlock Text="Needs input" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
+      <TextBox x:Name="SndNeedBox" Margin="0,2,0,8"/>
+      <TextBlock Text="Idle" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
+      <TextBox x:Name="SndIdleBox" Margin="0,2,0,12"/>
       <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+        <Button x:Name="TestBtn" Content="Test ▶" Width="70" Margin="0,0,8,0"/>
         <Button x:Name="ResetBtn" Content="Reset" Width="70" Margin="0,0,8,0"/>
         <Button x:Name="CancelBtn" Content="Cancel" Width="70" Margin="0,0,8,0"/>
         <Button x:Name="SaveBtn" Content="Save" Width="70"/>
@@ -1575,22 +1742,40 @@ function Show-GifSettings {
   $w = [Windows.Markup.XamlReader]::Load($r)
   $en = $w.FindName('EnabledChk')
   $rb = $w.FindName('RunBox'); $nb = $w.FindName('NeedBox'); $ib = $w.FindName('IdleBox')
+  $sen = $w.FindName('SndEnabledChk')
+  $srb = $w.FindName('SndRunBox'); $snb = $w.FindName('SndNeedBox'); $sib = $w.FindName('SndIdleBox')
   $en.IsChecked = $script:Gif.enabled
   $rb.Text = $script:Gif.paths.running
   $nb.Text = $script:Gif.paths.waiting
   $ib.Text = $script:Gif.paths.idle
+  $sen.IsChecked = $script:Snd.enabled
+  $srb.Text = $script:Snd.paths.running
+  $snb.Text = $script:Snd.paths.waiting
+  $sib.Text = $script:Snd.paths.idle
   # NOTE: do NOT use .GetNewClosure() on these handlers. GetNewClosure wraps the block
   # in a new module where $script: resolves to that module (so $script:Gif is $null and
   # the handler throws). The dialog is modal, so these plain scriptblocks keep access to
   # the function's local controls AND the real $script:Gif scope.
-  $w.FindName('ResetBtn').Add_Click({ $rb.Text = ''; $nb.Text = ''; $ib.Text = '' })
+  $w.FindName('ResetBtn').Add_Click({ $rb.Text = ''; $nb.Text = ''; $ib.Text = ''; $srb.Text = ''; $snb.Text = ''; $sib.Text = '' })
+  # Test plays whichever sound box is filled (running first), resolving the path right now
+  # so a freshly-typed URL is fetched and heard without needing to Save or wait.
+  $w.FindName('TestBtn').Add_Click({
+    $p = $srb.Text.Trim(); if (-not $p) { $p = $snb.Text.Trim() }; if (-not $p) { $p = $sib.Text.Trim() }
+    $f = Get-SoundFileSync $p
+    if ($f) { Play-SoundFile $f }
+  })
   $w.FindName('CancelBtn').Add_Click({ $w.Close() })
   $w.FindName('SaveBtn').Add_Click({
     $script:Gif.enabled           = [bool]$en.IsChecked
     $script:Gif.paths.running     = $rb.Text.Trim()
     $script:Gif.paths.waiting = $nb.Text.Trim()
     $script:Gif.paths.idle        = $ib.Text.Trim()
+    $script:Snd.enabled       = [bool]$sen.IsChecked
+    $script:Snd.paths.running = $srb.Text.Trim()
+    $script:Snd.paths.waiting = $snb.Text.Trim()
+    $script:Snd.paths.idle    = $sib.Text.Trim()
     Save-UISettings
+    Prewarm-Sounds   # fetch any newly-entered remote sounds so the next transition plays
     # Paths may have changed -> drop stale decodes + downloaded bytes so new paths reload.
     $script:GifCache.Clear(); $script:GifBytes.Clear(); $script:GifQueued.Clear()
     $script:GifShownPath = ''
@@ -1690,9 +1875,11 @@ $gifDesktopTimer.Start()
 # Initial render + refresh timer
 Update-List
 Update-Gif   # lazy-loads the current state's GIF; cached + instant on later switches
+Update-Sound   # records the startup state as baseline (no sound until the first change)
+Prewarm-Sounds # pre-download remote sounds so the first transition isn't silent
 $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromSeconds(2)
-$timer.Add_Tick({ Update-List; Update-Gif })
+$timer.Add_Tick({ Update-List; Update-Gif; Update-Sound })
 $timer.Start()
 
 # Always-on-top + show-on-all-desktops. Primary: ask Windows to pin the window
@@ -1732,6 +1919,9 @@ $Window.Add_Closed({
   if ($script:GifTimer) { $script:GifTimer.Stop() }
   $script:GifActive = $null
   if ($script:GifCache) { $script:GifCache.Clear() }
+  try { if ($script:SndPlayer) { $script:SndPlayer.Stop(); $script:SndPlayer.Close() } } catch {}
+  try { if ($script:SndDlPs) { $script:SndDlPs.Stop(); $script:SndDlPs.Dispose() } } catch {}
+  try { if ($script:SndDlRunspace) { $script:SndDlRunspace.Close(); $script:SndDlRunspace.Dispose() } } catch {}
   # Stop the background downloader runspace so it doesn't outlive the window.
   try { if ($script:DlPs) { $script:DlPs.Stop(); $script:DlPs.Dispose() } } catch {}
   try { if ($script:DlRunspace) { $script:DlRunspace.Close(); $script:DlRunspace.Dispose() } } catch {}
