@@ -524,6 +524,9 @@ $script:Snd = @{
   enabled = $true
   volume  = 0.8                       # 0.0-1.0, applied to every sound played
   paths   = @{ running = ''; waiting = ''; idle = '' }
+  # Per-state enable: unchecking silences that one state without clearing its path.
+  # Default on, so a configured path keeps playing as before.
+  pathEnabled = @{ running = $true; waiting = $true; idle = $true }
   nag     = @{
     running = @{ enabled = $false; interval = 60; max = 0 }
     waiting = @{ enabled = $true;  interval = 60; max = 0 }
@@ -567,6 +570,11 @@ if (Test-Path $UISettingsFile) {
         if ($cfg.sndPaths.$k) { $script:Snd.paths[$k] = [string]$cfg.sndPaths.$k }
       }
     }
+    if ($cfg.sndPathEnabled) {
+      foreach ($k in 'running','waiting','idle') {
+        if ($null -ne $cfg.sndPathEnabled.$k) { $script:Snd.pathEnabled[$k] = [bool]$cfg.sndPathEnabled.$k }
+      }
+    }
     if ($cfg.sndNag) {
       foreach ($k in 'running','waiting','idle') {
         if ($cfg.sndNag.$k) {
@@ -591,6 +599,7 @@ function Save-UISettings {
       sndEnabled  = $script:Snd.enabled
       sndVolume   = $script:Snd.volume
       sndPaths    = [pscustomobject]$script:Snd.paths
+      sndPathEnabled = [pscustomobject]$script:Snd.pathEnabled
       sndNag      = [pscustomobject]@{
         running = [pscustomobject]$script:Snd.nag.running
         waiting = [pscustomobject]$script:Snd.nag.waiting
@@ -1550,6 +1559,7 @@ function Update-Gif([bool]$force = $false) {
 # transition would be misleading).
 function Get-SoundPathForState([string]$state) {
   if (-not $script:Snd.enabled) { return '' }
+  if (-not $script:Snd.pathEnabled[$state]) { return '' }
   return [string]$script:Snd.paths[$state]
 }
 
@@ -1744,7 +1754,10 @@ function Show-SoundSettings {
       <TextBlock Text="Status sound paths (.wav / .mp3)" Foreground="#FFE6A23C" FontFamily="Segoe UI Semibold" FontSize="13" Margin="0,0,0,10"/>
       <CheckBox x:Name="SndEnabledChk" Content="Play sound on state change" Foreground="#FFFFFFFF" Margin="0,0,0,10"/>
       <TextBlock Text="Running (busy)" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
-      <TextBox x:Name="SndRunBox" Margin="0,2,0,2"/>
+      <DockPanel Margin="0,2,0,2" LastChildFill="True">
+        <CheckBox x:Name="SndRunEnChk" DockPanel.Dock="Left" VerticalAlignment="Center" Margin="0,0,8,0" ToolTip="Enable this sound"/>
+        <TextBox x:Name="SndRunBox"/>
+      </DockPanel>
       <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
         <CheckBox x:Name="SndRunNagChk" Content="Re-nag" Foreground="#FFFFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
         <TextBlock Text="every" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,4,0"/>
@@ -1754,7 +1767,10 @@ function Show-SoundSettings {
         <TextBlock Text="times (0 = no limit)" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="4,0,0,0"/>
       </StackPanel>
       <TextBlock Text="Needs input" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
-      <TextBox x:Name="SndNeedBox" Margin="0,2,0,2"/>
+      <DockPanel Margin="0,2,0,2" LastChildFill="True">
+        <CheckBox x:Name="SndNeedEnChk" DockPanel.Dock="Left" VerticalAlignment="Center" Margin="0,0,8,0" ToolTip="Enable this sound"/>
+        <TextBox x:Name="SndNeedBox"/>
+      </DockPanel>
       <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
         <CheckBox x:Name="SndNeedNagChk" Content="Re-nag" Foreground="#FFFFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
         <TextBlock Text="every" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,4,0"/>
@@ -1764,7 +1780,10 @@ function Show-SoundSettings {
         <TextBlock Text="times (0 = no limit)" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="4,0,0,0"/>
       </StackPanel>
       <TextBlock Text="Idle" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
-      <TextBox x:Name="SndIdleBox" Margin="0,2,0,2"/>
+      <DockPanel Margin="0,2,0,2" LastChildFill="True">
+        <CheckBox x:Name="SndIdleEnChk" DockPanel.Dock="Left" VerticalAlignment="Center" Margin="0,0,8,0" ToolTip="Enable this sound"/>
+        <TextBox x:Name="SndIdleBox"/>
+      </DockPanel>
       <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
         <CheckBox x:Name="SndIdleNagChk" Content="Re-nag" Foreground="#FFFFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
         <TextBlock Text="every" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,4,0"/>
@@ -1793,6 +1812,7 @@ function Show-SoundSettings {
   $w = [Windows.Markup.XamlReader]::Load($r)
   $sen = $w.FindName('SndEnabledChk')
   $srb = $w.FindName('SndRunBox'); $snb = $w.FindName('SndNeedBox'); $sib = $w.FindName('SndIdleBox')
+  $sre = $w.FindName('SndRunEnChk'); $sne = $w.FindName('SndNeedEnChk'); $sie = $w.FindName('SndIdleEnChk')
   $svol = $w.FindName('SndVolSlider'); $svval = $w.FindName('SndVolVal')
   $rnc = $w.FindName('SndRunNagChk');  $rni = $w.FindName('SndRunNagInt');  $rnm = $w.FindName('SndRunNagMax')
   $nnc = $w.FindName('SndNeedNagChk'); $nni = $w.FindName('SndNeedNagInt'); $nnm = $w.FindName('SndNeedNagMax')
@@ -1801,6 +1821,9 @@ function Show-SoundSettings {
   $srb.Text = $script:Snd.paths.running
   $snb.Text = $script:Snd.paths.waiting
   $sib.Text = $script:Snd.paths.idle
+  $sre.IsChecked = $script:Snd.pathEnabled.running
+  $sne.IsChecked = $script:Snd.pathEnabled.waiting
+  $sie.IsChecked = $script:Snd.pathEnabled.idle
   $svol.Value = [Math]::Max(0.0, [Math]::Min(1.0, [double]$script:Snd.volume))
   $rnc.IsChecked = $script:Snd.nag.running.enabled; $rni.Text = [string]$script:Snd.nag.running.interval; $rnm.Text = [string]$script:Snd.nag.running.max
   $nnc.IsChecked = $script:Snd.nag.waiting.enabled; $nni.Text = [string]$script:Snd.nag.waiting.interval; $nnm.Text = [string]$script:Snd.nag.waiting.max
@@ -1811,6 +1834,7 @@ function Show-SoundSettings {
   # is modal, so these plain scriptblocks keep access to the local controls AND $script:Snd.
   $w.FindName('ResetBtn').Add_Click({
     $srb.Text = ''; $snb.Text = ''; $sib.Text = ''
+    $sre.IsChecked = $true; $sne.IsChecked = $true; $sie.IsChecked = $true
     $rnc.IsChecked = $false; $rni.Text = '60'; $rnm.Text = '0'
     $nnc.IsChecked = $true;  $nni.Text = '60'; $nnm.Text = '0'
     $inc.IsChecked = $false; $ini.Text = '60'; $inm.Text = '0'
@@ -1830,6 +1854,9 @@ function Show-SoundSettings {
     $script:Snd.paths.running = $srb.Text.Trim()
     $script:Snd.paths.waiting = $snb.Text.Trim()
     $script:Snd.paths.idle    = $sib.Text.Trim()
+    $script:Snd.pathEnabled.running = [bool]$sre.IsChecked
+    $script:Snd.pathEnabled.waiting = [bool]$sne.IsChecked
+    $script:Snd.pathEnabled.idle    = [bool]$sie.IsChecked
     # Parse nag fields defensively: interval >= 1s, max >= 0 (0 = unlimited); blank/garbage -> keep prior.
     $parseInt = { param($txt, $cur, $min) $v = 0; if ([int]::TryParse(($txt.Trim()), [ref]$v)) { [Math]::Max($min, $v) } else { $cur } }
     $script:Snd.nag.running.enabled  = [bool]$rnc.IsChecked
