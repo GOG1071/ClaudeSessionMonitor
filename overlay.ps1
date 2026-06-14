@@ -560,13 +560,22 @@ $script:Gif = @{
 # file:// / http(s) URL; an empty path means "no sound for that state". A sound fires
 # ONCE on each transition into its state (it's an event, not a looping display) — the
 # audio analogue of the status GIF. Empty default = feature off.
+# nag = per-state re-nag config: while the overall state stays on a given state, its sound
+# is re-played every `interval` seconds, up to `max` times per entry (max = 0 means forever).
+# Default: only `waiting` nags (preserving the prior waiting-only behavior); the others are
+# armed-able but off by default.
 $script:Snd = @{
   enabled = $true
   volume  = 0.8                       # 0.0-1.0, applied to every sound played
   paths   = @{ running = ''; waiting = ''; idle = '' }
+  nag     = @{
+    running = @{ enabled = $false; interval = 60; max = 0 }
+    waiting = @{ enabled = $true;  interval = 60; max = 0 }
+    idle    = @{ enabled = $false; interval = 60; max = 0 }
+  }
 }
-$script:SndNagSeconds = 60            # waiting-state sound re-nag interval
-$script:SndNagTimer  = $null          # repeats the waiting sound until you respond
+$script:SndNagTimer  = $null          # repeats the current state's sound until you respond
+$script:SndNagCount  = 0              # re-nags fired since the current state was entered
 $script:SndLastState = $null          # last state a sound was reconciled against
 $script:SndPlayer    = $null          # reused MediaPlayer (created lazily on UI thread)
 # Remote sounds can't be streamed reliably through MediaPlayer (hotlink/UA/TLS), so they
@@ -602,6 +611,15 @@ if (Test-Path $UISettingsFile) {
         if ($cfg.sndPaths.$k) { $script:Snd.paths[$k] = [string]$cfg.sndPaths.$k }
       }
     }
+    if ($cfg.sndNag) {
+      foreach ($k in 'running','waiting','idle') {
+        if ($cfg.sndNag.$k) {
+          if ($null -ne $cfg.sndNag.$k.enabled)  { $script:Snd.nag[$k].enabled  = [bool]$cfg.sndNag.$k.enabled }
+          if ($null -ne $cfg.sndNag.$k.interval) { $script:Snd.nag[$k].interval = [Math]::Max(1, [int]$cfg.sndNag.$k.interval) }
+          if ($null -ne $cfg.sndNag.$k.max)      { $script:Snd.nag[$k].max      = [Math]::Max(0, [int]$cfg.sndNag.$k.max) }
+        }
+      }
+    }
   } catch {}
 }
 function Save-UISettings {
@@ -617,7 +635,12 @@ function Save-UISettings {
       sndEnabled  = $script:Snd.enabled
       sndVolume   = $script:Snd.volume
       sndPaths    = [pscustomobject]$script:Snd.paths
-    } | ConvertTo-Json -Compress | Set-Content -Path $UISettingsFile -Encoding UTF8
+      sndNag      = [pscustomobject]@{
+        running = [pscustomobject]$script:Snd.nag.running
+        waiting = [pscustomobject]$script:Snd.nag.waiting
+        idle    = [pscustomobject]$script:Snd.nag.idle
+      }
+    } | ConvertTo-Json -Depth 5 -Compress | Set-Content -Path $UISettingsFile -Encoding UTF8
   } catch {}
 }
 
@@ -1708,13 +1731,19 @@ function Get-SoundFileSync([string]$path) {
 
 # Reconcile audio with the current overall state. Fires the new state's sound exactly
 # once per transition. The very first call only records the baseline (no startup sound).
-# Start (reset) or stop the waiting re-nag timer to match the current state. Called on
-# every transition so the 60s countdown restarts each time waiting is (re)entered and
-# halts the instant the state leaves waiting.
+# Start (reset) or stop the re-nag timer to match the current state. Called on every
+# transition so the per-state countdown restarts each time a state is (re)entered and halts
+# the instant the state changes. The interval comes from that state's nag config; nagging is
+# armed only when sound is on, the state's nag is enabled, it has a configured path, and the
+# interval is positive. The fired-count resets on every (re)entry so `max` is per-entry.
 function Sync-SndNag([string]$state) {
   if (-not $script:SndNagTimer) { return }
-  if ($state -eq 'waiting' -and $script:Snd.enabled) {
-    $script:SndNagTimer.Stop(); $script:SndNagTimer.Start()   # restart the countdown
+  $script:SndNagCount = 0
+  $n = $script:Snd.nag[$state]
+  if ($script:Snd.enabled -and $n -and $n.enabled -and $script:Snd.paths[$state] -and [int]$n.interval -gt 0) {
+    $script:SndNagTimer.Stop()
+    $script:SndNagTimer.Interval = [TimeSpan]::FromSeconds([int]$n.interval)
+    $script:SndNagTimer.Start()
   } else {
     $script:SndNagTimer.Stop()
   }
@@ -1767,11 +1796,35 @@ function Show-GifSettings {
       <TextBlock Text="Status sound paths (.wav / .mp3)" Foreground="#FFE6A23C" FontFamily="Segoe UI Semibold" FontSize="13" Margin="0,0,0,10"/>
       <CheckBox x:Name="SndEnabledChk" Content="Play sound on state change" Foreground="#FFFFFFFF" Margin="0,0,0,10"/>
       <TextBlock Text="Running (busy)" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
-      <TextBox x:Name="SndRunBox" Margin="0,2,0,8"/>
+      <TextBox x:Name="SndRunBox" Margin="0,2,0,2"/>
+      <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+        <CheckBox x:Name="SndRunNagChk" Content="Re-nag" Foreground="#FFFFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
+        <TextBlock Text="every" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,4,0"/>
+        <TextBox x:Name="SndRunNagInt" Width="46" VerticalAlignment="Center"/>
+        <TextBlock Text="s," Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="3,0,8,0"/>
+        <TextBox x:Name="SndRunNagMax" Width="38" VerticalAlignment="Center"/>
+        <TextBlock Text="times (0 = no limit)" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="4,0,0,0"/>
+      </StackPanel>
       <TextBlock Text="Needs input" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
-      <TextBox x:Name="SndNeedBox" Margin="0,2,0,8"/>
+      <TextBox x:Name="SndNeedBox" Margin="0,2,0,2"/>
+      <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+        <CheckBox x:Name="SndNeedNagChk" Content="Re-nag" Foreground="#FFFFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
+        <TextBlock Text="every" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,4,0"/>
+        <TextBox x:Name="SndNeedNagInt" Width="46" VerticalAlignment="Center"/>
+        <TextBlock Text="s," Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="3,0,8,0"/>
+        <TextBox x:Name="SndNeedNagMax" Width="38" VerticalAlignment="Center"/>
+        <TextBlock Text="times (0 = no limit)" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="4,0,0,0"/>
+      </StackPanel>
       <TextBlock Text="Idle" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
-      <TextBox x:Name="SndIdleBox" Margin="0,2,0,10"/>
+      <TextBox x:Name="SndIdleBox" Margin="0,2,0,2"/>
+      <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+        <CheckBox x:Name="SndIdleNagChk" Content="Re-nag" Foreground="#FFFFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
+        <TextBlock Text="every" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,4,0"/>
+        <TextBox x:Name="SndIdleNagInt" Width="46" VerticalAlignment="Center"/>
+        <TextBlock Text="s," Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="3,0,8,0"/>
+        <TextBox x:Name="SndIdleNagMax" Width="38" VerticalAlignment="Center"/>
+        <TextBlock Text="times (0 = no limit)" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="4,0,0,0"/>
+      </StackPanel>
       <TextBlock Text="Volume" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
       <StackPanel Orientation="Horizontal" Margin="0,2,0,12">
         <Slider x:Name="SndVolSlider" Minimum="0" Maximum="1" Width="270" VerticalAlignment="Center"
@@ -1795,6 +1848,9 @@ function Show-GifSettings {
   $sen = $w.FindName('SndEnabledChk')
   $srb = $w.FindName('SndRunBox'); $snb = $w.FindName('SndNeedBox'); $sib = $w.FindName('SndIdleBox')
   $svol = $w.FindName('SndVolSlider'); $svval = $w.FindName('SndVolVal')
+  $rnc = $w.FindName('SndRunNagChk');  $rni = $w.FindName('SndRunNagInt');  $rnm = $w.FindName('SndRunNagMax')
+  $nnc = $w.FindName('SndNeedNagChk'); $nni = $w.FindName('SndNeedNagInt'); $nnm = $w.FindName('SndNeedNagMax')
+  $inc = $w.FindName('SndIdleNagChk'); $ini = $w.FindName('SndIdleNagInt'); $inm = $w.FindName('SndIdleNagMax')
   $en.IsChecked = $script:Gif.enabled
   $rb.Text = $script:Gif.paths.running
   $nb.Text = $script:Gif.paths.waiting
@@ -1804,13 +1860,21 @@ function Show-GifSettings {
   $snb.Text = $script:Snd.paths.waiting
   $sib.Text = $script:Snd.paths.idle
   $svol.Value = [Math]::Max(0.0, [Math]::Min(1.0, [double]$script:Snd.volume))
+  $rnc.IsChecked = $script:Snd.nag.running.enabled; $rni.Text = [string]$script:Snd.nag.running.interval; $rnm.Text = [string]$script:Snd.nag.running.max
+  $nnc.IsChecked = $script:Snd.nag.waiting.enabled; $nni.Text = [string]$script:Snd.nag.waiting.interval; $nnm.Text = [string]$script:Snd.nag.waiting.max
+  $inc.IsChecked = $script:Snd.nag.idle.enabled;    $ini.Text = [string]$script:Snd.nag.idle.interval;    $inm.Text = [string]$script:Snd.nag.idle.max
   $svval.Text = [string][int]([Math]::Round($svol.Value * 100)) + '%'
   $svol.Add_ValueChanged({ $svval.Text = [string][int]([Math]::Round($svol.Value * 100)) + '%' })
   # NOTE: do NOT use .GetNewClosure() on these handlers. GetNewClosure wraps the block
   # in a new module where $script: resolves to that module (so $script:Gif is $null and
   # the handler throws). The dialog is modal, so these plain scriptblocks keep access to
   # the function's local controls AND the real $script:Gif scope.
-  $w.FindName('ResetBtn').Add_Click({ $rb.Text = ''; $nb.Text = ''; $ib.Text = ''; $srb.Text = ''; $snb.Text = ''; $sib.Text = '' })
+  $w.FindName('ResetBtn').Add_Click({
+    $rb.Text = ''; $nb.Text = ''; $ib.Text = ''; $srb.Text = ''; $snb.Text = ''; $sib.Text = ''
+    $rnc.IsChecked = $false; $rni.Text = '60'; $rnm.Text = '0'
+    $nnc.IsChecked = $true;  $nni.Text = '60'; $nnm.Text = '0'
+    $inc.IsChecked = $false; $ini.Text = '60'; $inm.Text = '0'
+  })
   # Test plays whichever sound box is filled (running first), resolving the path right now
   # so a freshly-typed URL is fetched and heard without needing to Save or wait.
   $w.FindName('TestBtn').Add_Click({
@@ -1830,6 +1894,17 @@ function Show-GifSettings {
     $script:Snd.paths.running = $srb.Text.Trim()
     $script:Snd.paths.waiting = $snb.Text.Trim()
     $script:Snd.paths.idle    = $sib.Text.Trim()
+    # Parse nag fields defensively: interval >= 1s, max >= 0 (0 = unlimited); blank/garbage -> keep prior.
+    $parseInt = { param($txt, $cur, $min) $v = 0; if ([int]::TryParse(($txt.Trim()), [ref]$v)) { [Math]::Max($min, $v) } else { $cur } }
+    $script:Snd.nag.running.enabled  = [bool]$rnc.IsChecked
+    $script:Snd.nag.running.interval = & $parseInt $rni.Text $script:Snd.nag.running.interval 1
+    $script:Snd.nag.running.max      = & $parseInt $rnm.Text $script:Snd.nag.running.max 0
+    $script:Snd.nag.waiting.enabled  = [bool]$nnc.IsChecked
+    $script:Snd.nag.waiting.interval = & $parseInt $nni.Text $script:Snd.nag.waiting.interval 1
+    $script:Snd.nag.waiting.max      = & $parseInt $nnm.Text $script:Snd.nag.waiting.max 0
+    $script:Snd.nag.idle.enabled     = [bool]$inc.IsChecked
+    $script:Snd.nag.idle.interval    = & $parseInt $ini.Text $script:Snd.nag.idle.interval 1
+    $script:Snd.nag.idle.max         = & $parseInt $inm.Text $script:Snd.nag.idle.max 0
     Save-UISettings
     Prewarm-Sounds      # fetch any newly-entered remote sounds so the next transition plays
     Sync-SndNag $script:OverallState   # (re)arm or disarm the waiting re-nag per new settings
@@ -1930,15 +2005,19 @@ $gifDesktopTimer.Add_Tick({
 $gifDesktopTimer.Start()
 
 # Initial render + refresh timer
-# Waiting re-nag: re-plays the waiting sound every $SndNagSeconds while a session still
-# needs input. Armed/disarmed by Sync-SndNag on each transition; the tick self-stops if
-# the state has since left waiting (belt-and-suspenders).
+# Per-state re-nag: re-plays the current state's sound on each tick while that state holds.
+# Interval + arming are set by Sync-SndNag from the state's nag config; the tick self-stops
+# if the state's nag is no longer active, or once `max` re-nags have fired this entry.
 $script:SndNagTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:SndNagTimer.Interval = [TimeSpan]::FromSeconds($script:SndNagSeconds)
+$script:SndNagTimer.Interval = [TimeSpan]::FromSeconds(60)
 $script:SndNagTimer.Add_Tick({
-  if ($script:OverallState -ne 'waiting' -or -not $script:Snd.enabled) { $script:SndNagTimer.Stop(); return }
-  $f = Resolve-SoundFile (Get-SoundPathForState 'waiting')
+  $state = $script:OverallState
+  $n = $script:Snd.nag[$state]
+  if (-not $script:Snd.enabled -or -not $n -or -not $n.enabled) { $script:SndNagTimer.Stop(); return }
+  $f = Resolve-SoundFile (Get-SoundPathForState $state)
   if ($f) { Play-SoundFile $f }
+  $script:SndNagCount++
+  if ([int]$n.max -gt 0 -and $script:SndNagCount -ge [int]$n.max) { $script:SndNagTimer.Stop() }
 })
 
 Update-List
