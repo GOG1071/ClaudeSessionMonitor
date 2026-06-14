@@ -205,14 +205,13 @@ public static class Pinner {
 # pscustomobject, so the row pipeline is: construct -> enrich -> render.
 #
 # PowerShell-class scope note: class methods cannot see script-scoped functions
-# or variables. So the two cache-backed enrichers (transcript activity + token
-# tallies) run in script scope and push their results in via the property setters
-# below; everything that is PURE (formatting, tinting, lifecycle classification)
-# lives here as instance/static members.
+# or variables. So the cache-backed enricher (transcript activity) runs in script
+# scope and pushes its result in via the property setter below; everything that is
+# PURE (formatting, tinting, lifecycle classification) lives here as
+# instance/static members.
 # ===========================================================================
 class SessionState {
   static [char] $Sep   = [char]0x00B7   # middle dot separator (char code => encoding-safe)
-  static [char] $Sigma = [char]0x03A3   # Σ — marks the cumulative-tokens figure
 
   # --- Raw session facts ---
   [int]    $Pid
@@ -232,14 +231,6 @@ class SessionState {
   [string] $Activity = ''
   [string] $Prompt   = ''
   [string] $Model    = ''
-
-  # --- Token tallies (filled by SetTokens) ---
-  [long]   $InputTokens
-  [long]   $CacheCreate
-  [long]   $CacheRead
-  [long]   $OutputTokens
-  [long]   $ContextTokens
-  [long]   $TotalTokens
 
   # --- Per-tick snapshot (relative-time string is recomputed each refresh) ---
   [string] $AgeText = ''
@@ -277,17 +268,6 @@ class SessionState {
     $this.Model    = "$($activity.model)"
   }
 
-  # Push the token tallies in (computed by Get-SessionTokens).
-  [void] SetTokens([object]$tk) {
-    if (-not $tk) { return }
-    $this.InputTokens   = [long]$tk.inTok
-    $this.CacheCreate   = [long]$tk.cacheCreate
-    $this.CacheRead     = [long]$tk.cacheRead
-    $this.OutputTokens  = [long]$tk.outTok
-    $this.ContextTokens = [long]$tk.ctx
-    $this.TotalTokens   = $this.InputTokens + $this.CacheCreate + $this.CacheRead + $this.OutputTokens
-  }
-
   # Refresh the relative-age snapshot against the current clock (called per tick).
   [void] StampAge([long]$now) {
     $this.AgeText = [SessionState]::FormatAge($now - $this.UpdatedAt)
@@ -322,27 +302,6 @@ class SessionState {
     return $tip
   }
 
-  [string] CtxText() {
-    if ($this.ContextTokens -gt 0) { return 'ctx ' + [SessionState]::FormatTokens($this.ContextTokens) }
-    return ''
-  }
-
-  [string] TokText() {
-    if ($this.TotalTokens -gt 0) { return "$([SessionState]::Sigma) " + [SessionState]::FormatTokens($this.TotalTokens) }
-    return ''
-  }
-
-  [string] TokTip() {
-    if ($this.TotalTokens -le 0) { return '' }
-    return "tokens this session" +
-      "`n  context now : $([SessionState]::FormatTokens($this.ContextTokens))" +
-      "`n  output      : $([SessionState]::FormatTokens($this.OutputTokens))" +
-      "`n  input       : $([SessionState]::FormatTokens($this.InputTokens))" +
-      "`n  cache write : $([SessionState]::FormatTokens($this.CacheCreate))" +
-      "`n  cache read  : $([SessionState]::FormatTokens($this.CacheRead))" +
-      "`n  total       : $([SessionState]::FormatTokens($this.TotalTokens))"
-  }
-
   # --- Pure static formatters (folded in from the old script-level Format-* fns) ---
 
   static [string] FormatAge([long]$ms) {
@@ -355,14 +314,6 @@ class SessionState {
     if ($h -lt 24) { return "${h}h" }
     $d = [int]($h / 24)
     return "${d}d"
-  }
-
-  # 945 -> "945", 12_300 -> "12.3K", 3_450_000 -> "3.45M".
-  static [string] FormatTokens([long]$n) {
-    if ($n -le 0)       { return '0' }
-    if ($n -lt 1000)    { return "$n" }
-    if ($n -lt 1000000) { return ('{0:0.0}K' -f ($n / 1000.0)) }
-    return ('{0:0.00}M' -f ($n / 1000000.0))
   }
 
   # "claude-opus-4-8" -> "opus 4.8"; "claude-haiku-4-5-20251001" -> "haiku 4.5".
@@ -861,49 +812,6 @@ function Get-SessionActivity($cwd, $sessionId, $updatedAt) {
   return $val
 }
 
-# Token consumption per session. Sums message.usage across the whole transcript
-# (input + cache-create + cache-read + output) and also tracks the latest turn's
-# prompt size as the current context-window fill. Reads incrementally: the cache
-# remembers the byte offset already parsed, so each 2s tick only scans newly
-# appended lines (transcripts are append-only JSONL) instead of re-summing the file.
-$script:TokenCache = @{}
-function Get-SessionTokens($cwd, $sessionId) {
-  if (-not $sessionId -or -not $cwd) { return $null }
-  $enc  = ($cwd -replace '[^A-Za-z0-9]', '-')
-  $path = Join-Path $env:USERPROFILE ".claude\projects\$enc\$sessionId.jsonl"
-  if (-not (Test-Path $path)) { return $null }
-  try { $len = (Get-Item $path).Length } catch { return $null }
-
-  $c = $script:TokenCache[$sessionId]
-  if (-not $c) {
-    $c = @{ size = 0L; inTok = 0L; cacheCreate = 0L; cacheRead = 0L; outTok = 0L; ctx = 0L }
-    $script:TokenCache[$sessionId] = $c
-  }
-  if ($len -eq $c.size) { return $c }                       # nothing appended since last tick
-  if ($len -lt $c.size) {                                   # file rotated/compacted -> reparse
-    $c.size = 0L; $c.inTok = 0L; $c.cacheCreate = 0L; $c.cacheRead = 0L; $c.outTok = 0L; $c.ctx = 0L
-  }
-
-  try {
-    $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-    $null = $fs.Seek($c.size, [System.IO.SeekOrigin]::Begin) # resume at the first un-parsed byte (a line boundary)
-    $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
-    while (($ln = $sr.ReadLine()) -ne $null) {
-      if ([string]::IsNullOrWhiteSpace($ln)) { continue }
-      try { $d = $ln | ConvertFrom-Json } catch { continue }
-      $u = $d.message.usage
-      if (-not $u) { continue }
-      $it = [long]($u.input_tokens); $ci = [long]($u.cache_creation_input_tokens)
-      $cr = [long]($u.cache_read_input_tokens); $ot = [long]($u.output_tokens)
-      $c.inTok += $it; $c.cacheCreate += $ci; $c.cacheRead += $cr; $c.outTok += $ot
-      $c.ctx = $it + $ci + $cr                              # latest turn wins = current window fill
-    }
-    $sr.Close(); $fs.Close()
-    $c.size = $len
-  } catch {}
-  return $c
-}
-
 # Score how well a Windows Terminal tab/window title identifies a session.
 # Returns 100 when the title contains the exact folder name at a word boundary,
 # else 0. The boundary guard is essential: "Foo_IdleRPG" must NOT match the window
@@ -1126,7 +1034,7 @@ function New-Row {
   $meta.TextTrimming = 'CharacterEllipsis'
   $stack.Children.Add($meta) | Out-Null
 
-  # Right column: age on top, cumulative token consumption below.
+  # Right column: relative age.
   $right = New-Object System.Windows.Controls.StackPanel
   $right.VerticalAlignment = 'Center'
   $right.Margin = '8,0,0,0'
@@ -1138,23 +1046,7 @@ function New-Row {
   $age.FontSize = 10
   $age.HorizontalAlignment = 'Right'
 
-  # Current context-window fill (live), brighter blue.
-  $ctx = New-Object System.Windows.Controls.TextBlock
-  $ctx.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#CC6CB6FF')
-  $ctx.FontFamily = 'Segoe UI'
-  $ctx.FontSize = 10
-  $ctx.HorizontalAlignment = 'Right'
-
-  # Cumulative token throughput for the whole session, dimmer blue.
-  $tok = New-Object System.Windows.Controls.TextBlock
-  $tok.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#80A6D4FF')
-  $tok.FontFamily = 'Segoe UI'
-  $tok.FontSize = 10
-  $tok.HorizontalAlignment = 'Right'
-
   $right.Children.Add($age) | Out-Null
-  $right.Children.Add($ctx) | Out-Null
-  $right.Children.Add($tok) | Out-Null
 
   $grid.Children.Add($stack) | Out-Null
   $grid.Children.Add($right) | Out-Null
@@ -1162,7 +1054,7 @@ function New-Row {
 
   return @{
     Border = $border; RunName = $runName; RunPid = $runPid
-    Prompt = $promptTb; Sub = $sub; Meta = $meta; Age = $age; Ctx = $ctx; Tok = $tok
+    Prompt = $promptTb; Sub = $sub; Meta = $meta; Age = $age
   }
 }
 
@@ -1206,12 +1098,7 @@ function Set-RowData($e, [SessionState]$s) {
     $e.Meta.Visibility = 'Collapsed'
   }
 
-  $ctxTxt = $s.CtxText(); $tokTxt = $s.TokText(); $tokTip = $s.TokTip()
   if ($e.Age.Text -ne $s.AgeText)       { $e.Age.Text = $s.AgeText }
-  if ($e.Ctx.Text -ne $ctxTxt)          { $e.Ctx.Text = $ctxTxt }
-  if ($e.Tok.Text -ne $tokTxt)          { $e.Tok.Text = $tokTxt }
-  if ($e.Ctx.ToolTip -ne $tokTip)       { $e.Ctx.ToolTip = $tokTip }
-  if ($e.Tok.ToolTip -ne $tokTip)       { $e.Tok.ToolTip = $tokTip }
 }
 
 # Reused row elements, keyed by sessionId, so a session's row is built once and then
@@ -1261,11 +1148,10 @@ function Update-List {
       }
     }
 
-    # 3. Enrich with cache-backed transcript + token data, then stamp relative age.
+    # 3. Enrich with cache-backed transcript data, then stamp relative age.
     #    (Model (from transcript) + CLI version (from session JSON); effort/reasoning
     #    level is not recorded anywhere, so it can't be shown.)
     if ($isAlive) { $session.Enrich((Get-SessionActivity $session.Cwd $session.SessionId $session.UpdatedAt)) }
-    $session.SetTokens((Get-SessionTokens $session.Cwd $session.SessionId))
     $session.StampAge($now)
 
     $rows += $session
@@ -1325,11 +1211,9 @@ function Update-List {
 
   $aliveCount = ($rows | Where-Object { $_.IsAlive }).Count
   $busyCount  = ($rows | Where-Object { $_.IsBusy -and $_.IsAlive }).Count
-  $grandTotal = 0L; foreach ($r in $rows) { $grandTotal += [long]$r.TotalTokens }
   $sep = [SessionState]::Sep
   $CountText.Text = "$aliveCount active" +
-    $(if ($busyCount)  { " $sep $busyCount busy" } else { '' }) +
-    $(if ($grandTotal) { " $sep ~$([SessionState]::FormatTokens($grandTotal)) tok" } else { '' })
+    $(if ($busyCount)  { " $sep $busyCount busy" } else { '' })
   Apply-ListSnapHeight
 }
 
