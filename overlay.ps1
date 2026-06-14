@@ -417,6 +417,7 @@ function Save-Links {
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="Auto"/>
           </Grid.ColumnDefinitions>
           <TextBlock Grid.Column="0" Text="&#x25CF; Claude Sessions" Foreground="#FFE6A23C"
                      FontFamily="Segoe UI Semibold" FontSize="12" VerticalAlignment="Center"
@@ -437,10 +438,13 @@ function Save-Links {
           <Button Grid.Column="3" x:Name="GifBtn" Content="GIF" Width="34" Height="30"
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
                   FontSize="11" Cursor="Hand" ToolTip="Configure status GIFs"/>
-          <Button Grid.Column="4" x:Name="FitBtn" Content="&#x2922;3" Width="34" Height="30"
+          <Button Grid.Column="4" x:Name="SndBtn" Content="&#x1F509;" Width="30" Height="30"
+                  Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
+                  FontSize="13" Cursor="Hand" ToolTip="Configure status sounds"/>
+          <Button Grid.Column="5" x:Name="FitBtn" Content="&#x2922;3" Width="34" Height="30"
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
                   FontSize="11" Cursor="Hand" ToolTip="Auto-fit cap: max sessions the list auto-grows to fit"/>
-          <Button Grid.Column="5" x:Name="CloseBtn" Content="&#x2715;" Width="30" Height="30"
+          <Button Grid.Column="6" x:Name="CloseBtn" Content="&#x2715;" Width="30" Height="30"
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
                   FontSize="13" Cursor="Hand"/>
         </Grid>
@@ -491,6 +495,7 @@ $OpacitySlider = $Window.FindName('OpacitySlider')
 $OpacityBtn = $Window.FindName('OpacityBtn')
 $OpacityPopup = $Window.FindName('OpacityPopup')
 $GifBtn     = $Window.FindName('GifBtn')
+$SndBtn     = $Window.FindName('SndBtn')
 $FitBtn     = $Window.FindName('FitBtn')
 
 # Persisted UI settings (width + opacity).
@@ -1662,7 +1667,7 @@ function Show-GifSettings {
   [xml]$sx = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Status GIF &amp; Sound" Width="380" SizeToContent="Height"
+        Title="Status GIF" Width="380" SizeToContent="Height"
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize"
         WindowStartupLocation="CenterScreen">
@@ -1676,7 +1681,66 @@ function Show-GifSettings {
       <TextBox x:Name="NeedBox" Margin="0,2,0,8"/>
       <TextBlock Text="Idle" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
       <TextBox x:Name="IdleBox" Margin="0,2,0,12"/>
-      <Border Height="1" Background="#22FFFFFF" Margin="0,0,0,12"/>
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+        <Button x:Name="ResetBtn" Content="Reset" Width="70" Margin="0,0,8,0"/>
+        <Button x:Name="CancelBtn" Content="Cancel" Width="70" Margin="0,0,8,0"/>
+        <Button x:Name="SaveBtn" Content="Save" Width="70"/>
+      </StackPanel>
+    </StackPanel>
+  </Border>
+</Window>
+"@
+  $r = New-Object System.Xml.XmlNodeReader $sx
+  $w = [Windows.Markup.XamlReader]::Load($r)
+  $en = $w.FindName('EnabledChk')
+  $rb = $w.FindName('RunBox'); $nb = $w.FindName('NeedBox'); $ib = $w.FindName('IdleBox')
+  $en.IsChecked = $script:Gif.enabled
+  $rb.Text = $script:Gif.paths.running
+  $nb.Text = $script:Gif.paths.waiting
+  $ib.Text = $script:Gif.paths.idle
+  # NOTE: do NOT use .GetNewClosure() on these handlers. GetNewClosure wraps the block
+  # in a new module where $script: resolves to that module (so $script:Gif is $null and
+  # the handler throws). The dialog is modal, so these plain scriptblocks keep access to
+  # the function's local controls AND the real $script:Gif scope.
+  $w.FindName('ResetBtn').Add_Click({ $rb.Text = ''; $nb.Text = ''; $ib.Text = '' })
+  $w.FindName('CancelBtn').Add_Click({ $w.Close() })
+  $w.FindName('SaveBtn').Add_Click({
+    $script:Gif.enabled       = [bool]$en.IsChecked
+    $script:Gif.paths.running = $rb.Text.Trim()
+    $script:Gif.paths.waiting = $nb.Text.Trim()
+    $script:Gif.paths.idle    = $ib.Text.Trim()
+    Save-UISettings
+    # Paths may have changed -> drop stale decodes + downloaded bytes so new paths reload.
+    $script:GifCache.Clear(); $script:GifBytes.Clear(); $script:GifQueued.Clear()
+    $script:GifShownPath = ''
+    Update-Gif $true
+    $w.Close()
+  })
+  # The overlay is a no-activate window, so a modal opened from it gets MOUSE clicks
+  # but not KEYBOARD focus (typed text would go to the terminal). Force this dialog to
+  # the foreground using the same AttachThreadInput trick the overlay uses elsewhere,
+  # then drop the caret into the first field so typing works immediately.
+  $w.Add_Loaded({
+    try {
+      $hh = (New-Object System.Windows.Interop.WindowInteropHelper $w).Handle
+      if ($hh -ne [IntPtr]::Zero) { [WinTools]::Focus($hh) }
+    } catch {}
+    $rb.Focus() | Out-Null
+    [System.Windows.Input.Keyboard]::Focus($rb) | Out-Null
+  })
+  [void]$w.ShowDialog()
+}
+
+function Show-SoundSettings {
+  [xml]$sx = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Status Sound" Width="380" SizeToContent="Height"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen">
+  <Border CornerRadius="10" Background="#F2161616" BorderBrush="#33FFFFFF" BorderThickness="1" Padding="14">
+    <StackPanel>
       <TextBlock Text="Status sound paths (.wav / .mp3)" Foreground="#FFE6A23C" FontFamily="Segoe UI Semibold" FontSize="13" Margin="0,0,0,10"/>
       <CheckBox x:Name="SndEnabledChk" Content="Play sound on state change" Foreground="#FFFFFFFF" Margin="0,0,0,10"/>
       <TextBlock Text="Running (busy)" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
@@ -1727,18 +1791,12 @@ function Show-GifSettings {
 "@
   $r = New-Object System.Xml.XmlNodeReader $sx
   $w = [Windows.Markup.XamlReader]::Load($r)
-  $en = $w.FindName('EnabledChk')
-  $rb = $w.FindName('RunBox'); $nb = $w.FindName('NeedBox'); $ib = $w.FindName('IdleBox')
   $sen = $w.FindName('SndEnabledChk')
   $srb = $w.FindName('SndRunBox'); $snb = $w.FindName('SndNeedBox'); $sib = $w.FindName('SndIdleBox')
   $svol = $w.FindName('SndVolSlider'); $svval = $w.FindName('SndVolVal')
   $rnc = $w.FindName('SndRunNagChk');  $rni = $w.FindName('SndRunNagInt');  $rnm = $w.FindName('SndRunNagMax')
   $nnc = $w.FindName('SndNeedNagChk'); $nni = $w.FindName('SndNeedNagInt'); $nnm = $w.FindName('SndNeedNagMax')
   $inc = $w.FindName('SndIdleNagChk'); $ini = $w.FindName('SndIdleNagInt'); $inm = $w.FindName('SndIdleNagMax')
-  $en.IsChecked = $script:Gif.enabled
-  $rb.Text = $script:Gif.paths.running
-  $nb.Text = $script:Gif.paths.waiting
-  $ib.Text = $script:Gif.paths.idle
   $sen.IsChecked = $script:Snd.enabled
   $srb.Text = $script:Snd.paths.running
   $snb.Text = $script:Snd.paths.waiting
@@ -1749,12 +1807,10 @@ function Show-GifSettings {
   $inc.IsChecked = $script:Snd.nag.idle.enabled;    $ini.Text = [string]$script:Snd.nag.idle.interval;    $inm.Text = [string]$script:Snd.nag.idle.max
   $svval.Text = [string][int]([Math]::Round($svol.Value * 100)) + '%'
   $svol.Add_ValueChanged({ $svval.Text = [string][int]([Math]::Round($svol.Value * 100)) + '%' })
-  # NOTE: do NOT use .GetNewClosure() on these handlers. GetNewClosure wraps the block
-  # in a new module where $script: resolves to that module (so $script:Gif is $null and
-  # the handler throws). The dialog is modal, so these plain scriptblocks keep access to
-  # the function's local controls AND the real $script:Gif scope.
+  # NOTE: do NOT use .GetNewClosure() on these handlers (see Show-GifSettings). The dialog
+  # is modal, so these plain scriptblocks keep access to the local controls AND $script:Snd.
   $w.FindName('ResetBtn').Add_Click({
-    $rb.Text = ''; $nb.Text = ''; $ib.Text = ''; $srb.Text = ''; $snb.Text = ''; $sib.Text = ''
+    $srb.Text = ''; $snb.Text = ''; $sib.Text = ''
     $rnc.IsChecked = $false; $rni.Text = '60'; $rnm.Text = '0'
     $nnc.IsChecked = $true;  $nni.Text = '60'; $nnm.Text = '0'
     $inc.IsChecked = $false; $ini.Text = '60'; $inm.Text = '0'
@@ -1769,10 +1825,6 @@ function Show-GifSettings {
   })
   $w.FindName('CancelBtn').Add_Click({ $w.Close() })
   $w.FindName('SaveBtn').Add_Click({
-    $script:Gif.enabled           = [bool]$en.IsChecked
-    $script:Gif.paths.running     = $rb.Text.Trim()
-    $script:Gif.paths.waiting = $nb.Text.Trim()
-    $script:Gif.paths.idle        = $ib.Text.Trim()
     $script:Snd.enabled       = [bool]$sen.IsChecked
     $script:Snd.volume        = [Math]::Max(0.0, [Math]::Min(1.0, [double]$svol.Value))
     $script:Snd.paths.running = $srb.Text.Trim()
@@ -1792,28 +1844,21 @@ function Show-GifSettings {
     Save-UISettings
     Prewarm-Sounds      # fetch any newly-entered remote sounds so the next transition plays
     Sync-SndNag $script:OverallState   # (re)arm or disarm the waiting re-nag per new settings
-    # Paths may have changed -> drop stale decodes + downloaded bytes so new paths reload.
-    $script:GifCache.Clear(); $script:GifBytes.Clear(); $script:GifQueued.Clear()
-    $script:GifShownPath = ''
-    Update-Gif $true
     $w.Close()
   })
-  # The overlay is a no-activate window, so a modal opened from it gets MOUSE clicks
-  # but not KEYBOARD focus (typed text would go to the terminal). Force this dialog to
-  # the foreground using the same AttachThreadInput trick the overlay uses elsewhere,
-  # then drop the caret into the first field so typing works immediately.
   $w.Add_Loaded({
     try {
       $hh = (New-Object System.Windows.Interop.WindowInteropHelper $w).Handle
       if ($hh -ne [IntPtr]::Zero) { [WinTools]::Focus($hh) }
     } catch {}
-    $rb.Focus() | Out-Null
-    [System.Windows.Input.Keyboard]::Focus($rb) | Out-Null
+    $srb.Focus() | Out-Null
+    [System.Windows.Input.Keyboard]::Focus($srb) | Out-Null
   })
   [void]$w.ShowDialog()
 }
 
 $GifBtn.Add_Click({ Show-GifSettings })
+$SndBtn.Add_Click({ Show-SoundSettings })
 
 # Reflect the current auto-fit cap on the header button (e.g. "⤢3").
 function Update-FitButton {
