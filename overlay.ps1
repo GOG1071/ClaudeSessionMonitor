@@ -231,6 +231,7 @@ class SessionState {
   [string] $Activity = ''
   [string] $Prompt   = ''
   [string] $Model    = ''
+  [long]   $ContextTokens = 0    # current context-window fill = last assistant turn's input+cache tokens
 
   # --- Per-tick snapshot (relative-time string is recomputed each refresh) ---
   [string] $AgeText = ''
@@ -263,9 +264,10 @@ class SessionState {
   # Push transcript-derived fields in (computed by Get-SessionActivity).
   [void] Enrich([object]$activity) {
     if (-not $activity) { return }
-    $this.Activity = "$($activity.activity)"
-    $this.Prompt   = "$($activity.prompt)"
-    $this.Model    = "$($activity.model)"
+    $this.Activity      = "$($activity.activity)"
+    $this.Prompt        = "$($activity.prompt)"
+    $this.Model         = "$($activity.model)"
+    $this.ContextTokens = [long]$activity.context
   }
 
   # Refresh the relative-age snapshot against the current clock (called per tick).
@@ -285,6 +287,12 @@ class SessionState {
   [string] Sub() {
     if ($this.Activity) { return $this.Activity }
     return "$($this.StatusText) $([SessionState]::Sep) pid $($this.Pid)"
+  }
+
+  # Current context-window fill (e.g. "ctx 139K"); empty until a turn is recorded.
+  [string] CtxText() {
+    if ($this.ContextTokens -le 0) { return '' }
+    return "ctx $([SessionState]::FormatCtx($this.ContextTokens))"
   }
 
   [string] MetaText() {
@@ -314,6 +322,14 @@ class SessionState {
     if ($h -lt 24) { return "${h}h" }
     $d = [int]($h / 24)
     return "${d}d"
+  }
+
+  # Token count -> compact label: 139234 -> "139K"; 1200000 -> "1.2M".
+  static [string] FormatCtx([long]$n) {
+    if ($n -le 0)        { return '0' }
+    if ($n -lt 1000)     { return "$n" }
+    if ($n -lt 1000000)  { return "$([int][math]::Round($n / 1000.0))K" }
+    return "$([math]::Round($n / 1000000.0, 1))M"
   }
 
   # "claude-opus-4-8" -> "opus 4.8"; "claude-haiku-4-5-20251001" -> "haiku 4.5".
@@ -783,17 +799,17 @@ function Get-AliveProcessIds {
 # Returns @{ activity = <what it's doing>; prompt = <last user prompt>; model = <model id> }.
 $script:ActivityCache = @{}
 function Get-SessionActivity($cwd, $sessionId, $updatedAt) {
-  $empty = @{ activity = ''; prompt = ''; model = '' }
+  $empty = @{ activity = ''; prompt = ''; model = ''; context = 0 }
   if (-not $sessionId -or -not $cwd) { return $empty }
   $cached = $script:ActivityCache[$sessionId]
   if ($cached -and $cached.upd -eq $updatedAt) { return $cached.val }
 
   $enc  = ($cwd -replace '[^A-Za-z0-9]', '-')
   $path = Join-Path $env:USERPROFILE ".claude\projects\$enc\$sessionId.jsonl"
-  $val  = @{ activity = ''; prompt = ''; model = '' }
+  $val  = @{ activity = ''; prompt = ''; model = ''; context = 0 }
   if (Test-Path $path) {
     try {
-      $lastUser = ''; $lastAsst = ''; $lastTool = ''; $lastModel = ''
+      $lastUser = ''; $lastAsst = ''; $lastTool = ''; $lastModel = ''; $lastCtx = [long]0
       foreach ($ln in (Get-Content -Path $path -Tail 80 -Encoding UTF8 -ErrorAction Stop)) {
         if ([string]::IsNullOrWhiteSpace($ln)) { continue }
         try { $d = $ln | ConvertFrom-Json } catch { continue }
@@ -808,6 +824,13 @@ function Get-SessionActivity($cwd, $sessionId, $updatedAt) {
         }
         elseif ($m.role -eq 'assistant' -and $c) {
           if ($m.model) { $lastModel = "$($m.model)" }    # model can change mid-session; last wins
+          # Current context fill = the latest turn's total input (fresh + cache-write + cache-read).
+          # Reading the LAST turn (not summing the transcript) is what makes this accurate.
+          $u = $m.usage
+          if ($u) {
+            $ctx = [long]$u.input_tokens + [long]$u.cache_creation_input_tokens + [long]$u.cache_read_input_tokens
+            if ($ctx -gt 0) { $lastCtx = $ctx }
+          }
           foreach ($b in $c) {
             if ($b.type -eq 'text' -and "$($b.text)".Trim()) { $lastAsst = $b.text }
             elseif ($b.type -eq 'tool_use') { $lastTool = $b.name }
@@ -819,7 +842,7 @@ function Get-SessionActivity($cwd, $sessionId, $updatedAt) {
       if ($act.Length -gt 200) { $act = $act.Substring(0, 200) }
       $prompt = ($lastUser -replace '\s+', ' ').Trim()
       if ($prompt.Length -gt 200) { $prompt = $prompt.Substring(0, 200) }
-      $val = @{ activity = $act; prompt = $prompt; model = $lastModel }
+      $val = @{ activity = $act; prompt = $prompt; model = $lastModel; context = $lastCtx }
     } catch {}
   }
   $script:ActivityCache[$sessionId] = @{ upd = $updatedAt; val = $val }
@@ -1048,11 +1071,18 @@ function New-Row {
   $meta.TextTrimming = 'CharacterEllipsis'
   $stack.Children.Add($meta) | Out-Null
 
-  # Right column: relative age.
+  # Right column: current context fill (top) over relative age (bottom).
   $right = New-Object System.Windows.Controls.StackPanel
   $right.VerticalAlignment = 'Center'
   $right.Margin = '8,0,0,0'
   [Windows.Controls.Grid]::SetColumn($right, 1)
+
+  # Current context-window fill (e.g. "ctx 139K"), dim blue. Collapsed until known.
+  $ctx = New-Object System.Windows.Controls.TextBlock
+  $ctx.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#997AC2FF')
+  $ctx.FontFamily = 'Segoe UI'
+  $ctx.FontSize = 10
+  $ctx.HorizontalAlignment = 'Right'
 
   $age = New-Object System.Windows.Controls.TextBlock
   $age.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#66FFFFFF')
@@ -1060,6 +1090,7 @@ function New-Row {
   $age.FontSize = 10
   $age.HorizontalAlignment = 'Right'
 
+  $right.Children.Add($ctx) | Out-Null
   $right.Children.Add($age) | Out-Null
 
   $grid.Children.Add($stack) | Out-Null
@@ -1068,7 +1099,7 @@ function New-Row {
 
   return @{
     Border = $border; RunName = $runName; RunPid = $runPid
-    Prompt = $promptTb; Sub = $sub; Meta = $meta; Age = $age
+    Prompt = $promptTb; Sub = $sub; Meta = $meta; Ctx = $ctx; Age = $age
   }
 }
 
@@ -1110,6 +1141,14 @@ function Set-RowData($e, [SessionState]$s) {
     if ($e.Meta.Visibility -ne 'Visible') { $e.Meta.Visibility = 'Visible' }
   } elseif ($e.Meta.Visibility -ne 'Collapsed') {
     $e.Meta.Visibility = 'Collapsed'
+  }
+
+  $ctxTxt = $s.CtxText()
+  if ($ctxTxt) {
+    if ($e.Ctx.Text -ne $ctxTxt)        { $e.Ctx.Text = $ctxTxt }
+    if ($e.Ctx.Visibility -ne 'Visible') { $e.Ctx.Visibility = 'Visible' }
+  } elseif ($e.Ctx.Visibility -ne 'Collapsed') {
+    $e.Ctx.Visibility = 'Collapsed'
   }
 
   if ($e.Age.Text -ne $s.AgeText)       { $e.Age.Text = $s.AgeText }
