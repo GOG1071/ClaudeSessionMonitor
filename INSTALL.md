@@ -64,7 +64,8 @@ fresh Windows machine.
        "UserPromptSubmit": [
          {
            "hooks": [
-             { "type": "command", "command": "node \"C:/Tools/ClaudeSessionMonitor/scripts/session-attention.cjs\" clear" }
+             { "type": "command", "command": "node \"C:/Tools/ClaudeSessionMonitor/scripts/session-attention.cjs\" clear" },
+             { "type": "command", "command": "node \"C:/Tools/ClaudeSessionMonitor/scripts/session-prompt.cjs\" set" }
            ]
          }
        ]
@@ -103,8 +104,8 @@ If you are an AI agent setting this up, do exactly this:
 1. Determine the repo's absolute path (the folder containing `overlay.ps1`). Call it `<REPO>`.
    Convert backslashes to forward slashes for the JSON commands.
 
-2. Confirm prerequisites: `node --version` succeeds; the paths `<REPO>/scripts/session-attention.cjs`
-   and `<REPO>/scripts/session-activity.cjs` exist.
+2. Confirm prerequisites: `node --version` succeeds; the paths `<REPO>/scripts/session-attention.cjs`,
+   `<REPO>/scripts/session-activity.cjs`, and `<REPO>/scripts/session-prompt.cjs` exist.
 
 3. Read `%USERPROFILE%\.claude\settings.json` (path: `$env:USERPROFILE\.claude\settings.json`).
    If it does not exist, create it as `{ "hooks": {} }`.
@@ -121,6 +122,7 @@ If you are an AI agent setting this up, do exactly this:
      `node "<REPO>/scripts/session-attention.cjs" waiting`
    - In `hooks.UserPromptSubmit[].hooks[]`:
      `node "<REPO>/scripts/session-attention.cjs" clear`
+     `node "<REPO>/scripts/session-prompt.cjs" set`
 
    Each goes inside an object of the form `{ "hooks": [ { "type": "command", "command": "..." } ] }`
    (the `PreToolUse` object also needs `"matcher": ".*"`), appended to the corresponding array
@@ -150,6 +152,11 @@ Claude Code's native `~/.claude/sessions/<pid>.json` only ever reports `busy` or
   `~/.claude/session-status/`; `Stop`/`SubagentStop` clear it. The overlay shows this line — in
   place of the coarser transcript-derived one — while the session is busy, and reaps stale markers
   the moment a session goes idle or ends.
+- **`session-prompt.cjs`** (last user prompt). The `UserPromptSubmit` hook writes the exact prompt
+  the user just submitted to `~/.claude/session-prompt/`. The overlay shows it verbatim on the row —
+  in place of the lossy transcript tail-parse, which can drop the prompt out of its window on long
+  turns. The marker persists for the session (overwritten on each new prompt) and is reaped once the
+  native session file is gone.
 
 No hooks → the overlay still works, but only shows running/idle with the transcript-derived activity.
 

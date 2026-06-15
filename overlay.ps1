@@ -2,6 +2,23 @@
 # A frameless, always-on-top WPF overlay that shows every running Claude Code
 # session globally by reading ~/.claude/sessions/<pid>.json files.
 
+# Single-instance guard (last-one-wins): if a previous overlay is running, kill
+# it so this new instance takes over. We track the live overlay via a PID file.
+$script:OverlayPidFile = Join-Path $env:TEMP 'ClaudeSessionsOverlay.pid'
+$script:OverlayHostName = (Get-Process -Id $PID).ProcessName   # powershell / pwsh
+if (Test-Path $script:OverlayPidFile) {
+  $oldPid = Get-Content $script:OverlayPidFile -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($oldPid -match '^\d+$' -and [int]$oldPid -ne $PID) {
+    $old = Get-Process -Id ([int]$oldPid) -ErrorAction SilentlyContinue
+    # Only kill if the PID is still the same kind of host process (guards against
+    # the OS recycling that PID for an unrelated process).
+    if ($old -and $old.ProcessName -eq $script:OverlayHostName) {
+      try { $old.Kill(); $old.WaitForExit(5000) } catch {}
+    }
+  }
+}
+Set-Content -Path $script:OverlayPidFile -Value $PID
+
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
@@ -277,6 +294,13 @@ class SessionState {
     if ($a) { $this.Activity = $a }
   }
 
+  # Override the prompt with the live hook signal (session-prompt.cjs), which captures
+  # the exact prompt at submit time. Wins over the transcript-derived Prompt because it
+  # is both verbatim and not subject to the tail-window loss. Empty input is a no-op.
+  [void] SetPrompt([string]$p) {
+    if ($p) { $this.Prompt = $p }
+  }
+
   # Refresh the relative-age snapshot against the current clock (called per tick).
   [void] StampAge([long]$now) {
     $this.AgeText = [SessionState]::FormatAge($now - $this.UpdatedAt)
@@ -369,6 +393,10 @@ $AttentionDir = Join-Path $env:USERPROFILE '.claude\session-attention'
 # precise "what right now" line ("Editing overlay.ps1", "Bash: git status") that the
 # transcript tail-parse can't surface — only ever shown while the session is busy.
 $StatusDir = Join-Path $env:USERPROFILE '.claude\session-status'
+# last user prompt written by scripts\session-prompt.cjs (UserPromptSubmit hook). Captures
+# the exact prompt at submit time, so the row shows it verbatim instead of the lossy
+# transcript tail-parse. Persists across the session (overwritten on each new prompt).
+$PromptDir = Join-Path $env:USERPROFILE '.claude\session-prompt'
 
 # Persisted "links": sessionId -> terminal window handle, for sessions whose window
 # title can't be auto-matched (right-click a row to link it to the current terminal).
@@ -376,7 +404,7 @@ $LinksFile = Join-Path $PSScriptRoot 'links.json'
 $script:Links = @{}
 if (Test-Path $LinksFile) {
   try {
-    (Get-Content $LinksFile -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object {
+    (Get-Content $LinksFile -Raw -Encoding UTF8 | ConvertFrom-Json).PSObject.Properties | ForEach-Object {
       $script:Links[$_.Name] = [int64]$_.Value
     }
   } catch {}
@@ -572,7 +600,7 @@ $script:SndQueue  = [System.Collections.Queue]::Synchronized([System.Collections
 $script:SndQueued = @{}                # urls already enqueued (UI-thread only)
 if (Test-Path $UISettingsFile) {
   try {
-    $cfg = Get-Content $UISettingsFile -Raw | ConvertFrom-Json
+    $cfg = Get-Content $UISettingsFile -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($cfg.width)   { $script:UI.width   = [double]$cfg.width }
     if ($cfg.opacity) { $script:UI.opacity = [double]$cfg.opacity }
     if ($cfg.visibleRows) { $script:UI.visibleRows = [int]$cfg.visibleRows }
@@ -868,7 +896,17 @@ function Get-SessionStatus($sessionId) {
   if (-not $sessionId) { return '' }
   $path = Join-Path $StatusDir "$sessionId.json"
   if (-not (Test-Path $path)) { return '' }
-  try { return "$((Get-Content $path -Raw | ConvertFrom-Json).activity)" } catch { return '' }
+  try { return "$((Get-Content $path -Raw -Encoding UTF8 | ConvertFrom-Json).activity)" } catch { return '' }
+}
+
+# Read the last-user-prompt marker (session-prompt.cjs UserPromptSubmit hook) for a session.
+# Returns the verbatim prompt or '' when absent. Uncached: the file is tiny and only changes
+# once per user turn, so a heartbeat-keyed cache would buy nothing.
+function Get-SessionPrompt($sessionId) {
+  if (-not $sessionId) { return '' }
+  $path = Join-Path $PromptDir "$sessionId.json"
+  if (-not (Test-Path $path)) { return '' }
+  try { return "$((Get-Content $path -Raw -Encoding UTF8 | ConvertFrom-Json).prompt)" } catch { return '' }
 }
 
 # Score how well a Windows Terminal tab/window title identifies a session.
@@ -1195,7 +1233,7 @@ function Update-List {
   $nativeSids = @{}   # sessionIds seen this tick, for reaping orphaned attention markers
 
   foreach ($file in Get-ChildItem -Path $SessionsDir -Filter '*.json' -ErrorAction SilentlyContinue) {
-    try { $json = Get-Content $file.FullName -Raw | ConvertFrom-Json } catch { continue }
+    try { $json = Get-Content $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
     if (-not $json.pid) { continue }
 
     # 1. Construct the model from the raw facts + liveness.
@@ -1232,6 +1270,9 @@ function Update-List {
       # session can't be mid-tool, so a lingering marker (missed `stop`) is ignored here
       # and reaped below — purely state-based, matching the attention-marker rule.
       if ($session.IsBusy) { $session.SetActivity((Get-SessionStatus $session.SessionId)) }
+      # Live hook prompt (UserPromptSubmit) wins over the transcript-derived guess whenever
+      # present — it's the verbatim submitted text. Persists for the whole session.
+      $session.SetPrompt((Get-SessionPrompt $session.SessionId))
     }
     $session.StampAge($now)
 
@@ -1251,6 +1292,13 @@ function Update-List {
   if (Test-Path $StatusDir) {
     foreach ($sf in Get-ChildItem -Path $StatusDir -Filter '*.json' -ErrorAction SilentlyContinue) {
       if (-not $nativeSids.ContainsKey($sf.BaseName)) { Remove-Item $sf.FullName -ErrorAction SilentlyContinue }
+    }
+  }
+  # Same reap for last-prompt markers whose native session file is gone. Keeps
+  # ~/.claude/session-prompt bounded across many ended sessions.
+  if (Test-Path $PromptDir) {
+    foreach ($pf in Get-ChildItem -Path $PromptDir -Filter '*.json' -ErrorAction SilentlyContinue) {
+      if (-not $nativeSids.ContainsKey($pf.BaseName)) { Remove-Item $pf.FullName -ErrorAction SilentlyContinue }
     }
   }
 
@@ -2113,3 +2161,12 @@ $Window.Add_Closed({
   } catch {}
 })
 [void]$Window.ShowDialog()
+
+# Clean up the PID file on normal exit — but only if it still points at us, so we
+# never delete a newer instance's record (the one that killed and replaced us).
+try {
+  if (Test-Path $script:OverlayPidFile) {
+    $cur = Get-Content $script:OverlayPidFile -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cur -eq "$PID") { Remove-Item $script:OverlayPidFile -ErrorAction SilentlyContinue }
+  }
+} catch {}
