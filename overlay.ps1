@@ -107,38 +107,32 @@ public static class WinTools {
 }
 "@
 
-# Click-through toggle. When enabled, the overlay lets every mouse click fall through
-# to whatever window is underneath -- EXCEPT over the toggle button itself, so you can
-# always click it again to restore normal behavior. Implemented with a WM_NCHITTEST
-# hook that returns HTTRANSPARENT for points outside the button's screen rect.
-Add-Type -ReferencedAssemblies WindowsBase,PresentationCore @"
+# Click-through toggle. True cross-application click-through requires the
+# WS_EX_TRANSPARENT extended style (HTTRANSPARENT only passes to same-thread windows,
+# not to other apps). But WS_EX_TRANSPARENT makes the WHOLE window click-through,
+# including the toggle button -- so a fast timer keeps it on everywhere EXCEPT while
+# the cursor is over the button, leaving that one spot clickable to restore.
+Add-Type @"
 using System;
-using System.Windows;
-using System.Windows.Interop;
+using System.Runtime.InteropServices;
 
 public static class ClickThrough {
   public static bool Enabled = false;
-  public static Rect HotRect = Rect.Empty;   // toggle-button bounds, screen pixels
-  const int WM_NCHITTEST = 0x0084;
-  const int HTTRANSPARENT = -1;
+  [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int i);
+  [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr h, int i, int v);
+  [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
+  const int GWL_EXSTYLE = -20;
+  const int WS_EX_TRANSPARENT = 0x20;
 
-  static IntPtr Hook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled) {
-    if (Enabled && msg == WM_NCHITTEST) {
-      int lp = lParam.ToInt32();
-      int x = (short)(lp & 0xFFFF);
-      int y = (short)((lp >> 16) & 0xFFFF);
-      if (HotRect.IsEmpty || !HotRect.Contains(x, y)) {
-        handled = true;
-        return new IntPtr(HTTRANSPARENT);   // pass the click to the window below
-      }
-    }
-    return IntPtr.Zero;
+  // Add or remove WS_EX_TRANSPARENT (preserving WS_EX_LAYERED / WS_EX_NOACTIVATE).
+  public static void SetPassThrough(IntPtr h, bool on) {
+    int ex = GetWindowLong(h, GWL_EXSTYLE);
+    int want = on ? (ex | WS_EX_TRANSPARENT) : (ex & ~WS_EX_TRANSPARENT);
+    if (want != ex) SetWindowLong(h, GWL_EXSTYLE, want);
   }
 
-  public static void Install(IntPtr hwnd) {
-    var src = HwndSource.FromHwnd(hwnd);
-    if (src != null) src.AddHook(new HwndSourceHook(Hook));
-  }
+  public static POINT GetCursor() { POINT p; GetCursorPos(out p); return p; }
 }
 "@
 
@@ -737,31 +731,36 @@ $Header.Add_MouseLeftButtonDown({
 })
 $CloseBtn.Add_Click({ $Window.Close() })
 
-# Click-through toggle. Recompute the button's screen rect (the one spot that stays
-# clickable) then flip the flag; the WM_NCHITTEST hook does the rest.
-function Update-ClickThroughHotRect {
-  if (-not $ClickThruBtn -or $ClickThruBtn.ActualWidth -le 0) { return }
+# Click-through toggle. While enabled, a fast timer keeps WS_EX_TRANSPARENT on (true
+# cross-app pass-through) EXCEPT while the cursor is over the toggle button, so that one
+# spot stays clickable to restore. Recomputing the button rect each tick keeps it correct
+# as the window moves or the list grows.
+$script:CtTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:CtTimer.Interval = [TimeSpan]::FromMilliseconds(25)
+$script:CtTimer.Add_Tick({
+  if (-not [ClickThrough]::Enabled -or -not $script:overlayHwnd) { return }
   try {
     $tl = $ClickThruBtn.PointToScreen([System.Windows.Point]::new(0,0))
     $br = $ClickThruBtn.PointToScreen([System.Windows.Point]::new($ClickThruBtn.ActualWidth, $ClickThruBtn.ActualHeight))
-    [ClickThrough]::HotRect = [System.Windows.Rect]::new($tl.X, $tl.Y, $br.X - $tl.X, $br.Y - $tl.Y)
+    $p  = [ClickThrough]::GetCursor()
+    $overBtn = ($p.X -ge $tl.X -and $p.X -lt $br.X -and $p.Y -ge $tl.Y -and $p.Y -lt $br.Y)
+    [ClickThrough]::SetPassThrough($script:overlayHwnd, (-not $overBtn))
   } catch {}
-}
+})
 $ClickThruBtn.Add_Click({
   if ([ClickThrough]::Enabled) {
     [ClickThrough]::Enabled = $false
+    $script:CtTimer.Stop()
+    if ($script:overlayHwnd) { [ClickThrough]::SetPassThrough($script:overlayHwnd, $false) }  # restore interaction
     $ClickThruBtn.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#99FFFFFF')
     $ClickThruBtn.ToolTip = 'Click-through: OFF (clicks hit the overlay)'
   } else {
-    Update-ClickThroughHotRect
     [ClickThrough]::Enabled = $true
+    $script:CtTimer.Start()
     $ClickThruBtn.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#FFE6A23C')
     $ClickThruBtn.ToolTip = 'Click-through: ON (clicks pass through; click here to restore)'
   }
 })
-# Window can grow/move under us; keep the clickable rect in sync while enabled.
-$Window.Add_LocationChanged({ if ([ClickThrough]::Enabled) { Update-ClickThroughHotRect } })
-$Window.Add_SizeChanged({ if ([ClickThrough]::Enabled) { Update-ClickThroughHotRect } })
 
 # Opacity slider -> window opacity.
 $OpacitySlider.Add_ValueChanged({ $Window.Opacity = $_.NewValue })
@@ -897,10 +896,7 @@ $ResizeGripV.Add_DragCompleted({
 # Capture the handle and make the overlay a no-activate window (never steals focus).
 $Window.Add_SourceInitialized({
   $script:overlayHwnd = (New-Object System.Windows.Interop.WindowInteropHelper $Window).Handle
-  if ($script:overlayHwnd -ne [IntPtr]::Zero) {
-    [WinTools]::SetNoActivate($script:overlayHwnd)
-    [ClickThrough]::Install($script:overlayHwnd)   # arm the click-through hook
-  }
+  if ($script:overlayHwnd -ne [IntPtr]::Zero) { [WinTools]::SetNoActivate($script:overlayHwnd) }
 })
 
 function Get-AliveProcessIds {
