@@ -402,10 +402,18 @@ $PromptDir = Join-Path $env:USERPROFILE '.claude\session-prompt'
 # title can't be auto-matched (right-click a row to link it to the current terminal).
 $LinksFile = Join-Path $PSScriptRoot 'links.json'
 $script:Links = @{}
+# In-memory "last seen present" stamp (unix ms) per linked sessionId. A link is reaped
+# once its session has been absent from the native session list for longer than
+# $StaleLinkMs, so links.json stays bounded instead of growing forever across sessions.
+# (The grace window also absorbs a transient native-file disappearance between ticks.)
+$script:LinkSeen = @{}
+$StaleLinkMs = 24 * 60 * 60 * 1000   # 1 day
 if (Test-Path $LinksFile) {
   try {
+    $loadNow = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     (Get-Content $LinksFile -Raw -Encoding UTF8 | ConvertFrom-Json).PSObject.Properties | ForEach-Object {
       $script:Links[$_.Name] = [int64]$_.Value
+      $script:LinkSeen[$_.Name] = $loadNow   # seed grace so disk links aren't reaped instantly
     }
   } catch {}
 }
@@ -1300,6 +1308,26 @@ function Update-List {
     foreach ($pf in Get-ChildItem -Path $PromptDir -Filter '*.json' -ErrorAction SilentlyContinue) {
       if (-not $nativeSids.ContainsKey($pf.BaseName)) { Remove-Item $pf.FullName -ErrorAction SilentlyContinue }
     }
+  }
+  # Time out stale terminal links. A link whose session is still listed gets its
+  # last-seen stamp refreshed; one whose session has been gone longer than
+  # $StaleLinkMs is dropped. Without this, links.json grows without bound because a
+  # link is otherwise only forgotten the next time someone clicks it (Focus-Session).
+  if ($script:Links.Count -gt 0) {
+    $linksDirty = $false
+    foreach ($sid in @($script:Links.Keys)) {
+      if ($nativeSids.ContainsKey($sid)) {
+        $script:LinkSeen[$sid] = $now
+      } else {
+        $seenAt = if ($script:LinkSeen.ContainsKey($sid)) { $script:LinkSeen[$sid] } else { $now }
+        if ($now - $seenAt -gt $StaleLinkMs) {
+          $script:Links.Remove($sid); $script:LinkSeen.Remove($sid); $linksDirty = $true
+        } else {
+          $script:LinkSeen[$sid] = $seenAt   # ensure unseen-on-disk links have a stamp
+        }
+      }
+    }
+    if ($linksDirty) { Save-Links }
   }
 
   # Sort: busy first, then alive, then most recently updated
