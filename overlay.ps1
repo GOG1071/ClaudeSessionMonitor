@@ -107,6 +107,41 @@ public static class WinTools {
 }
 "@
 
+# Click-through toggle. When enabled, the overlay lets every mouse click fall through
+# to whatever window is underneath -- EXCEPT over the toggle button itself, so you can
+# always click it again to restore normal behavior. Implemented with a WM_NCHITTEST
+# hook that returns HTTRANSPARENT for points outside the button's screen rect.
+Add-Type -ReferencedAssemblies WindowsBase,PresentationCore @"
+using System;
+using System.Windows;
+using System.Windows.Interop;
+
+public static class ClickThrough {
+  public static bool Enabled = false;
+  public static Rect HotRect = Rect.Empty;   // toggle-button bounds, screen pixels
+  const int WM_NCHITTEST = 0x0084;
+  const int HTTRANSPARENT = -1;
+
+  static IntPtr Hook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled) {
+    if (Enabled && msg == WM_NCHITTEST) {
+      int lp = lParam.ToInt32();
+      int x = (short)(lp & 0xFFFF);
+      int y = (short)((lp >> 16) & 0xFFFF);
+      if (HotRect.IsEmpty || !HotRect.Contains(x, y)) {
+        handled = true;
+        return new IntPtr(HTTRANSPARENT);   // pass the click to the window below
+      }
+    }
+    return IntPtr.Zero;
+  }
+
+  public static void Install(IntPtr hwnd) {
+    var src = HwndSource.FromHwnd(hwnd);
+    if (src != null) src.AddHook(new HwndSourceHook(Hook));
+  }
+}
+"@
+
 # Virtual-desktop "follow" support via the public, build-stable IVirtualDesktopManager.
 # We can't truly pin without undocumented per-build COM GUIDs, so instead we move the
 # overlay onto the current desktop whenever it gets left behind -> it follows you
@@ -481,6 +516,7 @@ function Save-Links {
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="Auto"/>
           </Grid.ColumnDefinitions>
           <TextBlock Grid.Column="0" Text="&#x25CF; Claude Sessions" Foreground="#FFE6A23C"
                      FontFamily="Segoe UI Semibold" FontSize="12" VerticalAlignment="Center"
@@ -507,7 +543,10 @@ function Save-Links {
           <Button Grid.Column="5" x:Name="FitBtn" Content="&#x2922;3" Width="34" Height="30"
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
                   FontSize="11" Cursor="Hand" ToolTip="Auto-fit cap: max sessions the list auto-grows to fit"/>
-          <Button Grid.Column="6" x:Name="CloseBtn" Content="&#x2715;" Width="30" Height="30"
+          <Button Grid.Column="6" x:Name="ClickThruBtn" Content="&#x25CE;" Width="30" Height="30"
+                  Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
+                  FontSize="14" Cursor="Hand" ToolTip="Click-through: OFF (clicks hit the overlay)"/>
+          <Button Grid.Column="7" x:Name="CloseBtn" Content="&#x2715;" Width="30" Height="30"
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
                   FontSize="13" Cursor="Hand"/>
         </Grid>
@@ -551,6 +590,7 @@ $Header     = $Window.FindName('Header')
 $List       = $Window.FindName('List')
 $ScrollHost = $Window.FindName('ScrollHost')
 $CloseBtn   = $Window.FindName('CloseBtn')
+$ClickThruBtn = $Window.FindName('ClickThruBtn')
 $CountText  = $Window.FindName('CountText')
 $ResizeGrip = $Window.FindName('ResizeGrip')
 $ResizeGripV = $Window.FindName('ResizeGripV')
@@ -697,6 +737,32 @@ $Header.Add_MouseLeftButtonDown({
 })
 $CloseBtn.Add_Click({ $Window.Close() })
 
+# Click-through toggle. Recompute the button's screen rect (the one spot that stays
+# clickable) then flip the flag; the WM_NCHITTEST hook does the rest.
+function Update-ClickThroughHotRect {
+  if (-not $ClickThruBtn -or $ClickThruBtn.ActualWidth -le 0) { return }
+  try {
+    $tl = $ClickThruBtn.PointToScreen([System.Windows.Point]::new(0,0))
+    $br = $ClickThruBtn.PointToScreen([System.Windows.Point]::new($ClickThruBtn.ActualWidth, $ClickThruBtn.ActualHeight))
+    [ClickThrough]::HotRect = [System.Windows.Rect]::new($tl.X, $tl.Y, $br.X - $tl.X, $br.Y - $tl.Y)
+  } catch {}
+}
+$ClickThruBtn.Add_Click({
+  if ([ClickThrough]::Enabled) {
+    [ClickThrough]::Enabled = $false
+    $ClickThruBtn.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#99FFFFFF')
+    $ClickThruBtn.ToolTip = 'Click-through: OFF (clicks hit the overlay)'
+  } else {
+    Update-ClickThroughHotRect
+    [ClickThrough]::Enabled = $true
+    $ClickThruBtn.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#FFE6A23C')
+    $ClickThruBtn.ToolTip = 'Click-through: ON (clicks pass through; click here to restore)'
+  }
+})
+# Window can grow/move under us; keep the clickable rect in sync while enabled.
+$Window.Add_LocationChanged({ if ([ClickThrough]::Enabled) { Update-ClickThroughHotRect } })
+$Window.Add_SizeChanged({ if ([ClickThrough]::Enabled) { Update-ClickThroughHotRect } })
+
 # Opacity slider -> window opacity.
 $OpacitySlider.Add_ValueChanged({ $Window.Opacity = $_.NewValue })
 $OpacitySlider.Add_PreviewMouseUp({ Save-UISettings })
@@ -831,7 +897,10 @@ $ResizeGripV.Add_DragCompleted({
 # Capture the handle and make the overlay a no-activate window (never steals focus).
 $Window.Add_SourceInitialized({
   $script:overlayHwnd = (New-Object System.Windows.Interop.WindowInteropHelper $Window).Handle
-  if ($script:overlayHwnd -ne [IntPtr]::Zero) { [WinTools]::SetNoActivate($script:overlayHwnd) }
+  if ($script:overlayHwnd -ne [IntPtr]::Zero) {
+    [WinTools]::SetNoActivate($script:overlayHwnd)
+    [ClickThrough]::Install($script:overlayHwnd)   # arm the click-through hook
+  }
 })
 
 function Get-AliveProcessIds {
