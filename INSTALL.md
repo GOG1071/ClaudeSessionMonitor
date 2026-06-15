@@ -1,14 +1,15 @@
 # Install
 
-Setup guide for **Claude Session Monitor** (the `overlay.ps1` overlay + the
-`waiting` attention hook). Works on a fresh Windows machine.
+Setup guide for **Claude Session Monitor** (the `overlay.ps1` overlay + two
+hooks: the `waiting` attention hook and the live-activity hook). Works on a
+fresh Windows machine.
 
 ---
 
 ## Prerequisites
 
 - **Windows 10/11** — Windows PowerShell 5.1 and .NET/WPF are built in.
-- **Node.js** in your `PATH` (`node --version` should print a version). Needed by the attention hook.
+- **Node.js** in your `PATH` (`node --version` should print a version). Needed by the hooks.
 - **Claude Code** installed — it writes `~/.claude/sessions/<pid>.json`, which the overlay reads.
 
 ---
@@ -17,19 +18,42 @@ Setup guide for **Claude Session Monitor** (the `overlay.ps1` overlay + the
 
 1. **Clone the repo** anywhere, e.g. `C:\Tools\ClaudeSessionMonitor`. Remember this folder path.
 
-2. **Add two hooks** so Claude reports when it needs your input. Open (or create) the file:
+2. **Add the hooks** so Claude reports when it needs your input *and* what each session is
+   doing. Open (or create) the file:
 
    ```
    %USERPROFILE%\.claude\settings.json
    ```
 
-   If the file is empty/new, start with `{ "hooks": {} }`. Then add a `Notification` and a
-   `UserPromptSubmit` entry — replacing `C:/Tools/ClaudeSessionMonitor` with **your** clone path
-   (use forward slashes):
+   If the file is empty/new, start with `{ "hooks": {} }`. Then add the entries below —
+   replacing `C:/Tools/ClaudeSessionMonitor` with **your** clone path (use forward slashes):
 
    ```json
    {
      "hooks": {
+       "PreToolUse": [
+         {
+           "matcher": ".*",
+           "hooks": [
+             { "type": "command", "command": "node \"C:/Tools/ClaudeSessionMonitor/scripts/session-activity.cjs\" start" },
+             { "type": "command", "command": "node \"C:/Tools/ClaudeSessionMonitor/scripts/session-attention.cjs\" clear" }
+           ]
+         }
+       ],
+       "Stop": [
+         {
+           "hooks": [
+             { "type": "command", "command": "node \"C:/Tools/ClaudeSessionMonitor/scripts/session-activity.cjs\" stop" }
+           ]
+         }
+       ],
+       "SubagentStop": [
+         {
+           "hooks": [
+             { "type": "command", "command": "node \"C:/Tools/ClaudeSessionMonitor/scripts/session-activity.cjs\" stop" }
+           ]
+         }
+       ],
        "Notification": [
          {
            "hooks": [
@@ -48,12 +72,15 @@ Setup guide for **Claude Session Monitor** (the `overlay.ps1` overlay + the
    }
    ```
 
-   > Already have a `settings.json` with other hooks? Don't replace it — just add these two
-   > objects into the existing `Notification` and `UserPromptSubmit` arrays (create the array if
-   > it isn't there). Leave every other hook untouched.
+   Both hooks are independent — you can install just the `session-attention.cjs` lines (needs-input
+   only) or just the `session-activity.cjs` lines (live activity only).
+
+   > Already have a `settings.json` with other hooks? Don't replace it — just merge these
+   > objects into the matching event arrays (create an array if it isn't there). The `PreToolUse`
+   > entry uses `"matcher": ".*"` so it fires for every tool. Leave every other hook untouched.
 
 3. **Restart any open Claude Code sessions.** Hooks load at session start, so currently-running
-   sessions won't report `waiting` until relaunched.
+   sessions won't report `waiting`/activity until relaunched.
 
 4. **Run the overlay** — double-click `Start Overlay.vbs`, or:
 
@@ -76,27 +103,34 @@ If you are an AI agent setting this up, do exactly this:
 1. Determine the repo's absolute path (the folder containing `overlay.ps1`). Call it `<REPO>`.
    Convert backslashes to forward slashes for the JSON commands.
 
-2. Confirm prerequisites: `node --version` succeeds; the path `<REPO>/scripts/session-attention.cjs`
-   exists.
+2. Confirm prerequisites: `node --version` succeeds; the paths `<REPO>/scripts/session-attention.cjs`
+   and `<REPO>/scripts/session-activity.cjs` exist.
 
 3. Read `%USERPROFILE%\.claude\settings.json` (path: `$env:USERPROFILE\.claude\settings.json`).
    If it does not exist, create it as `{ "hooks": {} }`.
 
-4. **Idempotently** ensure these two command strings are present — do not duplicate if a hook with
+4. **Idempotently** ensure these command strings are present — do not duplicate if a hook with
    the same command already exists, and do not remove or reorder any other hooks:
 
+   - In `hooks.PreToolUse[].hooks[]` (inside an entry with `"matcher": ".*"`):
+     `node "<REPO>/scripts/session-activity.cjs" start`
+     `node "<REPO>/scripts/session-attention.cjs" clear`
+   - In `hooks.Stop[].hooks[]` and `hooks.SubagentStop[].hooks[]`:
+     `node "<REPO>/scripts/session-activity.cjs" stop`
    - In `hooks.Notification[].hooks[]`:
      `node "<REPO>/scripts/session-attention.cjs" waiting`
    - In `hooks.UserPromptSubmit[].hooks[]`:
      `node "<REPO>/scripts/session-attention.cjs" clear`
 
-   Each goes inside an object of the form `{ "hooks": [ { "type": "command", "command": "..." } ] }`,
-   appended to the corresponding array (create the array if missing).
+   Each goes inside an object of the form `{ "hooks": [ { "type": "command", "command": "..." } ] }`
+   (the `PreToolUse` object also needs `"matcher": ".*"`), appended to the corresponding array
+   (create the array if missing).
 
 5. Validate the file still parses as JSON (e.g. `node -e "JSON.parse(require('fs').readFileSync(process.env.USERPROFILE+'/.claude/settings.json','utf8'))"`).
 
 6. Tell the user to **restart their Claude Code sessions** (hooks load at session start) and to run
    the overlay (`Start Overlay.vbs` or `powershell -ExecutionPolicy Bypass -File overlay.ps1`).
+   Activity-hook changes to `overlay.ps1` also require restarting the overlay.
 
 **Do not** add anything else, and **do not** touch unrelated hooks already in the file.
 
@@ -105,11 +139,19 @@ If you are an AI agent setting this up, do exactly this:
 ## How it works (one paragraph)
 
 Claude Code's native `~/.claude/sessions/<pid>.json` only ever reports `busy` or `idle` — never
-"waiting for you." The `Notification` hook runs `scripts/session-attention.cjs`, which drops a
-marker file in `~/.claude/session-attention/` when Claude needs input; the `UserPromptSubmit` hook
-clears it when you reply. The overlay shows **needs-input** for any live, non-busy session that has
-a marker, and reaps the marker automatically when the session goes busy or ends. No hooks → the
-overlay still works, but only shows running/idle.
+"waiting for you," and never *what* it's doing. Two hooks fill those gaps:
+
+- **`session-attention.cjs`** (needs-input). The `Notification` hook drops a marker in
+  `~/.claude/session-attention/` when Claude needs input; the `UserPromptSubmit` (and `PreToolUse`)
+  hook clears it when you reply / resume. The overlay shows **needs-input** for any live, non-busy
+  session that has a marker, reaping it automatically when the session goes busy or ends.
+- **`session-activity.cjs`** (live activity). The `PreToolUse` hook writes the precise current
+  action ("Editing overlay.ps1", "Bash: git status", "Read settings.json") to
+  `~/.claude/session-status/`; `Stop`/`SubagentStop` clear it. The overlay shows this line — in
+  place of the coarser transcript-derived one — while the session is busy, and reaps stale markers
+  the moment a session goes idle or ends.
+
+No hooks → the overlay still works, but only shows running/idle with the transcript-derived activity.
 
 ---
 

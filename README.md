@@ -4,8 +4,8 @@ A lightweight, always-on-top Windows overlay that shows every running Claude Cod
 session globally — across all terminals, projects, and virtual desktops.
 
 > **Setting up on a new machine?** See [INSTALL.md](INSTALL.md) — it covers the one
-> step that isn't in the repo: registering the `waiting` attention hook in
-> `~/.claude/settings.json`.
+> step that isn't in the repo: registering the `waiting` attention hook and the
+> live-activity hook in `~/.claude/settings.json`.
 
 ## Features
 
@@ -14,9 +14,12 @@ session globally — across all terminals, projects, and virtual desktops.
   background** (🟢 busy · 🟡 needs-input · ⚪ idle · 🔴 ended).
 - **What each session is doing** — under the session name, the **recent prompt** line
   (italic amber) shows the most recent user prompt, and the activity line summarises what
-  the session is currently doing, read from its transcript
-  (`~/.claude/projects/<cwd>/<sessionId>.jsonl`). Hover a row for the full text plus pid,
-  version, status, and cwd.
+  the session is currently doing. With the **live-activity hook** installed (see
+  [INSTALL.md](INSTALL.md)), a busy session shows the precise current action — `Editing
+  overlay.ps1`, `Bash: git status`, `Read settings.json`, `Agent: <task>` — pushed the instant
+  each tool runs (`~/.claude/session-status/`). Without the hook it falls back to a coarser
+  summary read from the transcript (`~/.claude/projects/<cwd>/<sessionId>.jsonl`). Hover a row
+  for the full text plus pid, version, status, and cwd.
 - **Click to focus** — left-click a row to bring that session's terminal window to the
   foreground. Works reliably across the foreground-lock and minimised windows.
 - **Right-click to link** — for sessions whose terminal can't be auto-identified
@@ -48,6 +51,8 @@ Startup folder (`shell:startup`).
 |------|---------|
 | `overlay.ps1` | The overlay (WPF in Windows PowerShell 5.1). |
 | `Start Overlay.vbs` | Launches `overlay.ps1` hidden. |
+| `scripts/session-attention.cjs` | Hook: marks a session **needs-input** (Notification) and clears it (UserPromptSubmit / PreToolUse). |
+| `scripts/session-activity.cjs` | Hook: writes a session's **live activity** line (PreToolUse) and clears it (Stop / SubagentStop). |
 | `settings.json` | Saved width, opacity + status-GIF config (local, git-ignored). |
 | `links.json` | Saved session→window links (local, git-ignored). |
 

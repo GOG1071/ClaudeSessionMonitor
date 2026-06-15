@@ -270,6 +270,13 @@ class SessionState {
     $this.ContextTokens = [long]$activity.context
   }
 
+  # Override the activity line with the live hook signal (session-activity.cjs),
+  # which carries the precise current tool + target. Wins over the transcript-derived
+  # Activity because it is both fresher and more specific. Empty input is a no-op.
+  [void] SetActivity([string]$a) {
+    if ($a) { $this.Activity = $a }
+  }
+
   # Refresh the relative-age snapshot against the current clock (called per tick).
   [void] StampAge([long]$now) {
     $this.AgeText = [SessionState]::FormatAge($now - $this.UpdatedAt)
@@ -358,6 +365,10 @@ $SessionsDir = Join-Path $env:USERPROFILE '.claude\sessions'
 # The native session JSON only ever carries busy/idle, so this sidecar is the sole
 # source for the "Claude is waiting for the user" state.
 $AttentionDir = Join-Path $env:USERPROFILE '.claude\session-attention'
+# live activity written by scripts\session-activity.cjs (PreToolUse hook). Carries the
+# precise "what right now" line ("Editing overlay.ps1", "Bash: git status") that the
+# transcript tail-parse can't surface — only ever shown while the session is busy.
+$StatusDir = Join-Path $env:USERPROFILE '.claude\session-status'
 
 # Persisted "links": sessionId -> terminal window handle, for sessions whose window
 # title can't be auto-matched (right-click a row to link it to the current terminal).
@@ -849,6 +860,17 @@ function Get-SessionActivity($cwd, $sessionId, $updatedAt) {
   return $val
 }
 
+# Read the live activity marker (session-activity.cjs PreToolUse hook) for a session.
+# Returns the precise current-work line ("Editing overlay.ps1") or '' when absent.
+# Uncached: the file is tiny and changes every tool call, so a cache keyed on the
+# native heartbeat would just go stale within a single busy turn.
+function Get-SessionStatus($sessionId) {
+  if (-not $sessionId) { return '' }
+  $path = Join-Path $StatusDir "$sessionId.json"
+  if (-not (Test-Path $path)) { return '' }
+  try { return "$((Get-Content $path -Raw | ConvertFrom-Json).activity)" } catch { return '' }
+}
+
 # Score how well a Windows Terminal tab/window title identifies a session.
 # Returns 100 when the title contains the exact folder name at a word boundary,
 # else 0. The boundary guard is essential: "Foo_IdleRPG" must NOT match the window
@@ -1204,7 +1226,13 @@ function Update-List {
     # 3. Enrich with cache-backed transcript data, then stamp relative age.
     #    (Model (from transcript) + CLI version (from session JSON); effort/reasoning
     #    level is not recorded anywhere, so it can't be shown.)
-    if ($isAlive) { $session.Enrich((Get-SessionActivity $session.Cwd $session.SessionId $session.UpdatedAt)) }
+    if ($isAlive) {
+      $session.Enrich((Get-SessionActivity $session.Cwd $session.SessionId $session.UpdatedAt))
+      # Live hook activity wins over transcript activity, but only while busy. A non-busy
+      # session can't be mid-tool, so a lingering marker (missed `stop`) is ignored here
+      # and reaped below — purely state-based, matching the attention-marker rule.
+      if ($session.IsBusy) { $session.SetActivity((Get-SessionStatus $session.SessionId)) }
+    }
     $session.StampAge($now)
 
     $rows += $session
@@ -1216,6 +1244,13 @@ function Update-List {
   if (Test-Path $AttentionDir) {
     foreach ($mf in Get-ChildItem -Path $AttentionDir -Filter '*.json' -ErrorAction SilentlyContinue) {
       if (-not $nativeSids.ContainsKey($mf.BaseName)) { Remove-Item $mf.FullName -ErrorAction SilentlyContinue }
+    }
+  }
+  # Same reap for live-activity markers whose native session file is gone (a missed
+  # `stop`, or the session ended mid-tool). Keeps ~/.claude/session-status bounded.
+  if (Test-Path $StatusDir) {
+    foreach ($sf in Get-ChildItem -Path $StatusDir -Filter '*.json' -ErrorAction SilentlyContinue) {
+      if (-not $nativeSids.ContainsKey($sf.BaseName)) { Remove-Item $sf.FullName -ErrorAction SilentlyContinue }
     }
   }
 
