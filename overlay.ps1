@@ -1241,7 +1241,7 @@ function Update-Placeholder($box) {
 # Up/Down recall, shell/Claude style. dir=-1 older, +1 newer. Returns $true if it consumed
 # the key (so the caller suppresses the default caret move). In a multi-line draft the
 # arrows move the caret normally and only recall at the very top / very bottom.
-function Recall-History($box, $dir) {
+function Recall-History($box, [int]$dir) {
   $tag = $box.Tag
   $rb = $tag.RowBorder
   if (-not ($rb.Tag -and $rb.Tag.Pid)) { return $false }
@@ -1527,13 +1527,16 @@ function New-Row {
   $promptBox.Add_TextChanged({ Update-Placeholder $this })
 
   # PreviewKeyDown (tunneling) so we intercept Enter/Esc/arrows before the TextBox does.
+  # NB: capture the event args first — `switch` reassigns $_ to the switch item inside the
+  # case blocks, so $_.Handled there would target the Key enum (and throw), not the event.
   $promptBox.Add_PreviewKeyDown({
+    $ev = $_
     $box = $this
     $shift = ([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Shift) -ne 0
-    switch ($_.Key) {
+    switch ($ev.Key) {
       'Return' {
         if ($shift) { return }              # Shift+Enter → newline (let the box handle it)
-        $_.Handled = $true
+        $ev.Handled = $true
         $rb = $box.Tag.RowBorder
         $t = $rb.Tag
         $text = $box.Text
@@ -1546,9 +1549,9 @@ function New-Row {
           Hide-PromptInput $box
         }
       }
-      'Escape' { $_.Handled = $true; Hide-PromptInput $box }
-      'Up'     { if (Recall-History $box -1) { $_.Handled = $true } }
-      'Down'   { if (Recall-History $box  1) { $_.Handled = $true } }
+      'Escape' { $ev.Handled = $true; Hide-PromptInput $box }
+      'Up'     { if (Recall-History $box -1) { $ev.Handled = $true } }
+      'Down'   { if (Recall-History $box  1) { $ev.Handled = $true } }
     }
   })
   # Clicking elsewhere (or focus otherwise leaving) cancels the box and restores no-activate.
