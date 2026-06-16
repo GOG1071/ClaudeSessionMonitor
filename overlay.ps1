@@ -611,10 +611,11 @@ $script:Gif = @{
 
 # Per-state sound config. Each path is a user-configured local file (.wav/.mp3/...) or
 # file:// / http(s) URL; an empty path means "no sound for that state". A sound fires
-# ONCE on each transition into its state (it's an event, not a looping display) — the
-# audio analogue of the status GIF. Empty default = feature off.
-# nag = per-state re-nag config: while the overall state stays on a given state, its sound
-# is re-played every `interval` seconds, up to `max` times per entry (max = 0 means forever).
+# ONCE on each transition into its state, PER SESSION (it's an event, not a looping
+# display) — the audio analogue of the status GIF, but evaluated per individual session
+# rather than on the aggregated overall state. Empty default = feature off.
+# nag = per-state re-nag config: while a session stays in a given state, its sound is
+# re-played every `interval` seconds, up to `max` times per entry (max = 0 means forever).
 # Default: only `waiting` nags (preserving the prior waiting-only behavior); the others are
 # armed-able but off by default.
 $script:Snd = @{
@@ -630,10 +631,17 @@ $script:Snd = @{
     idle    = @{ enabled = $false; interval = 60; max = 0 }
   }
 }
-$script:SndNagTimer  = $null          # repeats the current state's sound until you respond
-$script:SndNagCount  = 0              # re-nags fired since the current state was entered
-$script:SndLastState = $null          # last state a sound was reconciled against
 $script:SndPlayer    = $null          # reused MediaPlayer (created lazily on UI thread)
+# Per-session sound state: a sound fires on each INDIVIDUAL session's transition
+# (running/waiting/idle), not on the aggregated overall state — so a second session going
+# `waiting` chimes even while another already is. Two parallel maps keyed by sessionId:
+# the current snapshot (rebuilt each tick by Update-List) and the last state each session's
+# sound was reconciled against (advanced by Update-Sound). Ended sessions drop out.
+$script:SndCurStates     = @{}        # sessionId -> 'running'|'waiting'|'idle' (alive only)
+$script:SndSessionStates = @{}        # sessionId -> last sound-state fired/seen
+# Per-session re-nag bookkeeping: while a session holds a nag-enabled state, its sound is
+# replayed every `interval`s up to `max` times. sessionId -> @{ lastNag = <ms>; count }.
+$script:SndNag = @{}
 # Remote sounds can't be streamed reliably through MediaPlayer (hotlink/UA/TLS), so they
 # are fetched to a temp file off the UI thread (same approach as the GIF downloader) and
 # played from disk. These mirror the $Gif* download plumbing.
@@ -1297,6 +1305,7 @@ function Update-List {
     $script:RowMap.Clear()
     $CountText.Text = '0'
     $script:OverallState = 'idle'
+    $script:SndCurStates = @{}
     Apply-ListSnapHeight
     return
   }
@@ -1400,13 +1409,20 @@ function Update-List {
 
   # Overall Claude state drives the status GIF: waiting > running > idle.
   # A dead-process ('stale') session counts as not-active and is ignored here.
+  # In the same pass, build the per-session sound-state snapshot (sound is per-session,
+  # not overall): map each alive session's row Color to its sound-state key.
   $st = 'idle'
+  $snd = @{}
   foreach ($r in $rows) {
     if (-not $r.IsAlive) { continue }
-    if ($r.Color -eq 'waiting') { $st = 'waiting'; break }
-    if ($r.Color -eq 'busy')    { $st = 'running' }
+    switch ($r.Color) {
+      'waiting' { $snd[$r.SessionId] = 'waiting'; $st = 'waiting' }
+      'busy'    { $snd[$r.SessionId] = 'running'; if ($st -ne 'waiting') { $st = 'running' } }
+      'idle'    { $snd[$r.SessionId] = 'idle' }
+    }
   }
   $script:OverallState = $st
+  $script:SndCurStates = $snd
 
   # Reconcile the live list against $rows without clearing it. Reuse each session's
   # existing Border (updating its content in place), create one only for new sessions,
@@ -1764,8 +1780,10 @@ function Update-Gif([bool]$force = $false) {
 }
 
 # ---------------------------------------------------------------------------
-# Status sound subsystem: plays a one-shot sound on each transition of the
-# overall Claude state (waiting > running > idle), mirroring the status GIF.
+# Status sound subsystem: plays a one-shot sound on each PER-SESSION transition between
+# states (running/waiting/idle). Unlike the status GIF (which tracks the aggregated overall
+# state), sound is evaluated for each individual session, so one session needing input
+# chimes even while another already does.
 # ---------------------------------------------------------------------------
 
 # The configured sound path for a state, or '' when none / feature disabled.
@@ -1843,48 +1861,58 @@ function Get-SoundFileSync([string]$path) {
   return $null
 }
 
-# Reconcile audio with the current overall state. Fires the new state's sound exactly
-# once per transition. The very first call only records the baseline (no startup sound).
-# Start (reset) or stop the re-nag timer to match the current state. Called on every
-# transition so the per-state countdown restarts each time a state is (re)entered and halts
-# the instant the state changes. The interval comes from that state's nag config; nagging is
-# armed only when sound is on, the state's nag is enabled, it has a configured path, and the
-# interval is positive. The fired-count resets on every (re)entry so `max` is per-entry.
-function Sync-SndNag([string]$state) {
-  if (-not $script:SndNagTimer) { return }
-  $script:SndNagCount = 0
-  $n = $script:Snd.nag[$state]
-  if ($script:Snd.enabled -and $n -and $n.enabled -and $script:Snd.paths[$state] -and [int]$n.interval -gt 0) {
-    $script:SndNagTimer.Stop()
-    $script:SndNagTimer.Interval = [TimeSpan]::FromSeconds([int]$n.interval)
-    $script:SndNagTimer.Start()
-  } else {
-    $script:SndNagTimer.Stop()
+# Reconcile audio with the CURRENT per-session states (rebuilt each tick by Update-List).
+# For each alive session, fire its new state's sound exactly once on a transition; a
+# session's first observation is a silent baseline (so launching the overlay, or a new
+# session appearing, doesn't replay a chorus). While a session holds a nag-enabled state,
+# its sound is re-played every `interval`s, up to `max` times per entry (max = 0 = forever);
+# the count resets whenever the session changes state. Driven by the 2s refresh tick, so the
+# nag config is honoured live with no separate timer. Ended sessions drop out of the maps.
+function Update-Sound {
+  $cur = $script:SndCurStates
+  $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+
+  foreach ($sid in @($cur.Keys)) {
+    $state = $cur[$sid]
+    $was   = $script:SndSessionStates[$sid]
+
+    if ($was -ne $state) {
+      # Transition (or first observation): advance the baseline, reset this session's nag.
+      $script:SndSessionStates[$sid] = $state
+      $script:SndNag[$sid] = @{ lastNag = $now; count = 0 }
+      if ($null -ne $was) {                            # first observation stays a silent baseline
+        $file = Resolve-SoundFile (Get-SoundPathForState $state)
+        if ($file) { Play-SoundFile $file }            # unset / disabled / not-yet-downloaded -> silent
+      }
+      continue
+    }
+
+    # Same state held: re-nag if this state's nag is armed and not yet exhausted.
+    $n = $script:Snd.nag[$state]
+    if (-not $n -or -not $n.enabled -or [int]$n.interval -le 0) { continue }
+    $info = $script:SndNag[$sid]
+    if (-not $info) { $info = @{ lastNag = $now; count = 0 }; $script:SndNag[$sid] = $info }
+    if ([int]$n.max -gt 0 -and $info.count -ge [int]$n.max) { continue }
+    if ($now - $info.lastNag -lt [int]$n.interval * 1000) { continue }
+    $file = Resolve-SoundFile (Get-SoundPathForState $state)   # gates enabled + pathEnabled + path
+    if ($file) { Play-SoundFile $file; $info.lastNag = $now; $info.count++ }
+  }
+
+  # Drop bookkeeping for sessions that ended (no longer in the current snapshot).
+  foreach ($sid in @($script:SndSessionStates.Keys)) {
+    if (-not $cur.ContainsKey($sid)) { $script:SndSessionStates.Remove($sid); $script:SndNag.Remove($sid) }
   }
 }
 
-function Update-Sound {
-  $state = $script:OverallState
-  if ($state -eq $script:SndLastState) { return }   # no transition -> nothing to do
-
-  $prev = $script:SndLastState
-  $script:SndLastState = $state
-  Sync-SndNag $state
-  if ($null -eq $prev) { return }                   # baseline only: startup is handled separately
-
-  $file = Resolve-SoundFile (Get-SoundPathForState $state)
-  if (-not $file) { return }                        # unset, or remote not downloaded yet
-  Play-SoundFile $file
-}
-
-# Play the current state's sound at launch (synchronously resolving a remote file so it's
-# audible immediately), record it as the baseline, and arm the waiting re-nag if needed.
+# Establish silent baselines for every session present at launch so the overlay starts
+# quiet — only genuine post-launch transitions chime. Each session's nag clock starts now,
+# so a session already waiting at launch still nags once its interval elapses.
 function Start-StartupSound {
-  $state = $script:OverallState
-  $script:SndLastState = $state
-  $file = Get-SoundFileSync (Get-SoundPathForState $state)
-  if ($file) { Play-SoundFile $file }
-  Sync-SndNag $state
+  $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  foreach ($sid in @($script:SndCurStates.Keys)) {
+    $script:SndSessionStates[$sid] = $script:SndCurStates[$sid]
+    $script:SndNag[$sid] = @{ lastNag = $now; count = 0 }
+  }
 }
 
 # Lightweight settings dialog: per-state GIF paths + an enable toggle.
@@ -2085,7 +2113,8 @@ function Show-SoundSettings {
     $script:Snd.nag.idle.max         = & $parseInt $inm.Text $script:Snd.nag.idle.max 0
     Save-UISettings
     Prewarm-Sounds      # fetch any newly-entered remote sounds so the next transition plays
-    Sync-SndNag $script:OverallState   # (re)arm or disarm the waiting re-nag per new settings
+    # Per-session re-nag re-reads $script:Snd.nag live every tick, so changed nag settings
+    # take effect on the next refresh with no timer to (re)arm here.
     $w.Close()
   })
   $w.Add_Loaded({
@@ -2175,26 +2204,12 @@ $gifDesktopTimer.Add_Tick({
 })
 $gifDesktopTimer.Start()
 
-# Initial render + refresh timer
-# Per-state re-nag: re-plays the current state's sound on each tick while that state holds.
-# Interval + arming are set by Sync-SndNag from the state's nag config; the tick self-stops
-# if the state's nag is no longer active, or once `max` re-nags have fired this entry.
-$script:SndNagTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:SndNagTimer.Interval = [TimeSpan]::FromSeconds(60)
-$script:SndNagTimer.Add_Tick({
-  $state = $script:OverallState
-  $n = $script:Snd.nag[$state]
-  if (-not $script:Snd.enabled -or -not $n -or -not $n.enabled) { $script:SndNagTimer.Stop(); return }
-  $f = Resolve-SoundFile (Get-SoundPathForState $state)
-  if ($f) { Play-SoundFile $f }
-  $script:SndNagCount++
-  if ([int]$n.max -gt 0 -and $script:SndNagCount -ge [int]$n.max) { $script:SndNagTimer.Stop() }
-})
-
+# Initial render + refresh timer. The per-session re-nag is folded into Update-Sound (driven
+# by the 2s tick below), so there is no separate nag timer to arm here.
 Update-List
 Update-Gif         # lazy-loads the current state's GIF; cached + instant on later switches
 Prewarm-Sounds     # pre-download remote sounds so transitions aren't silent
-Start-StartupSound # play the current state's sound on launch + arm the waiting re-nag
+Start-StartupSound # record silent per-session baselines so launch is quiet
 $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromSeconds(2)
 $timer.Add_Tick({ Update-List; Update-Gif; Update-Sound })
@@ -2237,7 +2252,6 @@ $Window.Add_Closed({
   if ($script:GifTimer) { $script:GifTimer.Stop() }
   $script:GifActive = $null
   if ($script:GifCache) { $script:GifCache.Clear() }
-  try { if ($script:SndNagTimer) { $script:SndNagTimer.Stop() } } catch {}
   try { if ($script:SndPlayer) { $script:SndPlayer.Stop(); $script:SndPlayer.Close() } } catch {}
   try { if ($script:SndDlPs) { $script:SndDlPs.Stop(); $script:SndDlPs.Dispose() } } catch {}
   try { if ($script:SndDlRunspace) { $script:SndDlRunspace.Close(); $script:SndDlRunspace.Dispose() } } catch {}
