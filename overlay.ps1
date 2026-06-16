@@ -55,6 +55,18 @@ public static class WinTools {
   [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int i);
   [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr h, int i, int v);
   [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+  [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+
+  static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+  const uint SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002, SWP_NOACTIVATE = 0x0010, SWP_NOOWNERZORDER = 0x0200;
+
+  // Force the window back to the top of the z-order without activating it. WPF's
+  // Topmost=true is silently dropped when another app (e.g. a terminal) claims the top
+  // slot; re-asserting HWND_TOPMOST on a timer keeps the overlay reliably on top.
+  public static void ReassertTopmost(IntPtr h) {
+    if (h == IntPtr.Zero) return;
+    SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+  }
 
   // Make the overlay a no-activate window so clicking it never steals foreground.
   public static void SetNoActivate(IntPtr h) {
@@ -2230,12 +2242,23 @@ $followTimer.Add_Tick({
   if ($script:overlayHwnd -ne [IntPtr]::Zero) { [VD]::Follow($script:overlayHwnd) }
 })
 
+# Re-assert HWND_TOPMOST on a steady timer. Shell-pinning keeps the overlay across
+# virtual desktops but does NOT defend z-order, and WPF's Topmost is silently dropped
+# when a terminal (or any app) grabs the top slot — so without this the overlay falls
+# behind until relaunch. NOACTIVATE means this never steals focus.
+$topmostTimer = New-Object System.Windows.Threading.DispatcherTimer
+$topmostTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+$topmostTimer.Add_Tick({
+  if ($script:overlayHwnd -ne [IntPtr]::Zero) { [WinTools]::ReassertTopmost($script:overlayHwnd) }
+})
+
 # Pin the overlay: always-on-top + pinned/followed across every virtual desktop.
 function Set-Pinned {
   $Window.Topmost = $true
   $h = $script:overlayHwnd
   if ($h -ne [IntPtr]::Zero) { $script:pinned = [Pinner]::Pin($h) }
   if ($script:pinned) { $followTimer.Stop() } else { $followTimer.Start() }
+  $topmostTimer.Start()   # always defend z-order, pinned or not
 }
 
 # One-shot, ~600ms after show (the shell has registered the window as a view by then):
@@ -2250,7 +2273,7 @@ $pinTimer.Add_Tick({
 $pinTimer.Start()
 
 $Window.Add_Closed({
-  $timer.Stop(); $followTimer.Stop(); $pinTimer.Stop(); $gifDesktopTimer.Stop()
+  $timer.Stop(); $followTimer.Stop(); $pinTimer.Stop(); $topmostTimer.Stop(); $gifDesktopTimer.Stop()
   if ($gifPollTimer) { $gifPollTimer.Stop() }
   if ($script:GifTimer) { $script:GifTimer.Stop() }
   $script:GifActive = $null
