@@ -362,6 +362,14 @@ class SessionState {
   [string] $Model    = ''
   [long]   $ContextTokens = 0    # current context-window fill = last assistant turn's input+cache tokens
 
+  # --- Subagent (child row) facts. A child is a Task/Agent spawn nested under its
+  #     parent session; it has no pid/session file of its own, so these are filled by
+  #     the child constructor below, not the JSON ctor. ---
+  [bool]   $IsChild   = $false
+  [string] $AgentId   = ''      # unique per subagent → row identity for children
+  [string] $AgentType = ''      # e.g. 't1k-debugger' (transcript attributionAgent)
+  [string] $Task      = ''      # first line of the spawn prompt
+
   # --- Per-tick snapshot (relative-time string is recomputed each refresh) ---
   [string] $AgeText = ''
 
@@ -382,6 +390,31 @@ class SessionState {
     } else {
       $this.Color = $this.Status; $this.StatusText = $this.Status
     }
+  }
+
+  # Child (subagent) constructor. Subagents have no pid and no ~/.claude/sessions file;
+  # they are discovered from the parent's transcript subagents/ dir (Get-LiveSubagents),
+  # so the parent supplies cwd + sessionId and the agent file supplies the rest. A child
+  # is only ever constructed while it is live, so it is always alive/busy.
+  SessionState([string]$agentId, [string]$parentSid, [string]$cwd, [string]$agentType, [string]$task, [long]$updatedAt) {
+    $this.IsChild    = $true
+    $this.AgentId    = $agentId
+    $this.SessionId  = $parentSid          # parent linkage (not the child's own id)
+    $this.Cwd        = $cwd
+    $this.AgentType  = if ($agentType) { $agentType } else { 'subagent' }
+    $this.Task       = $task
+    $this.UpdatedAt  = $updatedAt
+    $this.IsAlive    = $true
+    $this.IsBusy     = $true
+    $this.Color      = 'child'
+    $this.StatusText = 'subagent'
+  }
+
+  # Row identity: children key on their unique agentId, parents on their sessionId.
+  # (Agent ids are dash-free hex, session ids are UUIDs — they never collide.)
+  [string] RowKey() {
+    if ($this.IsChild) { return $this.AgentId }
+    return $this.SessionId
   }
 
   # Promote an alive, non-busy session to the waiting state. The attention-marker
@@ -421,6 +454,7 @@ class SessionState {
   # --- Display projections (consumed by Set-RowData) ---
 
   [string] Name() {
+    if ($this.IsChild) { return $this.AgentType }
     if ([string]::IsNullOrWhiteSpace($this.Cwd)) { return 'unknown' }
     $leaf = [System.IO.Path]::GetFileName($this.Cwd.TrimEnd([char]'\', [char]'/'))
     if (-not [string]::IsNullOrWhiteSpace($leaf)) { return $leaf }
@@ -428,6 +462,7 @@ class SessionState {
   }
 
   [string] Sub() {
+    if ($this.IsChild) { if ($this.Task) { return $this.Task } return 'working' }
     if ($this.Activity) { return $this.Activity }
     return "$($this.StatusText) $([SessionState]::Sep) pid $($this.Pid)"
   }
@@ -447,6 +482,11 @@ class SessionState {
   }
 
   [string] Tip() {
+    if ($this.IsChild) {
+      $tip = "subagent $([SessionState]::Sep) $($this.AgentType)"
+      if ($this.Task) { $tip += "`n`n$($this.Task)" }
+      return $tip
+    }
     $tip = "pid $($this.Pid) $([SessionState]::Sep) v$($this.Version) $([SessionState]::Sep) $($this.StatusText)`n$($this.Cwd)"
     if ($this.Prompt)   { $tip += "`n`nprompt: $($this.Prompt)" }
     if ($this.Activity) { $tip += "`n`n$($this.Activity)" }
@@ -491,6 +531,7 @@ class SessionState {
       'waiting' { return @{ base = '#38D29922'; hover = '#57D29922' } }   # yellow = waiting for input
       'stale'   { return @{ base = '#33F85149'; hover = '#52F85149' } }   # red    = process ended
       'idle'    { return @{ base = '#386E7681'; hover = '#576E7681' } }   # gray   = idle
+      'child'   { return @{ base = '#332D9A7D'; hover = '#502D9A7D' } }   # teal   = live subagent
     }
     return @{ base = '#386E7681'; hover = '#57D29922' }                   # default / unknown
   }
@@ -1054,6 +1095,63 @@ function Get-SessionActivity($cwd, $sessionId, $updatedAt) {
   return $val
 }
 
+# Discover the LIVE subagents (Task/Agent spawns) of one parent session as child rows.
+# Subagents have no pid and no ~/.claude/sessions file — they live as append-only
+# transcripts under projects\<enc>\<parentSid>\subagents\agent-<id>.jsonl. A subagent is
+# treated as live while its file was last written within $SubagentLiveMs (read-side only,
+# no hook): a finished agent stops being written and ages out on its own. Agent type +
+# spawn-prompt task are immutable per agent, so they're parsed once and cached by agentId.
+$script:SubagentMetaCache = @{}   # agentId -> @{ type; task }
+$SubagentLiveMs = 60000           # liveness window — wide enough to bridge a reasoning gap
+
+function Get-LiveSubagents($cwd, $parentSid, $now) {
+  $out = @()
+  if (-not $cwd -or -not $parentSid) { return $out }
+  $enc = ($cwd -replace '[^A-Za-z0-9]', '-')
+  $dir = Join-Path $env:USERPROFILE ".claude\projects\$enc\$parentSid\subagents"
+  if (-not (Test-Path $dir)) { return $out }
+
+  foreach ($f in Get-ChildItem -Path $dir -Filter 'agent-*.jsonl' -ErrorAction SilentlyContinue) {
+    $mtimeMs = [DateTimeOffset]::new($f.LastWriteTimeUtc, [TimeSpan]::Zero).ToUnixTimeMilliseconds()
+    if (($now - $mtimeMs) -gt $SubagentLiveMs) { continue }   # not live → skip
+
+    $agentId = $f.BaseName -replace '^agent-', ''
+    $meta = $script:SubagentMetaCache[$agentId]
+    if (-not $meta -or -not $meta.type) {
+      # (Re)read the head until both fields resolve. The task is on the first (user) line;
+      # the agent type (attributionAgent) only appears once the first assistant turn lands.
+      $type = if ($meta) { $meta.type } else { '' }
+      $task = if ($meta) { $meta.task } else { '' }
+      try {
+        $head = @(Get-Content -Path $f.FullName -TotalCount 8 -Encoding UTF8 -ErrorAction Stop)
+        if (-not $task -and $head.Count -gt 0) {
+          try {
+            $c0 = ($head[0] | ConvertFrom-Json).message.content
+            $t0 = if ($c0 -is [string]) { $c0 } else { '' }
+            if ($t0) {
+              $t0 = (($t0 -split "`n")[0]).Trim()
+              if ($t0.Length -gt 80) { $t0 = $t0.Substring(0, 80) }
+              $task = $t0
+            }
+          } catch {}
+        }
+        if (-not $type) {
+          foreach ($ln in $head) {
+            $mt = [regex]::Match($ln, '"attributionAgent":"([^"]+)"')
+            if ($mt.Success) { $type = $mt.Groups[1].Value; break }
+          }
+        }
+      } catch {}
+      $meta = @{ type = $type; task = $task }
+      if ($type -and $task) { $script:SubagentMetaCache[$agentId] = $meta }   # cache once stable
+    }
+
+    $out += [SessionState]::new($agentId, $parentSid, $cwd, $meta.type, $meta.task, $mtimeMs)
+  }
+  # Most-recently-active subagent first within the parent group.
+  return @($out | Sort-Object @{ e = { -$_.UpdatedAt } })
+}
+
 # Read the live activity marker (session-activity.cjs PreToolUse hook) for a session.
 # Returns the precise current-work line ("Editing overlay.ps1") or '' when absent.
 # Uncached: the file is tiny and changes every tool call, so a cache keyed on the
@@ -1352,7 +1450,9 @@ function New-Row {
     $t = $this.Tag
     if (-not ($t -and $t.Pid)) { return }
     $shift = ([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Shift) -ne 0
-    if ($shift) { Show-PromptInput $this; return }
+    # Shift-click opens the prompt composer — but only for real sessions. A subagent can't
+    # be messaged, so shift-click on a child row just focuses the parent terminal instead.
+    if ($shift -and -not $t.IsChild) { Show-PromptInput $this; return }
     $ok = Focus-Session $t.Pid $t.Cwd $t.SessionId
     if (-not $ok) { Show-RowFlash $this '#55F56C6C' }   # red: couldn't locate; right-click to link
   })
@@ -1362,6 +1462,7 @@ function New-Row {
   # Keyed by Claude PID so the link survives /clear (which changes sessionId, not the PID).
   $border.Add_MouseRightButtonUp({
     $t = $this.Tag
+    if ($t -and $t.IsChild) { return }   # subagent rows aren't linkable to a terminal
     if ($t -and $t.Pid) {
       $fg = [WinTools]::GetForegroundWindow()
       if ($fg -ne [IntPtr]::Zero -and $fg -ne $script:overlayHwnd) {
@@ -1574,9 +1675,17 @@ function Set-RowData($e, [SessionState]$s) {
   # Status -> row background tint (replaces the old dot). Carry base/hover on the Tag so
   # the MouseEnter/Leave handlers (and Show-RowFlash) restore the right shade.
   $tint = [SessionState]::Tint($s.Color)
-  $e.Border.Tag = [pscustomobject]@{ Pid = $s.Pid; Cwd = $s.Cwd; SessionId = $s.SessionId; BaseBg = $tint.base; HoverBg = $tint.hover }
+  $e.Border.Tag = [pscustomobject]@{ Pid = $s.Pid; Cwd = $s.Cwd; SessionId = $s.SessionId; IsChild = $s.IsChild; BaseBg = $tint.base; HoverBg = $tint.hover }
   $tip = $s.Tip()
   if ($e.Border.ToolTip -ne $tip) { $e.Border.ToolTip = $tip }
+
+  # Indent child (subagent) rows so they read as nested under their parent. Re-applied
+  # only when the row's child/parent kind flips — which never happens for a given RowKey
+  # (a child keys on agentId, a parent on sessionId) — so there is no per-tick churn.
+  if ($e.IsChildRow -ne $s.IsChild) {
+    $e.IsChildRow = $s.IsChild
+    $e.Border.Margin = if ($s.IsChild) { '22,2,0,0' } else { '0,3,0,0' }
+  }
 
   # Re-apply the background only when the tint or hover state actually changed, so an
   # unchanged row never churns its brush (keeps the in-place update blink-free).
@@ -1584,8 +1693,9 @@ function Set-RowData($e, [SessionState]$s) {
   if ($e.LastBg -ne $bg) { $e.LastBg = $bg; $e.Border.Background = [Windows.Media.BrushConverter]::new().ConvertFrom($bg) }
 
   $name = $s.Name()
+  if ($s.IsChild) { $name = "$([char]0x2514) $name" }   # '└ ' tree-branch prefix for nesting
   if ($e.RunName.Text -ne $name)        { $e.RunName.Text = $name }
-  $pidTxt = "  $($s.Pid)"
+  $pidTxt = if ($s.IsChild) { '' } else { "  $($s.Pid)" }   # a subagent has no pid of its own
   if ($e.RunPid.Text -ne $pidTxt)       { $e.RunPid.Text = $pidTxt }
 
   if ($s.Prompt) {
@@ -1746,14 +1856,31 @@ function Update-List {
   $script:OverallState = $st
   $script:SndCurStates = $snd
 
-  # Reconcile the live list against $rows without clearing it. Reuse each session's
-  # existing Border (updating its content in place), create one only for new sessions,
+  # Expand the sorted parent list into the flat render order: each parent immediately
+  # followed by its live subagents (nested child rows). Children inherit the parent's
+  # sort slot, so they always sit directly under the session that spawned them. Only
+  # alive parents are scanned — a dead process can't have a running subagent. The
+  # parent-only $rows is kept for the count/sound math above; $ordered drives rendering.
+  $ordered = New-Object System.Collections.Generic.List[object]
+  foreach ($p in $rows) {
+    $ordered.Add($p)
+    if ($p.IsAlive) {
+      foreach ($ch in (Get-LiveSubagents $p.Cwd $p.SessionId $now)) {
+        $ch.Pid = $p.Pid        # inherit parent's pid → clicking the child focuses its terminal
+        $ch.StampAge($now)
+        $ordered.Add($ch)
+      }
+    }
+  }
+
+  # Reconcile the live list against $ordered without clearing it. Reuse each row's
+  # existing Border (updating its content in place), create one only for new rows,
   # and move/insert it to the sorted position. Rows that stay put are never removed
   # from the visual tree, so the row under the cursor doesn't flicker on refresh.
   $seen = @{}
-  for ($i = 0; $i -lt $rows.Count; $i++) {
-    $r = $rows[$i]
-    $sid = $r.SessionId
+  for ($i = 0; $i -lt $ordered.Count; $i++) {
+    $r = $ordered[$i]
+    $sid = $r.RowKey()
     $e = $script:RowMap[$sid]
     if (-not $e) { $e = New-Row; $script:RowMap[$sid] = $e }
     Set-RowData $e $r
