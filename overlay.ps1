@@ -43,6 +43,7 @@ public static class WinTools {
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
@@ -124,15 +125,23 @@ public static class WinTools {
     if (want != ex) SetWindowLong(h, -20, want);
   }
 
-  // Activate the overlay itself (after SetActivatable(true)) so its TextBox gets keystrokes,
-  // disabling the foreground lock for the call exactly as Focus() does.
+  // Activate the overlay itself (after SetActivatable(true)) so its TextBox gets keystrokes.
+  // Mirrors Focus(): zero the foreground lock and attach to the current foreground thread,
+  // otherwise Windows refuses to let this (normally no-activate) window take foreground while
+  // the terminal owns it, and keyboard focus never lands on the box.
   public static void ActivateSelf(IntPtr h) {
     if (h == IntPtr.Zero) return;
     uint oldTimeout = 0;
     SystemParametersInfo(SPI_GETFOREGROUNDLOCKTIMEOUT, 0, ref oldTimeout, 0);
     SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, IntPtr.Zero, SPIF_SENDCHANGE);
+    IntPtr fg = GetForegroundWindow();
+    uint fgPid; uint fgThread = GetWindowThreadProcessId(fg, out fgPid);
+    uint cur = GetCurrentThreadId();
+    bool attached = (fgThread != cur) && AttachThreadInput(cur, fgThread, true);
     BringWindowToTop(h);
     SetForegroundWindow(h);
+    SetFocus(h);   // give the HWND Win32 keyboard focus so WPF has focus to route to the box
+    if (attached) AttachThreadInput(cur, fgThread, false);
     SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, (IntPtr)(long)oldTimeout, SPIF_SENDCHANGE);
   }
 
@@ -1272,9 +1281,16 @@ function Show-PromptInput($border) {
     [WinTools]::SetActivatable($script:overlayHwnd, $true)
     [WinTools]::ActivateSelf($script:overlayHwnd)
   }
-  # Defer focus until after activation/layout settles, else the first Focus() is dropped.
+  # Realize the just-shown box now (Collapsed -> Visible needs a layout pass before
+  # IsVisible flips true; focusing a not-yet-realized element is silently dropped).
+  $box.UpdateLayout()
+  [void]$box.Focus()
+  [void][System.Windows.Input.Keyboard]::Focus($box)
+  $box.CaretIndex = $box.Text.Length
+  # Belt-and-suspenders: re-assert keyboard focus once the input queue drains, in case the
+  # click that opened the box was still settling activation when the synchronous focus ran.
   $box.Dispatcher.BeginInvoke([action]{
-    [void]$box.Focus(); [void][System.Windows.Input.Keyboard]::Focus($box)
+    [void][System.Windows.Input.Keyboard]::Focus($box)
   }, [System.Windows.Threading.DispatcherPriority]::Input) | Out-Null
 }
 
