@@ -170,6 +170,14 @@ public static class WinTools {
     var arr = new INPUT[] { VkInput(0x0D, false), VkInput(0x0D, true) };
     SendInput((uint)arr.Length, arr, Marshal.SizeOf(typeof(INPUT)));
   }
+
+  // Ctrl+V — paste the clipboard into the focused terminal. Used for multi-line prompts:
+  // the terminal's bracketed-paste keeps embedded newlines as input instead of submitting,
+  // so a single SendEnter afterwards submits the whole block (matching a human paste).
+  public static void SendCtrlV() {
+    var arr = new INPUT[] { VkInput(0x11, false), VkInput(0x56, false), VkInput(0x56, true), VkInput(0x11, true) };
+    SendInput((uint)arr.Length, arr, Marshal.SizeOf(typeof(INPUT)));   // 0x11=Ctrl, 0x56=V
+  }
 }
 "@
 
@@ -1193,42 +1201,114 @@ function Select-WTTabInWindow($hwnd, $folder) {
 # The overlay is a no-activate window, so its TextBox can't receive keystrokes until we
 # temporarily clear WS_EX_NOACTIVATE and activate it. Show-PromptInput does that; the
 # Enter/Escape/lost-focus handlers restore no-activate so clicking the overlay never
-# steals foreground again.
+# steals foreground again. The box mirrors Claude's composer: a '>' chevron, placeholder,
+# Enter to send / Shift+Enter for a newline (auto-grows), and Up/Down to recall history.
 
-# The TextBox is the second child of a row's outer StackPanel (the grid is the first).
-function Get-RowInput($border) { return $border.Child.Children[1] }
+# Per-session prompt history (this run), keyed by Claude PID so it survives /clear.
+$script:PromptHistory = @{}
+
+function Add-PromptHistory($sessPid, $text) {
+  $sessPid = [int]$sessPid
+  if (-not $script:PromptHistory.ContainsKey($sessPid)) {
+    $script:PromptHistory[$sessPid] = New-Object System.Collections.Generic.List[string]
+  }
+  $h = $script:PromptHistory[$sessPid]
+  if ($h.Count -eq 0 -or $h[$h.Count - 1] -ne $text) { $h.Add($text) }  # de-dup consecutive
+  while ($h.Count -gt 100) { $h.RemoveAt(0) }                            # bound growth
+}
+
+# The TextBox is reachable from a row border via the wrap stashed at outer.Children[1].
+function Get-RowInput($border) {
+  $wrap = $border.Child.Children[1]
+  if ($wrap -and $wrap.Tag) { return $wrap.Tag.Box }
+  return $null
+}
+
+function Update-Placeholder($box) {
+  $ph = $box.Tag.Placeholder
+  if ($ph) { $ph.Visibility = if ($box.Text.Length -eq 0) { 'Visible' } else { 'Collapsed' } }
+}
+
+# Up/Down recall, shell/Claude style. dir=-1 older, +1 newer. Returns $true if it consumed
+# the key (so the caller suppresses the default caret move). In a multi-line draft the
+# arrows move the caret normally and only recall at the very top / very bottom.
+function Recall-History($box, $dir) {
+  $tag = $box.Tag
+  $rb = $tag.RowBorder
+  if (-not ($rb.Tag -and $rb.Tag.Pid)) { return $false }
+  $hist = $script:PromptHistory[[int]$rb.Tag.Pid]
+  if (-not $hist -or $hist.Count -eq 0) { return $false }
+  $multi = $box.Text.Contains([char]10)
+  if ($dir -lt 0) { if ($multi -and $box.CaretIndex -ne 0) { return $false } }
+  else            { if ($multi -and $box.CaretIndex -ne $box.Text.Length) { return $false } }
+
+  $idx = [int]$tag.HistIdx
+  if ($dir -lt 0) {
+    if ($idx -ge $hist.Count) { $tag.Draft = $box.Text }   # stash the live draft before leaving it
+    if ($idx -le 0) { $tag.HistIdx = 0; return $true }      # already oldest; still consume the key
+    $idx--
+  } else {
+    if ($idx -ge $hist.Count) { return $false }             # already on the draft; nothing newer
+    $idx++
+  }
+  $tag.HistIdx = $idx
+  $box.Text = if ($idx -ge $hist.Count) { $tag.Draft } else { $hist[$idx] }
+  $box.CaretIndex = $box.Text.Length
+  return $true
+}
 
 function Show-PromptInput($border) {
-  $tb = Get-RowInput $border
-  if (-not $tb) { return }
-  $tb.Text = ''
-  $tb.Visibility = 'Visible'
+  $box = Get-RowInput $border
+  if (-not $box) { return }
+  $tag = $box.Tag
+  $box.Text = ''
+  $tag.Draft = ''
+  # Start the history cursor past the newest entry (i.e. on the empty draft).
+  $sp = if ($border.Tag -and $border.Tag.Pid) { [int]$border.Tag.Pid } else { 0 }
+  $tag.HistIdx = if ($script:PromptHistory.ContainsKey($sp)) { $script:PromptHistory[$sp].Count } else { 0 }
+  $tag.Wrap.Visibility = 'Visible'
+  Update-Placeholder $box
   if ($script:overlayHwnd -ne [IntPtr]::Zero) {
     [WinTools]::SetActivatable($script:overlayHwnd, $true)
     [WinTools]::ActivateSelf($script:overlayHwnd)
   }
   # Defer focus until after activation/layout settles, else the first Focus() is dropped.
-  $tb.Dispatcher.BeginInvoke([action]{
-    [void]$tb.Focus(); [void][System.Windows.Input.Keyboard]::Focus($tb)
+  $box.Dispatcher.BeginInvoke([action]{
+    [void]$box.Focus(); [void][System.Windows.Input.Keyboard]::Focus($box)
   }, [System.Windows.Threading.DispatcherPriority]::Input) | Out-Null
 }
 
-function Hide-PromptInput($tb) {
-  if ($tb.Visibility -ne 'Collapsed') { $tb.Visibility = 'Collapsed' }
-  $tb.Text = ''
+function Hide-PromptInput($box) {
+  $tag = $box.Tag
+  if ($tag.Wrap.Visibility -ne 'Collapsed') { $tag.Wrap.Visibility = 'Collapsed' }
+  $box.Text = ''
+  Update-Placeholder $box
   # Restore no-activate so the overlay stops stealing foreground on click.
   if ($script:overlayHwnd -ne [IntPtr]::Zero) {
     [WinTools]::SetActivatable($script:overlayHwnd, $false)
   }
 }
 
-# Focus the session's terminal, then type the prompt and press Enter into it.
+# Focus the session's terminal, then deliver the prompt and submit it. Single-line goes in
+# as Unicode keystrokes; multi-line is pasted (bracketed paste preserves newlines) with the
+# clipboard saved and restored around the paste.
 function Send-PromptToSession($targetPid, $cwd, $sessionId, $text) {
   if (-not (Focus-Session $targetPid $cwd $sessionId)) { return $false }
   Start-Sleep -Milliseconds 140   # let the terminal actually take foreground
-  [WinTools]::SendText($text)
-  Start-Sleep -Milliseconds 40
-  [WinTools]::SendEnter()
+  if ($text.Contains([char]10)) {
+    $old = $null
+    try { $old = [System.Windows.Clipboard]::GetText() } catch {}
+    try { [System.Windows.Clipboard]::SetText($text) } catch {}
+    Start-Sleep -Milliseconds 40
+    [WinTools]::SendCtrlV()
+    Start-Sleep -Milliseconds 90
+    [WinTools]::SendEnter()
+    if ($old) { try { [System.Windows.Clipboard]::SetText($old) } catch {} }   # restore clipboard
+  } else {
+    [WinTools]::SendText($text)
+    Start-Sleep -Milliseconds 40
+    [WinTools]::SendEnter()
+  }
   return $true
 }
 
@@ -1354,49 +1434,111 @@ function New-Row {
   $grid.Children.Add($stack) | Out-Null
   $grid.Children.Add($right) | Out-Null
 
-  # Outer container so an inline prompt box can sit full-width below the row content.
-  # (border.Child must be a single element; the grid alone can't host the extra TextBox.)
+  # Outer container so the inline prompt box can sit full-width below the row content.
+  # (border.Child must be a single element; the grid alone can't host the extra box.)
   $outer = New-Object System.Windows.Controls.StackPanel
   $outer.Children.Add($grid) | Out-Null
 
-  # Inline prompt input — collapsed until shift-click. Enter sends to the session's
-  # terminal; Escape cancels. Visibility is never touched by Set-RowData, so an open box
-  # survives every refresh tick (rows are updated in place, not rebuilt).
+  # --- Inline prompt composer (collapsed until shift-click) ---------------------------
+  # Rounded wrap → '>' chevron + auto-growing TextBox with an overlaid placeholder, so it
+  # reads like Claude's own input. Visibility is never touched by Set-RowData, so an open
+  # box survives every refresh tick (rows are updated in place, not rebuilt).
+  $wrap = New-Object System.Windows.Controls.Border
+  $wrap.CornerRadius = '6'
+  $wrap.Margin = '0,7,0,0'
+  $wrap.Padding = '8,5,8,6'
+  $wrap.Background = [Windows.Media.BrushConverter]::new().ConvertFrom('#40000000')
+  $wrap.BorderBrush = [Windows.Media.BrushConverter]::new().ConvertFrom('#73E6A23C')
+  $wrap.BorderThickness = '1'
+  $wrap.Visibility = 'Collapsed'
+  # Consume clicks inside the composer so they never bubble to the row's focus-terminal handler.
+  $wrap.Add_MouseLeftButtonUp({ $_.Handled = $true })
+
+  $wrapGrid = New-Object System.Windows.Controls.Grid
+  $cc0 = New-Object System.Windows.Controls.ColumnDefinition; $cc0.Width = 'Auto'
+  $cc1 = New-Object System.Windows.Controls.ColumnDefinition; $cc1.Width = '*'
+  $wrapGrid.ColumnDefinitions.Add($cc0)
+  $wrapGrid.ColumnDefinitions.Add($cc1)
+
+  $chevron = New-Object System.Windows.Controls.TextBlock
+  $chevron.Text = '>'
+  $chevron.FontFamily = 'Consolas'
+  $chevron.FontSize = 12
+  $chevron.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#CCE6A23C')
+  $chevron.VerticalAlignment = 'Top'
+  $chevron.Margin = '0,1,7,0'
+  $chevron.IsHitTestVisible = $false
+  [Windows.Controls.Grid]::SetColumn($chevron, 0)
+
+  # The text area: the editable box with a placeholder TextBlock layered over it.
+  $boxHost = New-Object System.Windows.Controls.Grid
+  [Windows.Controls.Grid]::SetColumn($boxHost, 1)
+
   $promptBox = New-Object System.Windows.Controls.TextBox
-  $promptBox.Margin = '0,7,0,0'
-  $promptBox.Padding = '6,3,6,3'
   $promptBox.FontFamily = 'Segoe UI'
-  $promptBox.FontSize = 11
+  $promptBox.FontSize = 12
   $promptBox.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#FFFFFFFF')
-  $promptBox.Background = [Windows.Media.BrushConverter]::new().ConvertFrom('#33000000')
-  $promptBox.BorderBrush = [Windows.Media.BrushConverter]::new().ConvertFrom('#80FFFFFF')
+  $promptBox.Background = 'Transparent'
+  $promptBox.BorderThickness = '0'
+  $promptBox.Padding = '0'
   $promptBox.CaretBrush = [Windows.Media.BrushConverter]::new().ConvertFrom('#FFFFFFFF')
-  $promptBox.BorderThickness = '1'
-  $promptBox.AcceptsReturn = $false
-  $promptBox.Visibility = 'Collapsed'
+  $promptBox.AcceptsReturn = $true                 # Shift+Enter inserts a newline
+  $promptBox.TextWrapping = 'Wrap'
+  $promptBox.MaxHeight = 120                        # grows with content, then scrolls
+  $promptBox.VerticalScrollBarVisibility = 'Auto'
   $promptBox.Cursor = 'IBeam'
 
-  $promptBox.Add_KeyDown({
-    $tb = $this
-    if ($_.Key -eq 'Return') {
-      $_.Handled = $true
-      $border = $tb.Parent.Parent          # TextBox -> outer StackPanel -> Border
-      $t = $border.Tag
-      $text = $tb.Text
-      Hide-PromptInput $tb                  # collapse + restore no-activate BEFORE sending
-      if ($t -and $t.Pid -and $text) {
-        $sent = Send-PromptToSession $t.Pid $t.Cwd $t.SessionId $text
-        Show-RowFlash $border $(if ($sent) { '#5567C23A' } else { '#55F56C6C' })
+  $placeholder = New-Object System.Windows.Controls.TextBlock
+  $placeholder.Text = 'Send a message to this session...'
+  $placeholder.FontFamily = 'Segoe UI'
+  $placeholder.FontSize = 12
+  $placeholder.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#80FFFFFF')
+  $placeholder.VerticalAlignment = 'Top'
+  $placeholder.IsHitTestVisible = $false
+
+  $boxHost.Children.Add($promptBox) | Out-Null
+  $boxHost.Children.Add($placeholder) | Out-Null
+
+  $wrapGrid.Children.Add($chevron) | Out-Null
+  $wrapGrid.Children.Add($boxHost) | Out-Null
+  $wrap.Child = $wrapGrid
+
+  # Stash cross-references for the handlers + Get-RowInput (border.Tag is reserved for
+  # per-tick session data, so we hang these off the box/wrap Tags instead).
+  $wrap.Tag = [pscustomobject]@{ Box = $promptBox }
+  $promptBox.Tag = @{ RowBorder = $border; Wrap = $wrap; Placeholder = $placeholder; HistIdx = 0; Draft = '' }
+
+  $promptBox.Add_TextChanged({ Update-Placeholder $this })
+
+  # PreviewKeyDown (tunneling) so we intercept Enter/Esc/arrows before the TextBox does.
+  $promptBox.Add_PreviewKeyDown({
+    $box = $this
+    $shift = ([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Shift) -ne 0
+    switch ($_.Key) {
+      'Return' {
+        if ($shift) { return }              # Shift+Enter → newline (let the box handle it)
+        $_.Handled = $true
+        $rb = $box.Tag.RowBorder
+        $t = $rb.Tag
+        $text = $box.Text
+        if ($t -and $t.Pid -and $text) {
+          Add-PromptHistory $t.Pid $text
+          Hide-PromptInput $box             # collapse + restore no-activate BEFORE sending
+          $sent = Send-PromptToSession $t.Pid $t.Cwd $t.SessionId $text
+          Show-RowFlash $rb $(if ($sent) { '#5567C23A' } else { '#55F56C6C' })
+        } else {
+          Hide-PromptInput $box
+        }
       }
-    } elseif ($_.Key -eq 'Escape') {
-      $_.Handled = $true
-      Hide-PromptInput $tb
+      'Escape' { $_.Handled = $true; Hide-PromptInput $box }
+      'Up'     { if (Recall-History $box -1) { $_.Handled = $true } }
+      'Down'   { if (Recall-History $box  1) { $_.Handled = $true } }
     }
   })
   # Clicking elsewhere (or focus otherwise leaving) cancels the box and restores no-activate.
   $promptBox.Add_LostKeyboardFocus({ Hide-PromptInput $this })
 
-  $outer.Children.Add($promptBox) | Out-Null
+  $outer.Children.Add($wrap) | Out-Null
   $border.Child = $outer
 
   return @{

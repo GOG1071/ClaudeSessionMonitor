@@ -22,10 +22,12 @@ session globally — across all terminals, projects, and virtual desktops.
   for the full text plus pid, version, status, and cwd.
 - **Click to focus** — left-click a row to bring that session's terminal window to the
   foreground. Works reliably across the foreground-lock and minimised windows.
-- **Shift-click to prompt** — Shift+left-click a row to open an inline input field; type a
-  prompt and press **Enter** to send it straight to that session (the overlay focuses the
-  terminal and types the text + Enter for you). **Esc** cancels. Text is delivered as Unicode
-  keystrokes, so any characters work without clipboard interference.
+- **Shift-click to prompt** — Shift+left-click a row to open an inline composer that reads like
+  Claude's own input: a `>` chevron, placeholder text, **Enter** to send, **Shift+Enter** for a
+  newline (the box auto-grows, then scrolls), and **↑ / ↓** to recall prompts you've sent to that
+  session this run. **Esc** cancels. The overlay focuses the session's terminal and delivers the
+  prompt for you — single-line as Unicode keystrokes, multi-line via a clipboard-preserving paste
+  (the clipboard is saved and restored) — then submits it.
 - **Right-click to link** — for sessions whose terminal can't be auto-identified
   (Windows Terminal exposes only the tab title), focus the terminal once and right-click
   the row to link it. The link is remembered per session.
