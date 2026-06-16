@@ -116,6 +116,60 @@ public static class WinTools {
     // Restore the user's original foreground-lock setting.
     SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, (IntPtr)(long)oldTimeout, SPIF_SENDCHANGE);
   }
+
+  // Toggle WS_EX_NOACTIVATE so an inline input box can receive keyboard focus, then restore.
+  public static void SetActivatable(IntPtr h, bool activatable) {
+    int ex = GetWindowLong(h, -20);                                   // GWL_EXSTYLE
+    int want = activatable ? (ex & ~0x08000000) : (ex | 0x08000000);  // WS_EX_NOACTIVATE
+    if (want != ex) SetWindowLong(h, -20, want);
+  }
+
+  // Activate the overlay itself (after SetActivatable(true)) so its TextBox gets keystrokes,
+  // disabling the foreground lock for the call exactly as Focus() does.
+  public static void ActivateSelf(IntPtr h) {
+    if (h == IntPtr.Zero) return;
+    uint oldTimeout = 0;
+    SystemParametersInfo(SPI_GETFOREGROUNDLOCKTIMEOUT, 0, ref oldTimeout, 0);
+    SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, IntPtr.Zero, SPIF_SENDCHANGE);
+    BringWindowToTop(h);
+    SetForegroundWindow(h);
+    SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, (IntPtr)(long)oldTimeout, SPIF_SENDCHANGE);
+  }
+
+  // --- Synthesised keystrokes (SendInput) for typing a prompt into the focused terminal. ---
+  // Two trailing int pads make sizeof(INPUT) match the real Win32 union (40 on x64, 28 on
+  // x86); SendInput only reads type + ki, which sit at the correct offsets either way.
+  [StructLayout(LayoutKind.Sequential)]
+  struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+  [StructLayout(LayoutKind.Sequential)]
+  struct INPUT { public uint type; public KEYBDINPUT ki; public int padA; public int padB; }
+  [DllImport("user32.dll")] static extern uint SendInput(uint n, INPUT[] inputs, int cb);
+  const uint INPUT_KEYBOARD = 1, KEYEVENTF_KEYUP = 0x0002, KEYEVENTF_UNICODE = 0x0004;
+
+  static INPUT UniInput(char c, bool up) {
+    return new INPUT { type = INPUT_KEYBOARD, ki = new KEYBDINPUT {
+      wVk = 0, wScan = c, dwFlags = KEYEVENTF_UNICODE | (up ? KEYEVENTF_KEYUP : 0), time = 0, dwExtraInfo = IntPtr.Zero } };
+  }
+  static INPUT VkInput(ushort vk, bool up) {
+    return new INPUT { type = INPUT_KEYBOARD, ki = new KEYBDINPUT {
+      wVk = vk, wScan = 0, dwFlags = (up ? KEYEVENTF_KEYUP : 0), time = 0, dwExtraInfo = IntPtr.Zero } };
+  }
+
+  // Type a unicode string into whatever window currently has keyboard focus. Unicode scan
+  // codes carry every character (incl. punctuation/emoji) verbatim — no SendKeys escaping.
+  public static void SendText(string s) {
+    if (string.IsNullOrEmpty(s)) return;
+    var list = new List<INPUT>();
+    foreach (char c in s) { list.Add(UniInput(c, false)); list.Add(UniInput(c, true)); }
+    var arr = list.ToArray();
+    SendInput((uint)arr.Length, arr, Marshal.SizeOf(typeof(INPUT)));
+  }
+
+  // Press Enter (submit the prompt).
+  public static void SendEnter() {
+    var arr = new INPUT[] { VkInput(0x0D, false), VkInput(0x0D, true) };
+    SendInput((uint)arr.Length, arr, Marshal.SizeOf(typeof(INPUT)));
+  }
 }
 "@
 
@@ -1135,6 +1189,49 @@ function Select-WTTabInWindow($hwnd, $folder) {
   } catch {}
 }
 
+# --- Inline prompt input (shift-click a row) ------------------------------------------
+# The overlay is a no-activate window, so its TextBox can't receive keystrokes until we
+# temporarily clear WS_EX_NOACTIVATE and activate it. Show-PromptInput does that; the
+# Enter/Escape/lost-focus handlers restore no-activate so clicking the overlay never
+# steals foreground again.
+
+# The TextBox is the second child of a row's outer StackPanel (the grid is the first).
+function Get-RowInput($border) { return $border.Child.Children[1] }
+
+function Show-PromptInput($border) {
+  $tb = Get-RowInput $border
+  if (-not $tb) { return }
+  $tb.Text = ''
+  $tb.Visibility = 'Visible'
+  if ($script:overlayHwnd -ne [IntPtr]::Zero) {
+    [WinTools]::SetActivatable($script:overlayHwnd, $true)
+    [WinTools]::ActivateSelf($script:overlayHwnd)
+  }
+  # Defer focus until after activation/layout settles, else the first Focus() is dropped.
+  $tb.Dispatcher.BeginInvoke([action]{
+    [void]$tb.Focus(); [void][System.Windows.Input.Keyboard]::Focus($tb)
+  }, [System.Windows.Threading.DispatcherPriority]::Input) | Out-Null
+}
+
+function Hide-PromptInput($tb) {
+  if ($tb.Visibility -ne 'Collapsed') { $tb.Visibility = 'Collapsed' }
+  $tb.Text = ''
+  # Restore no-activate so the overlay stops stealing foreground on click.
+  if ($script:overlayHwnd -ne [IntPtr]::Zero) {
+    [WinTools]::SetActivatable($script:overlayHwnd, $false)
+  }
+}
+
+# Focus the session's terminal, then type the prompt and press Enter into it.
+function Send-PromptToSession($targetPid, $cwd, $sessionId, $text) {
+  if (-not (Focus-Session $targetPid $cwd $sessionId)) { return $false }
+  Start-Sleep -Milliseconds 140   # let the terminal actually take foreground
+  [WinTools]::SendText($text)
+  Start-Sleep -Milliseconds 40
+  [WinTools]::SendEnter()
+  return $true
+}
+
 # Build a row once and return a hashtable of the Border plus references to every
 # element whose content changes per tick. The row is then reused across refreshes
 # (see Update-List) and only its text/colors are updated in place via Set-RowData —
@@ -1150,13 +1247,18 @@ function New-Row {
   $border.Background = [Windows.Media.BrushConverter]::new().ConvertFrom('#386E7681')
   $border.Cursor = 'Hand'
 
-  # Left-click focuses the session's terminal; right-click links it to the current terminal.
+  # Left-click focuses the session's terminal; Shift+left-click opens an inline prompt box;
+  # right-click links it to the current terminal.
   $border.Add_MouseLeftButtonUp({
+    # A click that lands inside the open input box must not bubble up and re-focus the
+    # terminal (which would yank foreground away mid-typing).
+    if ($_.OriginalSource -is [System.Windows.Controls.TextBox]) { return }
     $t = $this.Tag
-    if ($t -and $t.Pid) {
-      $ok = Focus-Session $t.Pid $t.Cwd $t.SessionId
-      if (-not $ok) { Show-RowFlash $this '#55F56C6C' }   # red: couldn't locate; right-click to link
-    }
+    if (-not ($t -and $t.Pid)) { return }
+    $shift = ([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Shift) -ne 0
+    if ($shift) { Show-PromptInput $this; return }
+    $ok = Focus-Session $t.Pid $t.Cwd $t.SessionId
+    if (-not $ok) { Show-RowFlash $this '#55F56C6C' }   # red: couldn't locate; right-click to link
   })
 
   # Right-click: link this session to whatever terminal is currently focused.
@@ -1251,7 +1353,51 @@ function New-Row {
 
   $grid.Children.Add($stack) | Out-Null
   $grid.Children.Add($right) | Out-Null
-  $border.Child = $grid
+
+  # Outer container so an inline prompt box can sit full-width below the row content.
+  # (border.Child must be a single element; the grid alone can't host the extra TextBox.)
+  $outer = New-Object System.Windows.Controls.StackPanel
+  $outer.Children.Add($grid) | Out-Null
+
+  # Inline prompt input — collapsed until shift-click. Enter sends to the session's
+  # terminal; Escape cancels. Visibility is never touched by Set-RowData, so an open box
+  # survives every refresh tick (rows are updated in place, not rebuilt).
+  $promptBox = New-Object System.Windows.Controls.TextBox
+  $promptBox.Margin = '0,7,0,0'
+  $promptBox.Padding = '6,3,6,3'
+  $promptBox.FontFamily = 'Segoe UI'
+  $promptBox.FontSize = 11
+  $promptBox.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#FFFFFFFF')
+  $promptBox.Background = [Windows.Media.BrushConverter]::new().ConvertFrom('#33000000')
+  $promptBox.BorderBrush = [Windows.Media.BrushConverter]::new().ConvertFrom('#80FFFFFF')
+  $promptBox.CaretBrush = [Windows.Media.BrushConverter]::new().ConvertFrom('#FFFFFFFF')
+  $promptBox.BorderThickness = '1'
+  $promptBox.AcceptsReturn = $false
+  $promptBox.Visibility = 'Collapsed'
+  $promptBox.Cursor = 'IBeam'
+
+  $promptBox.Add_KeyDown({
+    $tb = $this
+    if ($_.Key -eq 'Return') {
+      $_.Handled = $true
+      $border = $tb.Parent.Parent          # TextBox -> outer StackPanel -> Border
+      $t = $border.Tag
+      $text = $tb.Text
+      Hide-PromptInput $tb                  # collapse + restore no-activate BEFORE sending
+      if ($t -and $t.Pid -and $text) {
+        $sent = Send-PromptToSession $t.Pid $t.Cwd $t.SessionId $text
+        Show-RowFlash $border $(if ($sent) { '#5567C23A' } else { '#55F56C6C' })
+      }
+    } elseif ($_.Key -eq 'Escape') {
+      $_.Handled = $true
+      Hide-PromptInput $tb
+    }
+  })
+  # Clicking elsewhere (or focus otherwise leaving) cancels the box and restores no-activate.
+  $promptBox.Add_LostKeyboardFocus({ Hide-PromptInput $this })
+
+  $outer.Children.Add($promptBox) | Out-Null
+  $border.Child = $outer
 
   return @{
     Border = $border; RunName = $runName; RunPid = $runPid
