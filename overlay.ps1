@@ -427,22 +427,24 @@ $StatusDir = Join-Path $env:USERPROFILE '.claude\session-status'
 # transcript tail-parse. Persists across the session (overwritten on each new prompt).
 $PromptDir = Join-Path $env:USERPROFILE '.claude\session-prompt'
 
-# Persisted "links": sessionId -> terminal window handle, for sessions whose window
+# Persisted "links": claudePid -> terminal window handle, for sessions whose window
 # title can't be auto-matched (right-click a row to link it to the current terminal).
+# Keyed by Claude PID (not sessionId) so a link survives /clear, which mints a new
+# sessionId but leaves the process -- and its terminal window -- unchanged.
 $LinksFile = Join-Path $PSScriptRoot 'links.json'
 $script:Links = @{}
-# In-memory "last seen present" stamp (unix ms) per linked sessionId. A link is reaped
-# once its session has been absent from the native session list for longer than
+# In-memory "last seen present" stamp (unix ms) per linked claudePid. A link is reaped
+# once its Claude process has been absent from the alive set for longer than
 # $StaleLinkMs, so links.json stays bounded instead of growing forever across sessions.
-# (The grace window also absorbs a transient native-file disappearance between ticks.)
+# (The grace window also absorbs a transient disappearance between ticks.)
 $script:LinkSeen = @{}
 $StaleLinkMs = 24 * 60 * 60 * 1000   # 1 day
 if (Test-Path $LinksFile) {
   try {
     $loadNow = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     (Get-Content $LinksFile -Raw -Encoding UTF8 | ConvertFrom-Json).PSObject.Properties | ForEach-Object {
-      $script:Links[$_.Name] = [int64]$_.Value
-      $script:LinkSeen[$_.Name] = $loadNow   # seed grace so disk links aren't reaped instantly
+      $script:Links[[int]$_.Name] = [int64]$_.Value     # keys normalized to int to match the alive-PID set
+      $script:LinkSeen[[int]$_.Name] = $loadNow          # seed grace so disk links aren't reaped instantly
     }
   } catch {}
 }
@@ -1022,17 +1024,17 @@ function Show-RowFlash($row, $hex) {
 }
 
 # Resolve and focus the terminal for a session.
-#   $cwd       disambiguates Windows Terminal windows/tabs by title.
-#   $sessionId looks up a user-created link (right-click) when the title can't be matched.
+#   $cwd        disambiguates Windows Terminal windows/tabs by title.
+#   $sessionPid looks up a user-created link (right-click) when the title can't be matched.
 function Focus-Session($sessionPid, $cwd, $sessionId) {
   $sessionPid = [int]$sessionPid
   $folder = if ($cwd) { Split-Path $cwd -Leaf } else { '' }
 
   # Prefer an explicit user link if it still points to a live window.
-  if ($sessionId -and $script:Links.ContainsKey($sessionId)) {
-    $lh = [IntPtr]([int64]$script:Links[$sessionId])
+  if ($script:Links.ContainsKey($sessionPid)) {
+    $lh = [IntPtr]([int64]$script:Links[$sessionPid])
     if ((Test-LiveWindow $lh)) { [WinTools]::Focus($lh); return $true }
-    $script:Links.Remove($sessionId); Save-Links            # stale -> forget it
+    $script:Links.Remove($sessionPid); Save-Links           # stale -> forget it
   }
 
   # Build a child -> parent process map and a pid -> name map once.
@@ -1147,12 +1149,13 @@ function New-Row {
 
   # Right-click: link this session to whatever terminal is currently focused.
   # (The overlay is no-activate, so the foreground window is the terminal you came from.)
+  # Keyed by Claude PID so the link survives /clear (which changes sessionId, not the PID).
   $border.Add_MouseRightButtonUp({
     $t = $this.Tag
-    if ($t -and $t.SessionId) {
+    if ($t -and $t.Pid) {
       $fg = [WinTools]::GetForegroundWindow()
       if ($fg -ne [IntPtr]::Zero -and $fg -ne $script:overlayHwnd) {
-        $script:Links[$t.SessionId] = $fg.ToInt64()
+        $script:Links[[int]$t.Pid] = $fg.ToInt64()
         Save-Links
         Show-RowFlash $this '#5567C23A'                   # green: linked
       } else {
@@ -1383,21 +1386,21 @@ function Update-List {
       if (-not $nativeSids.ContainsKey($pf.BaseName)) { Remove-Item $pf.FullName -ErrorAction SilentlyContinue }
     }
   }
-  # Time out stale terminal links. A link whose session is still listed gets its
-  # last-seen stamp refreshed; one whose session has been gone longer than
+  # Time out stale terminal links. A link whose Claude process is still alive gets its
+  # last-seen stamp refreshed; one whose process has been gone longer than
   # $StaleLinkMs is dropped. Without this, links.json grows without bound because a
   # link is otherwise only forgotten the next time someone clicks it (Focus-Session).
   if ($script:Links.Count -gt 0) {
     $linksDirty = $false
-    foreach ($sid in @($script:Links.Keys)) {
-      if ($nativeSids.ContainsKey($sid)) {
-        $script:LinkSeen[$sid] = $now
+    foreach ($lpid in @($script:Links.Keys)) {
+      if ($alive.ContainsKey([int]$lpid)) {
+        $script:LinkSeen[$lpid] = $now
       } else {
-        $seenAt = if ($script:LinkSeen.ContainsKey($sid)) { $script:LinkSeen[$sid] } else { $now }
+        $seenAt = if ($script:LinkSeen.ContainsKey($lpid)) { $script:LinkSeen[$lpid] } else { $now }
         if ($now - $seenAt -gt $StaleLinkMs) {
-          $script:Links.Remove($sid); $script:LinkSeen.Remove($sid); $linksDirty = $true
+          $script:Links.Remove($lpid); $script:LinkSeen.Remove($lpid); $linksDirty = $true
         } else {
-          $script:LinkSeen[$sid] = $seenAt   # ensure unseen-on-disk links have a stamp
+          $script:LinkSeen[$lpid] = $seenAt   # ensure unseen-on-disk links have a stamp
         }
       }
     }
