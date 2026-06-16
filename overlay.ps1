@@ -2683,7 +2683,15 @@ $followTimer.Add_Tick({
 $topmostTimer = New-Object System.Windows.Threading.DispatcherTimer
 $topmostTimer.Interval = [TimeSpan]::FromMilliseconds(500)
 $topmostTimer.Add_Tick({
-  if ($script:overlayHwnd -ne [IntPtr]::Zero) { [WinTools]::ReassertTopmost($script:overlayHwnd) }
+  if ($script:overlayHwnd -eq [IntPtr]::Zero) { return }
+  # Skip the re-assert while the mouse is over the overlay: that's exactly when a row's
+  # hover ToolTip is showing, and the ToolTip renders in its own popup window. Pushing the
+  # overlay back to HWND_TOPMOST would re-stack it above that popup and hide the tooltip.
+  # When the mouse is over the overlay it is already on top (you couldn't hover it otherwise),
+  # so skipping here costs no z-order safety — other apps only grab the top slot when you're
+  # interacting with them, i.e. the mouse is NOT over the overlay.
+  if ($Window.IsMouseOver) { return }
+  [WinTools]::ReassertTopmost($script:overlayHwnd)
 })
 
 # Pin the overlay: always-on-top + pinned/followed across every virtual desktop.
