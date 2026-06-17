@@ -365,7 +365,8 @@ class SessionState {
   # --- Subagent (child row) facts. A child is a Task/Agent spawn nested under its
   #     parent session; it has no pid/session file of its own, so these are filled by
   #     the child constructor below, not the JSON ctor. ---
-  [bool]   $IsChild   = $false
+  [bool]   $IsChild    = $false  # nested under a parent (indented, keyed by agentId)
+  [bool]   $IsSubagent = $false  # display with subagent treatment (tint/label, non-messageable)
   [string] $AgentId   = ''      # unique per subagent → row identity for children
   [string] $AgentType = ''      # e.g. 't1k-debugger' (transcript attributionAgent)
   [string] $Task      = ''      # first line of the spawn prompt
@@ -390,6 +391,16 @@ class SessionState {
     } else {
       $this.Color = $this.Status; $this.StatusText = $this.Status
     }
+
+    # A native session file with no advancing heartbeat (updatedAt at the Unix epoch)
+    # that is also NOT a normal interactive CLI session is a headless/background agent
+    # process, not a real session. Render it top-level but with the subagent treatment.
+    $kind = "$($json.kind)"; $entry = "$($json.entrypoint)"
+    if ($this.UpdatedAt -le 0 -and ($kind -ne 'interactive' -or $entry -ne 'cli')) {
+      $this.IsSubagent = $true
+      $this.Color      = 'child'
+      $this.StatusText = 'subagent'
+    }
   }
 
   # Child (subagent) constructor. Subagents have no pid and no ~/.claude/sessions file;
@@ -398,6 +409,7 @@ class SessionState {
   # is only ever constructed while it is live, so it is always alive/busy.
   SessionState([string]$agentId, [string]$parentSid, [string]$cwd, [string]$agentType, [string]$task, [long]$updatedAt) {
     $this.IsChild    = $true
+    $this.IsSubagent = $true
     $this.AgentId    = $agentId
     $this.SessionId  = $parentSid          # parent linkage (not the child's own id)
     $this.Cwd        = $cwd
@@ -448,6 +460,10 @@ class SessionState {
 
   # Refresh the relative-age snapshot against the current clock (called per tick).
   [void] StampAge([long]$now) {
+    # A zero/absent timestamp would otherwise read as ~20615d (age measured from the Unix
+    # epoch). Show nothing instead — true for a session JSON caught mid-write and for the
+    # epoch headless-agent files flagged as subagents above.
+    if ($this.UpdatedAt -le 0) { $this.AgeText = ''; return }
     $this.AgeText = [SessionState]::FormatAge($now - $this.UpdatedAt)
   }
 
@@ -1452,7 +1468,7 @@ function New-Row {
     $shift = ([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Shift) -ne 0
     # Shift-click opens the prompt composer — but only for real sessions. A subagent can't
     # be messaged, so shift-click on a child row just focuses the parent terminal instead.
-    if ($shift -and -not $t.IsChild) { Show-PromptInput $this; return }
+    if ($shift -and -not $t.IsSubagent) { Show-PromptInput $this; return }
     $ok = Focus-Session $t.Pid $t.Cwd $t.SessionId
     if (-not $ok) { Show-RowFlash $this '#55F56C6C' }   # red: couldn't locate; right-click to link
   })
@@ -1462,7 +1478,7 @@ function New-Row {
   # Keyed by Claude PID so the link survives /clear (which changes sessionId, not the PID).
   $border.Add_MouseRightButtonUp({
     $t = $this.Tag
-    if ($t -and $t.IsChild) { return }   # subagent rows aren't linkable to a terminal
+    if ($t -and $t.IsSubagent) { return }   # subagent rows aren't linkable to a terminal
     if ($t -and $t.Pid) {
       $fg = [WinTools]::GetForegroundWindow()
       if ($fg -ne [IntPtr]::Zero -and $fg -ne $script:overlayHwnd) {
@@ -1675,7 +1691,7 @@ function Set-RowData($e, [SessionState]$s) {
   # Status -> row background tint (replaces the old dot). Carry base/hover on the Tag so
   # the MouseEnter/Leave handlers (and Show-RowFlash) restore the right shade.
   $tint = [SessionState]::Tint($s.Color)
-  $e.Border.Tag = [pscustomobject]@{ Pid = $s.Pid; Cwd = $s.Cwd; SessionId = $s.SessionId; IsChild = $s.IsChild; BaseBg = $tint.base; HoverBg = $tint.hover }
+  $e.Border.Tag = [pscustomobject]@{ Pid = $s.Pid; Cwd = $s.Cwd; SessionId = $s.SessionId; IsSubagent = $s.IsSubagent; BaseBg = $tint.base; HoverBg = $tint.hover }
   $tip = $s.Tip()
   if ($e.Border.ToolTip -ne $tip) { $e.Border.ToolTip = $tip }
 
@@ -1903,8 +1919,8 @@ function Update-List {
     $script:RowMap.Remove($sid)
   }
 
-  $aliveCount = ($rows | Where-Object { $_.IsAlive }).Count
-  $busyCount  = ($rows | Where-Object { $_.IsBusy -and $_.IsAlive }).Count
+  $aliveCount = ($rows | Where-Object { $_.IsAlive -and -not $_.IsSubagent }).Count
+  $busyCount  = ($rows | Where-Object { $_.IsBusy -and $_.IsAlive -and -not $_.IsSubagent }).Count
   $sep = [SessionState]::Sep
   $CountText.Text = "$aliveCount active" +
     $(if ($busyCount)  { " $sep $busyCount busy" } else { '' })
