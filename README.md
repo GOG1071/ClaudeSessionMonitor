@@ -84,6 +84,13 @@ for it. The floating GIF window only appears when the current state has a GIF co
   with a transparent background — the window itself is transparent and always-on-top, and shows
   on every virtual desktop like the main overlay.
 - Per-state GIF paths are saved in `settings.json` alongside width/opacity.
+- **Presets** — both the GIF and Sound dialogs have a **Preset** row at the top to switch whole
+  sets in one pick. Pick a name from the dropdown to load that saved set into the fields; type a
+  name and click **Save** to store the current set under it (saving over an existing name
+  overwrites it); **Delete** removes the named preset. A GIF preset stores the three GIF paths; a
+  Sound preset stores the paths, per-state enables, re-nag settings, and volume. Loading a preset
+  fills the fields — click the dialog's main **Save** to apply it. Presets persist in
+  `settings.json` (`gifPresets` / `sndPresets`).
 
 ## Notes / limitations
 

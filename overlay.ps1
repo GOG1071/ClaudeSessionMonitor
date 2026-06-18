@@ -750,6 +750,10 @@ $script:Gif = @{
   paths   = @{ running = ''; waiting = ''; idle = '' }
   win     = @{ left = 60.0; top = 360.0; width = 200.0; height = 200.0 }
 }
+# Named GIF presets: name -> @{ running; waiting; idle }. Saving the current set of three
+# paths under a name (overwriting any same-named preset) lets the user switch the whole GIF
+# set in one pick. Persisted in settings.json under `gifPresets`.
+$script:GifPresets = @{}
 
 # Per-state sound config. Each path is a user-configured local file (.wav/.mp3/...) or
 # file:// / http(s) URL; an empty path means "no sound for that state". A sound fires
@@ -773,6 +777,10 @@ $script:Snd = @{
     idle    = @{ enabled = $false; interval = 60; max = 0 }
   }
 }
+# Named sound presets: name -> @{ volume; paths; pathEnabled; nag }. Saving the current sound
+# configuration under a name (overwriting any same-named preset) lets the user switch the whole
+# sound set in one pick. Persisted in settings.json under `sndPresets`.
+$script:SndPresets   = @{}
 $script:SndPlayer    = $null          # reused MediaPlayer (created lazily on UI thread)
 # Per-session sound state: a sound fires on each INDIVIDUAL session's transition
 # (running/waiting/idle), not on the aggregated overall state — so a second session going
@@ -831,6 +839,52 @@ if (Test-Path $UISettingsFile) {
         }
       }
     }
+    # GIF presets: a map of name -> { running; waiting; idle } path sets.
+    if ($cfg.gifPresets) {
+      foreach ($pp in $cfg.gifPresets.PSObject.Properties) {
+        $v = $pp.Value
+        $script:GifPresets[$pp.Name] = @{
+          running = [string]$v.running
+          waiting = [string]$v.waiting
+          idle    = [string]$v.idle
+        }
+      }
+    }
+    # Sound presets: a map of name -> full sound config (volume/paths/pathEnabled/nag). Each
+    # field is additive against the same defaults the live $script:Snd uses, so an old preset
+    # missing a newer key still loads cleanly.
+    if ($cfg.sndPresets) {
+      foreach ($pp in $cfg.sndPresets.PSObject.Properties) {
+        $v = $pp.Value
+        $preset = @{
+          volume      = 0.8
+          paths       = @{ running = ''; waiting = ''; idle = '' }
+          pathEnabled = @{ running = $true; waiting = $true; idle = $true }
+          nag         = @{
+            running = @{ enabled = $false; interval = 60; max = 0 }
+            waiting = @{ enabled = $true;  interval = 60; max = 0 }
+            idle    = @{ enabled = $false; interval = 60; max = 0 }
+          }
+        }
+        if ($null -ne $v.volume) { $preset.volume = [Math]::Max(0.0, [Math]::Min(1.0, [double]$v.volume)) }
+        if ($v.paths) {
+          foreach ($k in 'running','waiting','idle') { if ($null -ne $v.paths.$k) { $preset.paths[$k] = [string]$v.paths.$k } }
+        }
+        if ($v.pathEnabled) {
+          foreach ($k in 'running','waiting','idle') { if ($null -ne $v.pathEnabled.$k) { $preset.pathEnabled[$k] = [bool]$v.pathEnabled.$k } }
+        }
+        if ($v.nag) {
+          foreach ($k in 'running','waiting','idle') {
+            if ($v.nag.$k) {
+              if ($null -ne $v.nag.$k.enabled)  { $preset.nag[$k].enabled  = [bool]$v.nag.$k.enabled }
+              if ($null -ne $v.nag.$k.interval) { $preset.nag[$k].interval = [Math]::Max(1, [int]$v.nag.$k.interval) }
+              if ($null -ne $v.nag.$k.max)      { $preset.nag[$k].max      = [Math]::Max(0, [int]$v.nag.$k.max) }
+            }
+          }
+        }
+        $script:SndPresets[$pp.Name] = $preset
+      }
+    }
   } catch {}
 }
 function Save-UISettings {
@@ -852,7 +906,9 @@ function Save-UISettings {
         waiting = [pscustomobject]$script:Snd.nag.waiting
         idle    = [pscustomobject]$script:Snd.nag.idle
       }
-    } | ConvertTo-Json -Depth 5 -Compress | Set-Content -Path $UISettingsFile -Encoding UTF8
+      gifPresets  = $script:GifPresets
+      sndPresets  = $script:SndPresets
+    } | ConvertTo-Json -Depth 8 -Compress | Set-Content -Path $UISettingsFile -Encoding UTF8
   } catch {}
 }
 
@@ -2393,6 +2449,12 @@ function Show-GifSettings {
     <StackPanel>
       <TextBlock Text="Status GIF paths" Foreground="#FFE6A23C" FontFamily="Segoe UI Semibold" FontSize="13" Margin="0,0,0,10"/>
       <CheckBox x:Name="EnabledChk" Content="Show status GIF" Foreground="#FFFFFFFF" Margin="0,0,0,10"/>
+      <TextBlock Text="Preset (pick to load &#xB7; type a name + Save to store)" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
+      <DockPanel Margin="0,2,0,12" LastChildFill="True">
+        <Button x:Name="PresetDelBtn" DockPanel.Dock="Right" Content="Delete" Width="58" Margin="6,0,0,0" ToolTip="Delete the named preset"/>
+        <Button x:Name="PresetSaveBtn" DockPanel.Dock="Right" Content="Save" Width="50" Margin="6,0,0,0" ToolTip="Save current paths as this preset (overwrites a same-named one)"/>
+        <ComboBox x:Name="PresetCombo" IsEditable="True"/>
+      </DockPanel>
       <TextBlock Text="Running (busy)" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
       <TextBox x:Name="RunBox" Margin="0,2,0,8"/>
       <TextBlock Text="Needs input" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
@@ -2416,6 +2478,41 @@ function Show-GifSettings {
   $rb.Text = $script:Gif.paths.running
   $nb.Text = $script:Gif.paths.waiting
   $ib.Text = $script:Gif.paths.idle
+  # Presets: pick from the dropdown to load a saved path set into the three boxes; type a name
+  # and Save to store the current boxes (overwriting a same-named preset); Delete removes it.
+  $pc = $w.FindName('PresetCombo')
+  $refreshGifPresets = {
+    param($select)
+    $pc.Items.Clear()
+    foreach ($n in ($script:GifPresets.Keys | Sort-Object)) { [void]$pc.Items.Add($n) }
+    if ($select) { $pc.SelectedItem = $select } else { $pc.Text = '' }
+  }
+  $applyGifPreset = {
+    param($p)
+    $rb.Text = [string]$p.running
+    $nb.Text = [string]$p.waiting
+    $ib.Text = [string]$p.idle
+  }
+  & $refreshGifPresets ''
+  $pc.Add_SelectionChanged({
+    $sel = $pc.SelectedItem
+    if ($sel -and $script:GifPresets.ContainsKey([string]$sel)) { & $applyGifPreset $script:GifPresets[[string]$sel] }
+  })
+  $w.FindName('PresetSaveBtn').Add_Click({
+    $name = ([string]$pc.Text).Trim()
+    if (-not $name) { return }
+    $script:GifPresets[$name] = @{ running = $rb.Text.Trim(); waiting = $nb.Text.Trim(); idle = $ib.Text.Trim() }
+    Save-UISettings
+    & $refreshGifPresets $name
+  })
+  $w.FindName('PresetDelBtn').Add_Click({
+    $name = ([string]$pc.Text).Trim()
+    if ($name -and $script:GifPresets.ContainsKey($name)) {
+      $script:GifPresets.Remove($name)
+      Save-UISettings
+      & $refreshGifPresets ''
+    }
+  })
   # NOTE: do NOT use .GetNewClosure() on these handlers. GetNewClosure wraps the block
   # in a new module where $script: resolves to that module (so $script:Gif is $null and
   # the handler throws). The dialog is modal, so these plain scriptblocks keep access to
@@ -2461,6 +2558,12 @@ function Show-SoundSettings {
     <StackPanel>
       <TextBlock Text="Status sound paths (.wav / .mp3)" Foreground="#FFE6A23C" FontFamily="Segoe UI Semibold" FontSize="13" Margin="0,0,0,10"/>
       <CheckBox x:Name="SndEnabledChk" Content="Play sound on state change" Foreground="#FFFFFFFF" Margin="0,0,0,10"/>
+      <TextBlock Text="Preset (pick to load &#xB7; type a name + Save to store)" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
+      <DockPanel Margin="0,2,0,12" LastChildFill="True">
+        <Button x:Name="SndPresetDelBtn" DockPanel.Dock="Right" Content="Delete" Width="58" Margin="6,0,0,0" ToolTip="Delete the named preset"/>
+        <Button x:Name="SndPresetSaveBtn" DockPanel.Dock="Right" Content="Save" Width="50" Margin="6,0,0,0" ToolTip="Save current sound config as this preset (overwrites a same-named one)"/>
+        <ComboBox x:Name="SndPresetCombo" IsEditable="True"/>
+      </DockPanel>
       <TextBlock Text="Running (busy)" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
       <DockPanel Margin="0,2,0,2" LastChildFill="True">
         <CheckBox x:Name="SndRunEnChk" DockPanel.Dock="Left" VerticalAlignment="Center" Margin="0,0,8,0" ToolTip="Enable this sound"/>
@@ -2538,6 +2641,59 @@ function Show-SoundSettings {
   $inc.IsChecked = $script:Snd.nag.idle.enabled;    $ini.Text = [string]$script:Snd.nag.idle.interval;    $inm.Text = [string]$script:Snd.nag.idle.max
   $svval.Text = [string][int]([Math]::Round($svol.Value * 100)) + '%'
   $svol.Add_ValueChanged({ $svval.Text = [string][int]([Math]::Round($svol.Value * 100)) + '%' })
+  # Parse nag fields defensively: interval >= 1s, max >= 0 (0 = unlimited); blank/garbage -> fallback.
+  # Defined once here so both preset-save and the main Save reuse it.
+  $parseInt = { param($txt, $cur, $min) $v = 0; if ([int]::TryParse(($txt.Trim()), [ref]$v)) { [Math]::Max($min, $v) } else { $cur } }
+  # Presets: pick from the dropdown to load a whole saved sound config; type a name and Save to
+  # store the current config (overwriting a same-named preset); Delete removes it.
+  $spc = $w.FindName('SndPresetCombo')
+  $refreshSndPresets = {
+    param($select)
+    $spc.Items.Clear()
+    foreach ($n in ($script:SndPresets.Keys | Sort-Object)) { [void]$spc.Items.Add($n) }
+    if ($select) { $spc.SelectedItem = $select } else { $spc.Text = '' }
+  }
+  $applySndPreset = {
+    param($p)
+    if ($null -ne $p.volume) { $svol.Value = [Math]::Max(0.0, [Math]::Min(1.0, [double]$p.volume)) }
+    $srb.Text = [string]$p.paths.running; $snb.Text = [string]$p.paths.waiting; $sib.Text = [string]$p.paths.idle
+    $sre.IsChecked = [bool]$p.pathEnabled.running; $sne.IsChecked = [bool]$p.pathEnabled.waiting; $sie.IsChecked = [bool]$p.pathEnabled.idle
+    $rnc.IsChecked = [bool]$p.nag.running.enabled; $rni.Text = [string]$p.nag.running.interval; $rnm.Text = [string]$p.nag.running.max
+    $nnc.IsChecked = [bool]$p.nag.waiting.enabled; $nni.Text = [string]$p.nag.waiting.interval; $nnm.Text = [string]$p.nag.waiting.max
+    $inc.IsChecked = [bool]$p.nag.idle.enabled;    $ini.Text = [string]$p.nag.idle.interval;    $inm.Text = [string]$p.nag.idle.max
+  }
+  $buildSndPreset = {
+    @{
+      volume      = [Math]::Max(0.0, [Math]::Min(1.0, [double]$svol.Value))
+      paths       = @{ running = $srb.Text.Trim(); waiting = $snb.Text.Trim(); idle = $sib.Text.Trim() }
+      pathEnabled = @{ running = [bool]$sre.IsChecked; waiting = [bool]$sne.IsChecked; idle = [bool]$sie.IsChecked }
+      nag         = @{
+        running = @{ enabled = [bool]$rnc.IsChecked; interval = (& $parseInt $rni.Text 60 1); max = (& $parseInt $rnm.Text 0 0) }
+        waiting = @{ enabled = [bool]$nnc.IsChecked; interval = (& $parseInt $nni.Text 60 1); max = (& $parseInt $nnm.Text 0 0) }
+        idle    = @{ enabled = [bool]$inc.IsChecked; interval = (& $parseInt $ini.Text 60 1); max = (& $parseInt $inm.Text 0 0) }
+      }
+    }
+  }
+  & $refreshSndPresets ''
+  $spc.Add_SelectionChanged({
+    $sel = $spc.SelectedItem
+    if ($sel -and $script:SndPresets.ContainsKey([string]$sel)) { & $applySndPreset $script:SndPresets[[string]$sel] }
+  })
+  $w.FindName('SndPresetSaveBtn').Add_Click({
+    $name = ([string]$spc.Text).Trim()
+    if (-not $name) { return }
+    $script:SndPresets[$name] = & $buildSndPreset
+    Save-UISettings
+    & $refreshSndPresets $name
+  })
+  $w.FindName('SndPresetDelBtn').Add_Click({
+    $name = ([string]$spc.Text).Trim()
+    if ($name -and $script:SndPresets.ContainsKey($name)) {
+      $script:SndPresets.Remove($name)
+      Save-UISettings
+      & $refreshSndPresets ''
+    }
+  })
   # NOTE: do NOT use .GetNewClosure() on these handlers (see Show-GifSettings). The dialog
   # is modal, so these plain scriptblocks keep access to the local controls AND $script:Snd.
   $w.FindName('ResetBtn').Add_Click({
@@ -2565,8 +2721,7 @@ function Show-SoundSettings {
     $script:Snd.pathEnabled.running = [bool]$sre.IsChecked
     $script:Snd.pathEnabled.waiting = [bool]$sne.IsChecked
     $script:Snd.pathEnabled.idle    = [bool]$sie.IsChecked
-    # Parse nag fields defensively: interval >= 1s, max >= 0 (0 = unlimited); blank/garbage -> keep prior.
-    $parseInt = { param($txt, $cur, $min) $v = 0; if ([int]::TryParse(($txt.Trim()), [ref]$v)) { [Math]::Max($min, $v) } else { $cur } }
+    # $parseInt is defined once near the top of this function (shared with preset-save).
     $script:Snd.nag.running.enabled  = [bool]$rnc.IsChecked
     $script:Snd.nag.running.interval = & $parseInt $rni.Text $script:Snd.nag.running.interval 1
     $script:Snd.nag.running.max      = & $parseInt $rnm.Text $script:Snd.nag.running.max 0
