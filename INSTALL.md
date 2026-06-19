@@ -47,13 +47,6 @@ fresh Windows machine.
            ]
          }
        ],
-       "SubagentStop": [
-         {
-           "hooks": [
-             { "type": "command", "command": "node \"C:/Tools/ClaudeSessionMonitor/scripts/session-activity.cjs\" stop" }
-           ]
-         }
-       ],
        "Notification": [
          {
            "hooks": [
@@ -116,7 +109,7 @@ If you are an AI agent setting this up, do exactly this:
    - In `hooks.PreToolUse[].hooks[]` (inside an entry with `"matcher": ".*"`):
      `node "<REPO>/scripts/session-activity.cjs" start`
      `node "<REPO>/scripts/session-attention.cjs" clear`
-   - In `hooks.Stop[].hooks[]` and `hooks.SubagentStop[].hooks[]`:
+   - In `hooks.Stop[].hooks[]`:
      `node "<REPO>/scripts/session-activity.cjs" stop`
    - In `hooks.Notification[].hooks[]`:
      `node "<REPO>/scripts/session-attention.cjs" waiting`
@@ -149,7 +142,7 @@ Claude Code's native `~/.claude/sessions/<pid>.json` only ever reports `busy` or
   session that has a marker, reaping it automatically when the session goes busy or ends.
 - **`session-activity.cjs`** (live activity). The `PreToolUse` hook writes the precise current
   action ("Editing overlay.ps1", "Bash: git status", "Read settings.json") to
-  `~/.claude/session-status/`; `Stop`/`SubagentStop` clear it. The overlay shows this line — in
+  `~/.claude/session-status/`; `Stop` clears it. The overlay shows this line — in
   place of the coarser transcript-derived one — while the session is busy, and reaps stale markers
   the moment a session goes idle or ends.
 - **`session-prompt.cjs`** (last user prompt). The `UserPromptSubmit` hook writes the exact prompt

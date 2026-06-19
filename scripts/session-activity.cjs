@@ -11,7 +11,6 @@
 // Wired into the GLOBAL ~/.claude/settings.json hooks:
 //   PreToolUse    -> node session-activity.cjs start   (a tool is about to run)
 //   Stop          -> node session-activity.cjs stop    (turn finished)
-//   SubagentStop  -> node session-activity.cjs stop    (sub-agent finished)
 //
 // It reads the Claude Code hook payload from stdin (JSON with session_id, cwd,
 // tool_name, tool_input, ...) and writes/removes a marker at
@@ -68,8 +67,6 @@ function describe(tool, input) {
     case 'NotebookEdit': return 'Editing ' + clip(baseName(inp.notebook_path), 48);
     case 'Glob':       return 'Glob ' + clip(inp.pattern, 48);
     case 'Grep':       return 'Grep ' + clip(inp.pattern, 48);
-    case 'Task':
-    case 'Agent':      return 'Agent: ' + clip(inp.description || inp.subagent_type, 56);
     case 'Skill':      return 'Skill ' + clip(inp.skill || inp.command, 48);
     case 'WebFetch':   { try { return 'Fetch ' + clip(new URL(inp.url).host, 48); } catch { return 'WebFetch'; } }
     case 'WebSearch':  return 'Search: ' + clip(inp.query, 56);

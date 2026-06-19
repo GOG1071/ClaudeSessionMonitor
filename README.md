@@ -58,7 +58,7 @@ Startup folder (`shell:startup`).
 | `overlay.ps1` | The overlay (WPF in Windows PowerShell 5.1). |
 | `Start Overlay.vbs` | Launches `overlay.ps1` hidden. |
 | `scripts/session-attention.cjs` | Hook: marks a session **needs-input** (Notification) and clears it (UserPromptSubmit / PreToolUse). |
-| `scripts/session-activity.cjs` | Hook: writes a session's **live activity** line (PreToolUse) and clears it (Stop / SubagentStop). |
+| `scripts/session-activity.cjs` | Hook: writes a session's **live activity** line (PreToolUse) and clears it (Stop). |
 | `settings.json` | Saved width, opacity + status-GIF config (local, git-ignored). |
 | `links.json` | Saved session→window links (local, git-ignored). |
 
