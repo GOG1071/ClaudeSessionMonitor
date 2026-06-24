@@ -4,6 +4,11 @@ All notable changes to the Claude Session Monitor overlay are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.0.9] - 2026-06-24
+
+- Clicking the "update available" indicator now runs `git pull` and relaunches
+  the overlay in place, instead of opening the repo in a browser.
+
 ## [1.0.8] - 2026-06-24
 
 - Merged opacity, GIF, sound, and auto-fit settings into one scrollable popup

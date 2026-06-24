@@ -762,8 +762,8 @@ function Get-ChangelogTip {
 # The repo is private, so an unauthenticated raw.githubusercontent fetch 404s. Instead the
 # latest version is read from the local clone's `origin/main:VERSION` after a background
 # `git fetch` — this reuses the user's existing git auth (SSH/HTTPS) and needs no token.
-# A non-git copy simply fails the lookup and shows no nag. RepoUrl is opened when the user
-# clicks the "update available" indicator.
+# A non-git copy simply fails the lookup and shows no nag. Clicking the "update available"
+# indicator runs `git pull` in RepoDir and relaunches the overlay.
 $script:RepoDir = $PSScriptRoot
 $script:RepoUrl = 'https://github.com/GOG1071/ClaudeSessionMonitor'
 # Cross-thread drop box: the background checker writes 'latest' -> remote version | 'FAILED'.
@@ -1009,8 +1009,30 @@ $Header.Add_MouseLeftButtonDown({
 })
 $CloseBtn.Add_Click({ $Window.Close() })
 
-# Click the "update available" indicator to open the repo (then `git pull` to update).
-$UpdateText.Add_MouseLeftButtonUp({ try { Start-Process $script:RepoUrl } catch {} })
+# Click the "update available" indicator to `git pull` the latest version and relaunch.
+$UpdateText.Add_MouseLeftButtonUp({
+  try {
+    $UpdateText.Text = "$([char]0x2193) updating..."
+    # Pull latest, reusing the user's existing git auth (SSH/HTTPS). ff-only so a dirty
+    # or diverged clone fails loudly instead of creating a merge commit.
+    $git = Start-Process 'git' -ArgumentList 'pull','--ff-only' -WorkingDirectory $script:RepoDir -NoNewWindow -Wait -PassThru
+    if ($git.ExitCode -eq 0) {
+      # Relaunch via the consoleless VBS launcher (falls back to a hidden powershell).
+      # The new instance's single-instance guard kills this one; close explicitly too.
+      $launcher = Join-Path $script:RepoDir 'Start Overlay.vbs'
+      if (Test-Path $launcher) {
+        Start-Process 'wscript.exe' -ArgumentList "`"$launcher`""
+      } else {
+        Start-Process 'powershell.exe' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',"`"$(Join-Path $script:RepoDir 'overlay.ps1')`""
+      }
+      $Window.Close()
+    } else {
+      $UpdateText.Text = "$([char]0x2191) pull failed"
+    }
+  } catch {
+    try { $UpdateText.Text = "$([char]0x2191) pull failed" } catch {}
+  }
+})
 
 # Click-through toggle. While enabled, a fast timer keeps WS_EX_TRANSPARENT on (true
 # cross-app pass-through) EXCEPT while the cursor is over the toggle button, so that one
@@ -2313,7 +2335,7 @@ $script:UpdTimer.Add_Tick({
   }
   if ($latest -and $latest -ne 'FAILED' -and (Test-UpdateAvailable $script:OverlayVersion $latest)) {
     $UpdateText.Text = "$([char]0x2191) v$latest"
-    $UpdateText.ToolTip = "Update available: v$latest (you have v$($script:OverlayVersion)). Click to open the repo, then ``git pull``."
+    $UpdateText.ToolTip = "Update available: v$latest (you have v$($script:OverlayVersion)). Click to ``git pull`` and relaunch."
     $UpdateText.Visibility = 'Visible'
     $clTip = Get-ChangelogTip
     $base  = "Claude Session Monitor $([char]0x00B7) v$($script:OverlayVersion) $([char]0x00B7) update available: v$latest"
