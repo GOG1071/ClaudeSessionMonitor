@@ -755,10 +755,13 @@ if (Test-Path $script:VersionFile) {
     if ($v) { $script:OverlayVersion = $v }
   } catch {}
 }
-# Latest published version is the raw VERSION file on the default branch; RepoUrl is opened
-# when the user clicks the "update available" indicator.
-$script:UpdateUrl = 'https://raw.githubusercontent.com/GOG1071/ClaudeSessionMonitor/main/VERSION'
-$script:RepoUrl   = 'https://github.com/GOG1071/ClaudeSessionMonitor'
+# The repo is private, so an unauthenticated raw.githubusercontent fetch 404s. Instead the
+# latest version is read from the local clone's `origin/main:VERSION` after a background
+# `git fetch` — this reuses the user's existing git auth (SSH/HTTPS) and needs no token.
+# A non-git copy simply fails the lookup and shows no nag. RepoUrl is opened when the user
+# clicks the "update available" indicator.
+$script:RepoDir = $PSScriptRoot
+$script:RepoUrl = 'https://github.com/GOG1071/ClaudeSessionMonitor'
 # Cross-thread drop box: the background checker writes 'latest' -> remote version | 'FAILED'.
 $script:UpdateCheck = [hashtable]::Synchronized(@{})
 
@@ -2240,29 +2243,28 @@ $script:SndDlPs.Runspace = $script:SndDlRunspace
 })
 $script:SndDlHandle = $script:SndDlPs.BeginInvoke()
 
-# One-shot background update check: fetch the latest published VERSION off the UI thread and
+# One-shot background update check: read the latest published VERSION off the UI thread and
 # drop it into $UpdateCheck['latest']. The poll timer below reads it once, updates the header,
 # then stops. Mirrors the GIF/sound downloader plumbing (no WPF touched on this thread).
 $script:UpdRunspace = [runspacefactory]::CreateRunspace()
 $script:UpdRunspace.Open()
 $script:UpdRunspace.SessionStateProxy.SetVariable('result', $script:UpdateCheck)
-$script:UpdRunspace.SessionStateProxy.SetVariable('url', $script:UpdateUrl)
+$script:UpdRunspace.SessionStateProxy.SetVariable('repoDir', $script:RepoDir)
 $script:UpdPs = [powershell]::Create()
 $script:UpdPs.Runspace = $script:UpdRunspace
 [void]$script:UpdPs.AddScript({
+  # Read origin/main:VERSION from the local clone. `git fetch` updates only the
+  # remote-tracking ref (no working-tree changes); GIT_TERMINAL_PROMPT=0 keeps a
+  # missing/expired credential from hanging this background thread on a prompt.
   try {
-    [System.Net.ServicePointManager]::SecurityProtocol =
-      [System.Net.SecurityProtocolType]::Tls12 -bor
-      [System.Net.SecurityProtocolType]::Tls11 -bor
-      [System.Net.SecurityProtocolType]::Tls
-  } catch {}
-  try {
-    $req = [System.Net.HttpWebRequest]::Create($url)
-    $req.Timeout = 15000; $req.ReadWriteTimeout = 15000; $req.UserAgent = 'ClaudeSessionMonitor'
-    $resp = $req.GetResponse()
-    $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
-    $txt = $sr.ReadToEnd(); $sr.Close(); $resp.Close()
-    $result['latest'] = $txt.Trim()
+    $env:GIT_TERMINAL_PROMPT = '0'
+    if (-not $repoDir) { $result['latest'] = 'FAILED'; return }
+    & git -C $repoDir rev-parse --is-inside-work-tree 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { $result['latest'] = 'FAILED'; return }
+    & git -C $repoDir fetch --quiet origin main 2>$null | Out-Null
+    $txt = (& git -C $repoDir show origin/main:VERSION 2>$null | Out-String)
+    if ($LASTEXITCODE -eq 0 -and $txt.Trim()) { $result['latest'] = $txt.Trim() }
+    else { $result['latest'] = 'FAILED' }
   } catch { $result['latest'] = 'FAILED' }
 })
 $script:UpdHandle = $script:UpdPs.BeginInvoke()
