@@ -47,6 +47,20 @@ fresh Windows machine.
            ]
          }
        ],
+       "SubagentStart": [
+         {
+           "hooks": [
+             { "type": "command", "command": "node \"C:/Tools/ClaudeSessionMonitor/scripts/subagent-activity.cjs\" start" }
+           ]
+         }
+       ],
+       "SubagentStop": [
+         {
+           "hooks": [
+             { "type": "command", "command": "node \"C:/Tools/ClaudeSessionMonitor/scripts/subagent-activity.cjs\" stop" }
+           ]
+         }
+       ],
        "Notification": [
          {
            "hooks": [
@@ -98,7 +112,8 @@ If you are an AI agent setting this up, do exactly this:
    Convert backslashes to forward slashes for the JSON commands.
 
 2. Confirm prerequisites: `node --version` succeeds; the paths `<REPO>/scripts/session-attention.cjs`,
-   `<REPO>/scripts/session-activity.cjs`, and `<REPO>/scripts/session-prompt.cjs` exist.
+   `<REPO>/scripts/session-activity.cjs`, `<REPO>/scripts/session-prompt.cjs`, and
+   `<REPO>/scripts/subagent-activity.cjs` exist.
 
 3. Read `%USERPROFILE%\.claude\settings.json` (path: `$env:USERPROFILE\.claude\settings.json`).
    If it does not exist, create it as `{ "hooks": {} }`.
@@ -111,6 +126,10 @@ If you are an AI agent setting this up, do exactly this:
      `node "<REPO>/scripts/session-attention.cjs" clear`
    - In `hooks.Stop[].hooks[]`:
      `node "<REPO>/scripts/session-activity.cjs" stop`
+   - In `hooks.SubagentStart[].hooks[]`:
+     `node "<REPO>/scripts/subagent-activity.cjs" start`
+   - In `hooks.SubagentStop[].hooks[]`:
+     `node "<REPO>/scripts/subagent-activity.cjs" stop`
    - In `hooks.Notification[].hooks[]`:
      `node "<REPO>/scripts/session-attention.cjs" waiting`
    - In `hooks.UserPromptSubmit[].hooks[]`:
@@ -150,8 +169,16 @@ Claude Code's native `~/.claude/sessions/<pid>.json` only ever reports `busy` or
   in place of the lossy transcript tail-parse, which can drop the prompt out of its window on long
   turns. The marker persists for the session (overwritten on each new prompt) and is reaped once the
   native session file is gone.
+- **`subagent-activity.cjs`** (live subagents). Task/Agent subagents have no pid and no native
+  session file, so they're otherwise invisible. The `SubagentStart` hook writes one marker per live
+  spawn under `~/.claude/session-subagents/<parentSessionId>/<agentId>.json` (the parent's session_id
+  is shared with its subagents, so it's the directory key); `SubagentStop` deletes it. The overlay
+  nests each live subagent as a teal child row directly under its parent session, showing the agent
+  type and spawn prompt. A missed `stop` self-heals — the overlay reaps a parent's whole dir when the
+  native session is gone and skips markers older than 30 minutes.
 
-No hooks → the overlay still works, but only shows running/idle with the transcript-derived activity.
+No hooks → the overlay still works, but only shows running/idle with the transcript-derived activity
+and no nested subagents.
 
 ---
 
