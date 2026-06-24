@@ -2609,7 +2609,7 @@ function Show-GifSettings {
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize"
         WindowStartupLocation="CenterScreen">
-  <Border CornerRadius="10" Background="#F2161616" BorderBrush="#33FFFFFF" BorderThickness="1" Padding="14">
+  <Border x:Name="DragRoot" CornerRadius="10" Background="#F2161616" BorderBrush="#33FFFFFF" BorderThickness="1" Padding="14">
     <StackPanel>
       <TextBlock Text="Status GIF paths" Foreground="#FFE6A23C" FontFamily="Segoe UI Semibold" FontSize="13" Margin="0,0,0,10"/>
       <CheckBox x:Name="EnabledChk" Content="Show status GIF" Foreground="#FFFFFFFF" Margin="0,0,0,10"/>
@@ -2636,6 +2636,10 @@ function Show-GifSettings {
 "@
   $r = New-Object System.Xml.XmlNodeReader $sx
   $w = [Windows.Markup.XamlReader]::Load($r)
+  # Borderless window has no title bar -> let the user drag it by the chrome. Interactive
+  # children (TextBox/Button/ComboBox/CheckBox) mark their own clicks handled, so DragMove
+  # only fires on empty background. DragMove must run while the button is down (it is here).
+  $w.FindName('DragRoot').Add_MouseLeftButtonDown({ try { $w.DragMove() } catch {} })
   $en = $w.FindName('EnabledChk')
   $rb = $w.FindName('RunBox'); $nb = $w.FindName('NeedBox'); $ib = $w.FindName('IdleBox')
   $en.IsChecked = $script:Gif.enabled
@@ -2722,7 +2726,7 @@ function Show-SoundSettings {
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize"
         WindowStartupLocation="CenterScreen">
-  <Border CornerRadius="10" Background="#F2161616" BorderBrush="#33FFFFFF" BorderThickness="1" Padding="14">
+  <Border x:Name="DragRoot" CornerRadius="10" Background="#F2161616" BorderBrush="#33FFFFFF" BorderThickness="1" Padding="14">
     <StackPanel>
       <TextBlock Text="Status sound paths (.wav / .mp3)" Foreground="#FFE6A23C" FontFamily="Segoe UI Semibold" FontSize="13" Margin="0,0,0,10"/>
       <CheckBox x:Name="SndEnabledChk" Content="Play sound on state change" Foreground="#FFFFFFFF" Margin="0,0,0,10"/>
@@ -2795,6 +2799,10 @@ function Show-SoundSettings {
 "@
   $r = New-Object System.Xml.XmlNodeReader $sx
   $w = [Windows.Markup.XamlReader]::Load($r)
+  # Borderless window has no title bar -> let the user drag it by the chrome. Interactive
+  # children (TextBox/Button/ComboBox/CheckBox) mark their own clicks handled, so DragMove
+  # only fires on empty background. DragMove must run while the button is down (it is here).
+  $w.FindName('DragRoot').Add_MouseLeftButtonDown({ try { $w.DragMove() } catch {} })
   $sen = $w.FindName('SndEnabledChk')
   $srb = $w.FindName('SndRunBox'); $snb = $w.FindName('SndNeedBox'); $sib = $w.FindName('SndIdleBox')
   $sre = $w.FindName('SndRunEnChk'); $sne = $w.FindName('SndNeedEnChk'); $sie = $w.FindName('SndIdleEnChk')

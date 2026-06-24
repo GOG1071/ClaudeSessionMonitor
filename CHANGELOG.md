@@ -4,6 +4,11 @@ All notable changes to the Claude Session Monitor overlay are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.0.7] - 2026-06-24
+
+- The GIF and sound settings popups can now be dragged around — grab either by
+  its background to move it off-center.
+
 ## [1.0.6] - 2026-06-24
 
 - Hover the version in the header to see the latest changelog entry, sourced
