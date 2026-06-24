@@ -799,7 +799,9 @@ $script:GifPresets = @{}
 # display) — the audio analogue of the status GIF, but evaluated per individual session
 # rather than on the aggregated overall state. Empty default = feature off.
 # nag = per-state re-nag config: while a session stays in a given state, its sound is
-# re-played every `interval` seconds, up to `max` times per entry (max = 0 means forever).
+# re-played every `interval`-`intervalMax` seconds (a fresh random delay is picked in that
+# range before each replay), up to `max` times per entry (max = 0 means forever). When
+# intervalMax <= interval the delay is fixed at `interval` (the pre-range behavior).
 # Default: only `waiting` nags (preserving the prior waiting-only behavior); the others are
 # armed-able but off by default.
 $script:Snd = @{
@@ -810,9 +812,9 @@ $script:Snd = @{
   # Default on, so a configured path keeps playing as before.
   pathEnabled = @{ running = $true; waiting = $true; idle = $true }
   nag     = @{
-    running = @{ enabled = $false; interval = 60; max = 0 }
-    waiting = @{ enabled = $true;  interval = 60; max = 0 }
-    idle    = @{ enabled = $false; interval = 60; max = 0 }
+    running = @{ enabled = $false; interval = 60; intervalMax = 60; max = 0 }
+    waiting = @{ enabled = $true;  interval = 60; intervalMax = 60; max = 0 }
+    idle    = @{ enabled = $false; interval = 60; intervalMax = 60; max = 0 }
   }
 }
 # Named sound presets: name -> @{ volume; paths; pathEnabled; nag }. Saving the current sound
@@ -828,7 +830,8 @@ $script:SndPlayer    = $null          # reused MediaPlayer (created lazily on UI
 $script:SndCurStates     = @{}        # sessionId -> 'running'|'waiting'|'idle' (alive only)
 $script:SndSessionStates = @{}        # sessionId -> last sound-state fired/seen
 # Per-session re-nag bookkeeping: while a session holds a nag-enabled state, its sound is
-# replayed every `interval`s up to `max` times. sessionId -> @{ lastNag = <ms>; count }.
+# replayed after a random delay in [interval, intervalMax]s, up to `max` times.
+# sessionId -> @{ lastNag = <ms>; count; nextDelay = <ms> } (nextDelay re-rolled each replay).
 $script:SndNag = @{}
 # Remote sounds can't be streamed reliably through MediaPlayer (hotlink/UA/TLS), so they
 # are fetched to a temp file off the UI thread (same approach as the GIF downloader) and
@@ -871,9 +874,10 @@ if (Test-Path $UISettingsFile) {
     if ($cfg.sndNag) {
       foreach ($k in 'running','waiting','idle') {
         if ($cfg.sndNag.$k) {
-          if ($null -ne $cfg.sndNag.$k.enabled)  { $script:Snd.nag[$k].enabled  = [bool]$cfg.sndNag.$k.enabled }
-          if ($null -ne $cfg.sndNag.$k.interval) { $script:Snd.nag[$k].interval = [Math]::Max(1, [int]$cfg.sndNag.$k.interval) }
-          if ($null -ne $cfg.sndNag.$k.max)      { $script:Snd.nag[$k].max      = [Math]::Max(0, [int]$cfg.sndNag.$k.max) }
+          if ($null -ne $cfg.sndNag.$k.enabled)     { $script:Snd.nag[$k].enabled     = [bool]$cfg.sndNag.$k.enabled }
+          if ($null -ne $cfg.sndNag.$k.interval)    { $script:Snd.nag[$k].interval    = [Math]::Max(1, [int]$cfg.sndNag.$k.interval) }
+          if ($null -ne $cfg.sndNag.$k.intervalMax) { $script:Snd.nag[$k].intervalMax = [Math]::Max(1, [int]$cfg.sndNag.$k.intervalMax) }
+          if ($null -ne $cfg.sndNag.$k.max)         { $script:Snd.nag[$k].max         = [Math]::Max(0, [int]$cfg.sndNag.$k.max) }
         }
       }
     }
@@ -899,9 +903,9 @@ if (Test-Path $UISettingsFile) {
           paths       = @{ running = ''; waiting = ''; idle = '' }
           pathEnabled = @{ running = $true; waiting = $true; idle = $true }
           nag         = @{
-            running = @{ enabled = $false; interval = 60; max = 0 }
-            waiting = @{ enabled = $true;  interval = 60; max = 0 }
-            idle    = @{ enabled = $false; interval = 60; max = 0 }
+            running = @{ enabled = $false; interval = 60; intervalMax = 60; max = 0 }
+            waiting = @{ enabled = $true;  interval = 60; intervalMax = 60; max = 0 }
+            idle    = @{ enabled = $false; interval = 60; intervalMax = 60; max = 0 }
           }
         }
         if ($null -ne $v.volume) { $preset.volume = [Math]::Max(0.0, [Math]::Min(1.0, [double]$v.volume)) }
@@ -914,9 +918,10 @@ if (Test-Path $UISettingsFile) {
         if ($v.nag) {
           foreach ($k in 'running','waiting','idle') {
             if ($v.nag.$k) {
-              if ($null -ne $v.nag.$k.enabled)  { $preset.nag[$k].enabled  = [bool]$v.nag.$k.enabled }
-              if ($null -ne $v.nag.$k.interval) { $preset.nag[$k].interval = [Math]::Max(1, [int]$v.nag.$k.interval) }
-              if ($null -ne $v.nag.$k.max)      { $preset.nag[$k].max      = [Math]::Max(0, [int]$v.nag.$k.max) }
+              if ($null -ne $v.nag.$k.enabled)     { $preset.nag[$k].enabled     = [bool]$v.nag.$k.enabled }
+              if ($null -ne $v.nag.$k.interval)    { $preset.nag[$k].interval    = [Math]::Max(1, [int]$v.nag.$k.interval) }
+              if ($null -ne $v.nag.$k.intervalMax) { $preset.nag[$k].intervalMax = [Math]::Max(1, [int]$v.nag.$k.intervalMax) }
+              if ($null -ne $v.nag.$k.max)         { $preset.nag[$k].max         = [Math]::Max(0, [int]$v.nag.$k.max) }
             }
           }
         }
@@ -2447,12 +2452,23 @@ function Get-SoundFileSync([string]$path) {
 }
 
 # Reconcile audio with the CURRENT per-session states (rebuilt each tick by Update-List).
+# Pick the next re-nag wait (ms) for a nag entry: a random whole-second delay in
+# [interval, intervalMax]. When intervalMax <= interval the range collapses to a fixed
+# `interval` (the pre-range behavior, and the safe fallback for old configs).
+function Get-NagDelayMs($n) {
+  $min = [Math]::Max(1, [int]$n.interval)
+  $max = if ($null -ne $n.intervalMax) { [int]$n.intervalMax } else { $min }
+  if ($max -le $min) { return $min * 1000 }
+  return (Get-Random -Minimum $min -Maximum ($max + 1)) * 1000   # Maximum is exclusive
+}
+
 # For each alive session, fire its new state's sound exactly once on a transition; a
 # session's first observation is a silent baseline (so launching the overlay, or a new
 # session appearing, doesn't replay a chorus). While a session holds a nag-enabled state,
-# its sound is re-played every `interval`s, up to `max` times per entry (max = 0 = forever);
-# the count resets whenever the session changes state. Driven by the 2s refresh tick, so the
-# nag config is honoured live with no separate timer. Ended sessions drop out of the maps.
+# its sound is re-played after a fresh random delay in [interval, intervalMax]s, up to `max`
+# times per entry (max = 0 = forever); the count resets whenever the session changes state.
+# Driven by the 2s refresh tick, so the nag config is honoured live with no separate timer.
+# Ended sessions drop out of the maps.
 function Update-Sound {
   $cur = $script:SndCurStates
   $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
@@ -2472,15 +2488,18 @@ function Update-Sound {
       continue
     }
 
-    # Same state held: re-nag if this state's nag is armed and not yet exhausted.
+    # Same state held: re-nag if this state's nag is armed and not yet exhausted. The wait
+    # before each replay is a fresh random delay in [interval, intervalMax] (picked lazily,
+    # re-picked after every play), so the chime doesn't fall on a fixed cadence.
     $n = $script:Snd.nag[$state]
     if (-not $n -or -not $n.enabled -or [int]$n.interval -le 0) { continue }
     $info = $script:SndNag[$sid]
-    if (-not $info) { $info = @{ lastNag = $now; count = 0 }; $script:SndNag[$sid] = $info }
+    if (-not $info) { $info = @{ lastNag = $now; count = 0; nextDelay = 0 }; $script:SndNag[$sid] = $info }
+    if ([int]$info.nextDelay -le 0) { $info.nextDelay = Get-NagDelayMs $n }
     if ([int]$n.max -gt 0 -and $info.count -ge [int]$n.max) { continue }
-    if ($now - $info.lastNag -lt [int]$n.interval * 1000) { continue }
+    if ($now - $info.lastNag -lt [int]$info.nextDelay) { continue }
     $file = Resolve-SoundFile (Get-SoundPathForState $state)   # gates enabled + pathEnabled + path
-    if ($file) { Play-SoundFile $file; $info.lastNag = $now; $info.count++ }
+    if ($file) { Play-SoundFile $file; $info.lastNag = $now; $info.count++; $info.nextDelay = Get-NagDelayMs $n }
   }
 
   # Drop bookkeeping for sessions that ended (no longer in the current snapshot).
@@ -2636,7 +2655,9 @@ function Show-SoundSettings {
       <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
         <CheckBox x:Name="SndRunNagChk" Content="Re-nag" Foreground="#FFFFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
         <TextBlock Text="every" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,4,0"/>
-        <TextBox x:Name="SndRunNagInt" Width="46" VerticalAlignment="Center"/>
+        <TextBox x:Name="SndRunNagInt" Width="40" VerticalAlignment="Center" ToolTip="Min seconds between re-nags"/>
+        <TextBlock Text="-" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="3,0,3,0"/>
+        <TextBox x:Name="SndRunNagIntMax" Width="40" VerticalAlignment="Center" ToolTip="Max seconds between re-nags (= min for a fixed interval)"/>
         <TextBlock Text="s," Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="3,0,8,0"/>
         <TextBox x:Name="SndRunNagMax" Width="38" VerticalAlignment="Center"/>
         <TextBlock Text="times (0 = no limit)" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="4,0,0,0"/>
@@ -2649,7 +2670,9 @@ function Show-SoundSettings {
       <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
         <CheckBox x:Name="SndNeedNagChk" Content="Re-nag" Foreground="#FFFFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
         <TextBlock Text="every" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,4,0"/>
-        <TextBox x:Name="SndNeedNagInt" Width="46" VerticalAlignment="Center"/>
+        <TextBox x:Name="SndNeedNagInt" Width="40" VerticalAlignment="Center" ToolTip="Min seconds between re-nags"/>
+        <TextBlock Text="-" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="3,0,3,0"/>
+        <TextBox x:Name="SndNeedNagIntMax" Width="40" VerticalAlignment="Center" ToolTip="Max seconds between re-nags (= min for a fixed interval)"/>
         <TextBlock Text="s," Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="3,0,8,0"/>
         <TextBox x:Name="SndNeedNagMax" Width="38" VerticalAlignment="Center"/>
         <TextBlock Text="times (0 = no limit)" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="4,0,0,0"/>
@@ -2662,7 +2685,9 @@ function Show-SoundSettings {
       <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
         <CheckBox x:Name="SndIdleNagChk" Content="Re-nag" Foreground="#FFFFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
         <TextBlock Text="every" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,4,0"/>
-        <TextBox x:Name="SndIdleNagInt" Width="46" VerticalAlignment="Center"/>
+        <TextBox x:Name="SndIdleNagInt" Width="40" VerticalAlignment="Center" ToolTip="Min seconds between re-nags"/>
+        <TextBlock Text="-" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="3,0,3,0"/>
+        <TextBox x:Name="SndIdleNagIntMax" Width="40" VerticalAlignment="Center" ToolTip="Max seconds between re-nags (= min for a fixed interval)"/>
         <TextBlock Text="s," Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="3,0,8,0"/>
         <TextBox x:Name="SndIdleNagMax" Width="38" VerticalAlignment="Center"/>
         <TextBlock Text="times (0 = no limit)" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="4,0,0,0"/>
@@ -2689,9 +2714,9 @@ function Show-SoundSettings {
   $srb = $w.FindName('SndRunBox'); $snb = $w.FindName('SndNeedBox'); $sib = $w.FindName('SndIdleBox')
   $sre = $w.FindName('SndRunEnChk'); $sne = $w.FindName('SndNeedEnChk'); $sie = $w.FindName('SndIdleEnChk')
   $svol = $w.FindName('SndVolSlider'); $svval = $w.FindName('SndVolVal')
-  $rnc = $w.FindName('SndRunNagChk');  $rni = $w.FindName('SndRunNagInt');  $rnm = $w.FindName('SndRunNagMax')
-  $nnc = $w.FindName('SndNeedNagChk'); $nni = $w.FindName('SndNeedNagInt'); $nnm = $w.FindName('SndNeedNagMax')
-  $inc = $w.FindName('SndIdleNagChk'); $ini = $w.FindName('SndIdleNagInt'); $inm = $w.FindName('SndIdleNagMax')
+  $rnc = $w.FindName('SndRunNagChk');  $rni = $w.FindName('SndRunNagInt');  $rnx = $w.FindName('SndRunNagIntMax');  $rnm = $w.FindName('SndRunNagMax')
+  $nnc = $w.FindName('SndNeedNagChk'); $nni = $w.FindName('SndNeedNagInt'); $nnx = $w.FindName('SndNeedNagIntMax'); $nnm = $w.FindName('SndNeedNagMax')
+  $inc = $w.FindName('SndIdleNagChk'); $ini = $w.FindName('SndIdleNagInt'); $inx = $w.FindName('SndIdleNagIntMax'); $inm = $w.FindName('SndIdleNagMax')
   $sen.IsChecked = $script:Snd.enabled
   $srb.Text = $script:Snd.paths.running
   $snb.Text = $script:Snd.paths.waiting
@@ -2700,9 +2725,9 @@ function Show-SoundSettings {
   $sne.IsChecked = $script:Snd.pathEnabled.waiting
   $sie.IsChecked = $script:Snd.pathEnabled.idle
   $svol.Value = [Math]::Max(0.0, [Math]::Min(1.0, [double]$script:Snd.volume))
-  $rnc.IsChecked = $script:Snd.nag.running.enabled; $rni.Text = [string]$script:Snd.nag.running.interval; $rnm.Text = [string]$script:Snd.nag.running.max
-  $nnc.IsChecked = $script:Snd.nag.waiting.enabled; $nni.Text = [string]$script:Snd.nag.waiting.interval; $nnm.Text = [string]$script:Snd.nag.waiting.max
-  $inc.IsChecked = $script:Snd.nag.idle.enabled;    $ini.Text = [string]$script:Snd.nag.idle.interval;    $inm.Text = [string]$script:Snd.nag.idle.max
+  $rnc.IsChecked = $script:Snd.nag.running.enabled; $rni.Text = [string]$script:Snd.nag.running.interval; $rnx.Text = [string]$script:Snd.nag.running.intervalMax; $rnm.Text = [string]$script:Snd.nag.running.max
+  $nnc.IsChecked = $script:Snd.nag.waiting.enabled; $nni.Text = [string]$script:Snd.nag.waiting.interval; $nnx.Text = [string]$script:Snd.nag.waiting.intervalMax; $nnm.Text = [string]$script:Snd.nag.waiting.max
+  $inc.IsChecked = $script:Snd.nag.idle.enabled;    $ini.Text = [string]$script:Snd.nag.idle.interval;    $inx.Text = [string]$script:Snd.nag.idle.intervalMax;    $inm.Text = [string]$script:Snd.nag.idle.max
   $svval.Text = [string][int]([Math]::Round($svol.Value * 100)) + '%'
   $svol.Add_ValueChanged({ $svval.Text = [string][int]([Math]::Round($svol.Value * 100)) + '%' })
   # Parse nag fields defensively: interval >= 1s, max >= 0 (0 = unlimited); blank/garbage -> fallback.
@@ -2722,9 +2747,9 @@ function Show-SoundSettings {
     if ($null -ne $p.volume) { $svol.Value = [Math]::Max(0.0, [Math]::Min(1.0, [double]$p.volume)) }
     $srb.Text = [string]$p.paths.running; $snb.Text = [string]$p.paths.waiting; $sib.Text = [string]$p.paths.idle
     $sre.IsChecked = [bool]$p.pathEnabled.running; $sne.IsChecked = [bool]$p.pathEnabled.waiting; $sie.IsChecked = [bool]$p.pathEnabled.idle
-    $rnc.IsChecked = [bool]$p.nag.running.enabled; $rni.Text = [string]$p.nag.running.interval; $rnm.Text = [string]$p.nag.running.max
-    $nnc.IsChecked = [bool]$p.nag.waiting.enabled; $nni.Text = [string]$p.nag.waiting.interval; $nnm.Text = [string]$p.nag.waiting.max
-    $inc.IsChecked = [bool]$p.nag.idle.enabled;    $ini.Text = [string]$p.nag.idle.interval;    $inm.Text = [string]$p.nag.idle.max
+    $rnc.IsChecked = [bool]$p.nag.running.enabled; $rni.Text = [string]$p.nag.running.interval; $rnx.Text = [string]$p.nag.running.intervalMax; $rnm.Text = [string]$p.nag.running.max
+    $nnc.IsChecked = [bool]$p.nag.waiting.enabled; $nni.Text = [string]$p.nag.waiting.interval; $nnx.Text = [string]$p.nag.waiting.intervalMax; $nnm.Text = [string]$p.nag.waiting.max
+    $inc.IsChecked = [bool]$p.nag.idle.enabled;    $ini.Text = [string]$p.nag.idle.interval;    $inx.Text = [string]$p.nag.idle.intervalMax;    $inm.Text = [string]$p.nag.idle.max
   }
   $buildSndPreset = {
     @{
@@ -2732,9 +2757,9 @@ function Show-SoundSettings {
       paths       = @{ running = $srb.Text.Trim(); waiting = $snb.Text.Trim(); idle = $sib.Text.Trim() }
       pathEnabled = @{ running = [bool]$sre.IsChecked; waiting = [bool]$sne.IsChecked; idle = [bool]$sie.IsChecked }
       nag         = @{
-        running = @{ enabled = [bool]$rnc.IsChecked; interval = (& $parseInt $rni.Text 60 1); max = (& $parseInt $rnm.Text 0 0) }
-        waiting = @{ enabled = [bool]$nnc.IsChecked; interval = (& $parseInt $nni.Text 60 1); max = (& $parseInt $nnm.Text 0 0) }
-        idle    = @{ enabled = [bool]$inc.IsChecked; interval = (& $parseInt $ini.Text 60 1); max = (& $parseInt $inm.Text 0 0) }
+        running = @{ enabled = [bool]$rnc.IsChecked; interval = (& $parseInt $rni.Text 60 1); intervalMax = (& $parseInt $rnx.Text 60 1); max = (& $parseInt $rnm.Text 0 0) }
+        waiting = @{ enabled = [bool]$nnc.IsChecked; interval = (& $parseInt $nni.Text 60 1); intervalMax = (& $parseInt $nnx.Text 60 1); max = (& $parseInt $nnm.Text 0 0) }
+        idle    = @{ enabled = [bool]$inc.IsChecked; interval = (& $parseInt $ini.Text 60 1); intervalMax = (& $parseInt $inx.Text 60 1); max = (& $parseInt $inm.Text 0 0) }
       }
     }
   }
@@ -2786,15 +2811,18 @@ function Show-SoundSettings {
     $script:Snd.pathEnabled.waiting = [bool]$sne.IsChecked
     $script:Snd.pathEnabled.idle    = [bool]$sie.IsChecked
     # $parseInt is defined once near the top of this function (shared with preset-save).
-    $script:Snd.nag.running.enabled  = [bool]$rnc.IsChecked
-    $script:Snd.nag.running.interval = & $parseInt $rni.Text $script:Snd.nag.running.interval 1
-    $script:Snd.nag.running.max      = & $parseInt $rnm.Text $script:Snd.nag.running.max 0
-    $script:Snd.nag.waiting.enabled  = [bool]$nnc.IsChecked
-    $script:Snd.nag.waiting.interval = & $parseInt $nni.Text $script:Snd.nag.waiting.interval 1
-    $script:Snd.nag.waiting.max      = & $parseInt $nnm.Text $script:Snd.nag.waiting.max 0
-    $script:Snd.nag.idle.enabled     = [bool]$inc.IsChecked
-    $script:Snd.nag.idle.interval    = & $parseInt $ini.Text $script:Snd.nag.idle.interval 1
-    $script:Snd.nag.idle.max         = & $parseInt $inm.Text $script:Snd.nag.idle.max 0
+    $script:Snd.nag.running.enabled     = [bool]$rnc.IsChecked
+    $script:Snd.nag.running.interval    = & $parseInt $rni.Text $script:Snd.nag.running.interval 1
+    $script:Snd.nag.running.intervalMax = & $parseInt $rnx.Text $script:Snd.nag.running.intervalMax 1
+    $script:Snd.nag.running.max         = & $parseInt $rnm.Text $script:Snd.nag.running.max 0
+    $script:Snd.nag.waiting.enabled     = [bool]$nnc.IsChecked
+    $script:Snd.nag.waiting.interval    = & $parseInt $nni.Text $script:Snd.nag.waiting.interval 1
+    $script:Snd.nag.waiting.intervalMax = & $parseInt $nnx.Text $script:Snd.nag.waiting.intervalMax 1
+    $script:Snd.nag.waiting.max         = & $parseInt $nnm.Text $script:Snd.nag.waiting.max 0
+    $script:Snd.nag.idle.enabled        = [bool]$inc.IsChecked
+    $script:Snd.nag.idle.interval       = & $parseInt $ini.Text $script:Snd.nag.idle.interval 1
+    $script:Snd.nag.idle.intervalMax    = & $parseInt $inx.Text $script:Snd.nag.idle.intervalMax 1
+    $script:Snd.nag.idle.max            = & $parseInt $inm.Text $script:Snd.nag.idle.max 0
     Save-UISettings
     Prewarm-Sounds      # fetch any newly-entered remote sounds so the next transition plays
     # Per-session re-nag re-reads $script:Snd.nag live every tick, so changed nag settings
