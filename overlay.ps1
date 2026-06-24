@@ -755,6 +755,35 @@ if (Test-Path $script:VersionFile) {
     if ($v) { $script:OverlayVersion = $v }
   } catch {}
 }
+
+# Changelog. SSOT is CHANGELOG.md (Keep a Changelog format) at the repo root. The version
+# header tooltip shows the most recent entry, so hovering the `v…` reveals what's new.
+$script:ChangelogFile = Join-Path $PSScriptRoot 'CHANGELOG.md'
+# Parse only the top (latest) `## [version] - date` section and reflow its bullets into a
+# single tidy block. Wrapped continuation lines are folded back onto their bullet.
+function Get-ChangelogTip {
+  if (-not (Test-Path $script:ChangelogFile)) { return $null }
+  try {
+    $lines   = Get-Content $script:ChangelogFile -ErrorAction Stop
+    $ver     = $null
+    $bullets = New-Object System.Collections.Generic.List[string]
+    $inSec   = $false
+    foreach ($ln in $lines) {
+      if ($ln -match '^##\s+\[([^\]]+)\]') {
+        if ($inSec) { break }          # hit the next version → latest section is done
+        $ver = $Matches[1]; $inSec = $true; continue
+      }
+      if (-not $inSec) { continue }
+      if ($ln -match '^\s*[-*]\s+') {
+        $bullets.Add(($ln -replace '^\s*[-*]\s+', ([char]0x2022 + ' ')).TrimEnd())
+      } elseif ($ln.Trim() -and $bullets.Count) {
+        $bullets[$bullets.Count - 1] = $bullets[$bullets.Count - 1] + ' ' + $ln.Trim()
+      }
+    }
+    if (-not $ver -or $bullets.Count -eq 0) { return $null }
+    return "What's new in v${ver}:`n" + ($bullets -join "`n")
+  } catch { return $null }
+}
 # The repo is private, so an unauthenticated raw.githubusercontent fetch 404s. Instead the
 # latest version is read from the local clone's `origin/main:VERSION` after a background
 # `git fetch` — this reuses the user's existing git auth (SSH/HTTPS) and needs no token.
@@ -766,7 +795,9 @@ $script:RepoUrl = 'https://github.com/GOG1071/ClaudeSessionMonitor'
 $script:UpdateCheck = [hashtable]::Synchronized(@{})
 
 $VersionText.Text = "v$($script:OverlayVersion)"
-$VersionText.ToolTip = "Claude Session Monitor $([char]0x00B7) v$($script:OverlayVersion)"
+$script:VerTipBase = "Claude Session Monitor $([char]0x00B7) v$($script:OverlayVersion)"
+$clTip = Get-ChangelogTip
+$VersionText.ToolTip = if ($clTip) { "$script:VerTipBase`n`n$clTip" } else { $script:VerTipBase }
 
 # True iff $remote is a strictly-higher dotted version than $local. Anything non-numeric
 # (e.g. 'dev', 'FAILED') parses to nothing and compares false, so a dev checkout never nags.
@@ -2319,7 +2350,9 @@ $script:UpdTimer.Add_Tick({
     $UpdateText.Text = "$([char]0x2191) v$latest"
     $UpdateText.ToolTip = "Update available: v$latest (you have v$($script:OverlayVersion)). Click to open the repo, then ``git pull``."
     $UpdateText.Visibility = 'Visible'
-    $VersionText.ToolTip = "Claude Session Monitor $([char]0x00B7) v$($script:OverlayVersion) $([char]0x00B7) update available: v$latest"
+    $clTip = Get-ChangelogTip
+    $base  = "Claude Session Monitor $([char]0x00B7) v$($script:OverlayVersion) $([char]0x00B7) update available: v$latest"
+    $VersionText.ToolTip = if ($clTip) { "$base`n`n$clTip" } else { $base }
   }
 })
 $script:UpdTimer.Start()
