@@ -2628,7 +2628,11 @@ function Show-GifSettings {
     $rb.Focus() | Out-Null
     [System.Windows.Input.Keyboard]::Focus($rb) | Out-Null
   })
-  [void]$w.ShowDialog()
+  # Suspend the main overlay's HWND_TOPMOST re-assert while this modal is up; otherwise the
+  # 500ms timer keeps re-stacking the overlay above the dialog and hides it. ShowDialog runs
+  # a nested message loop, so the timer keeps ticking and observes this flag during the wait.
+  $script:dialogOpen = $true
+  try { [void]$w.ShowDialog() } finally { $script:dialogOpen = $false }
 }
 
 function Show-SoundSettings {
@@ -2839,7 +2843,11 @@ function Show-SoundSettings {
     $srb.Focus() | Out-Null
     [System.Windows.Input.Keyboard]::Focus($srb) | Out-Null
   })
-  [void]$w.ShowDialog()
+  # Suspend the main overlay's HWND_TOPMOST re-assert while this modal is up; otherwise the
+  # 500ms timer keeps re-stacking the overlay above the dialog and hides it. ShowDialog runs
+  # a nested message loop, so the timer keeps ticking and observes this flag during the wait.
+  $script:dialogOpen = $true
+  try { [void]$w.ShowDialog() } finally { $script:dialogOpen = $false }
 }
 
 $GifBtn.Add_Click({ Show-GifSettings })
@@ -2901,7 +2909,11 @@ function Show-FitSettings {
     } catch {}
     $sl.Focus() | Out-Null
   })
-  [void]$w.ShowDialog()
+  # Suspend the main overlay's HWND_TOPMOST re-assert while this modal is up; otherwise the
+  # 500ms timer keeps re-stacking the overlay above the dialog and hides it. ShowDialog runs
+  # a nested message loop, so the timer keeps ticking and observes this flag during the wait.
+  $script:dialogOpen = $true
+  try { [void]$w.ShowDialog() } finally { $script:dialogOpen = $false }
 }
 
 $FitBtn.Add_Click({ Show-FitSettings })
@@ -2945,6 +2957,7 @@ $followTimer.Add_Tick({
 # virtual desktops but does NOT defend z-order, and WPF's Topmost is silently dropped
 # when a terminal (or any app) grabs the top slot — so without this the overlay falls
 # behind until relaunch. NOACTIVATE means this never steals focus.
+$script:dialogOpen = $false   # true while a modal settings dialog is open (see ShowDialog sites)
 $topmostTimer = New-Object System.Windows.Threading.DispatcherTimer
 $topmostTimer.Interval = [TimeSpan]::FromMilliseconds(500)
 $topmostTimer.Add_Tick({
@@ -2956,6 +2969,13 @@ $topmostTimer.Add_Tick({
   # so skipping here costs no z-order safety — other apps only grab the top slot when you're
   # interacting with them, i.e. the mouse is NOT over the overlay.
   if ($Window.IsMouseOver) { return }
+  # A settings dialog (GIF/sound/fit) is modal and Topmost; re-asserting here would re-stack
+  # the main overlay above it. Skip until it closes.
+  if ($script:dialogOpen) { return }
+  # The opacity slider lives in a drop-down Popup (its own top-level window placed below the
+  # button, so it falls outside $Window bounds and the IsMouseOver guard misses it). Re-asserting
+  # would cover it — skip while it's open.
+  if ($OpacityPopup -and $OpacityPopup.IsOpen) { return }
   [WinTools]::ReassertTopmost($script:overlayHwnd)
 })
 
