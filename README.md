@@ -16,10 +16,17 @@ session globally — across all terminals, projects, and virtual desktops.
   (italic amber) shows the most recent user prompt, and the activity line summarises what
   the session is currently doing. With the **live-activity hook** installed (see
   [INSTALL.md](INSTALL.md)), a busy session shows the precise current action — `Editing
-  overlay.ps1`, `Bash: git status`, `Read settings.json`, `Agent: <task>` — pushed the instant
+  overlay.ps1`, `Bash: git status`, `Read settings.json` — pushed the instant
   each tool runs (`~/.claude/session-status/`). Without the hook it falls back to a coarser
   summary read from the transcript (`~/.claude/projects/<cwd>/<sessionId>.jsonl`). Hover a row
   for the full text plus pid, version, status, and cwd.
+- **Live subagents nested under their parent** — Task/Agent subagents have no pid or session
+  file of their own, so they're normally invisible. With the **subagent hook** installed (see
+  [INSTALL.md](INSTALL.md)), each live subagent appears as a **teal child row** indented directly
+  under the session that spawned it, showing the agent type (e.g. `t1k-debugger`) and its spawn
+  prompt. Driven by Claude Code's `SubagentStart`/`SubagentStop` events (the parent's session id is
+  shared with its subagents, which is what links them) — the row appears the instant the subagent
+  starts and disappears the instant it finishes.
 - **Click to focus** — left-click a row to bring that session's terminal window to the
   foreground. Works reliably across the foreground-lock and minimised windows.
 - **Shift-click to prompt** — Shift+left-click a row to open an inline composer that reads like
@@ -38,6 +45,11 @@ session globally — across all terminals, projects, and virtual desktops.
   current desktop. The choice persists across restarts.
 - **Resizable & adjustable opacity** — drag the right edge to change width; use the
   header slider to change opacity. Both persist across restarts.
+- **Version & update check** — the header shows the overlay's own version (`v1.0.0`, next to
+  the title). On launch it checks GitHub (off the UI thread) for a newer published version and,
+  if one exists, shows an amber **↑ vX.Y.Z** indicator — click it to open the repo, then
+  `git pull` to update. The local version is read from the `VERSION` file; running from a copy
+  without it shows `vdev` and disables the check.
 - **Status GIF** — an optional separate floating window shows a different animated GIF
   depending on the overall Claude state across all sessions: **needs-input** (a session
   waiting for you) takes priority over **running** (any busy session), which takes
@@ -56,9 +68,11 @@ Startup folder (`shell:startup`).
 | File | Purpose |
 |------|---------|
 | `overlay.ps1` | The overlay (WPF in Windows PowerShell 5.1). |
+| `VERSION` | The overlay's version string (single source of truth; checked against GitHub for updates). |
 | `Start Overlay.vbs` | Launches `overlay.ps1` hidden. |
 | `scripts/session-attention.cjs` | Hook: marks a session **needs-input** (Notification) and clears it (UserPromptSubmit / PreToolUse). |
 | `scripts/session-activity.cjs` | Hook: writes a session's **live activity** line (PreToolUse) and clears it (Stop). |
+| `scripts/subagent-activity.cjs` | Hook: writes a **live subagent** marker (SubagentStart) and clears it (SubagentStop), keyed by parent session id. |
 | `settings.json` | Saved width, opacity + status-GIF config (local, git-ignored). |
 | `links.json` | Saved session→window links (local, git-ignored). |
 
