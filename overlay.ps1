@@ -2243,39 +2243,58 @@ $script:SndDlPs.Runspace = $script:SndDlRunspace
 })
 $script:SndDlHandle = $script:SndDlPs.BeginInvoke()
 
-# One-shot background update check: read the latest published VERSION off the UI thread and
-# drop it into $UpdateCheck['latest']. The poll timer below reads it once, updates the header,
-# then stops. Mirrors the GIF/sound downloader plumbing (no WPF touched on this thread).
+# Periodic background update check: every minute, read the latest published VERSION off the
+# UI thread and drop it into $UpdateCheck['latest']. The poll timer reads each result and
+# reflects it in the header. Mirrors the GIF/sound downloader plumbing (no WPF touched on the
+# background thread). A long-lived runspace is reused across checks; one [powershell] runs at
+# a time (overlapping kicks are skipped while a check is still in flight).
 $script:UpdRunspace = [runspacefactory]::CreateRunspace()
 $script:UpdRunspace.Open()
 $script:UpdRunspace.SessionStateProxy.SetVariable('result', $script:UpdateCheck)
 $script:UpdRunspace.SessionStateProxy.SetVariable('repoDir', $script:RepoDir)
-$script:UpdPs = [powershell]::Create()
-$script:UpdPs.Runspace = $script:UpdRunspace
-[void]$script:UpdPs.AddScript({
-  # Read origin/main:VERSION from the local clone. `git fetch` updates only the
-  # remote-tracking ref (no working-tree changes); GIT_TERMINAL_PROMPT=0 keeps a
-  # missing/expired credential from hanging this background thread on a prompt.
-  try {
-    $env:GIT_TERMINAL_PROMPT = '0'
-    if (-not $repoDir) { $result['latest'] = 'FAILED'; return }
-    & git -C $repoDir rev-parse --is-inside-work-tree 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) { $result['latest'] = 'FAILED'; return }
-    & git -C $repoDir fetch --quiet origin main 2>$null | Out-Null
-    $txt = (& git -C $repoDir show origin/main:VERSION 2>$null | Out-String)
-    if ($LASTEXITCODE -eq 0 -and $txt.Trim()) { $result['latest'] = $txt.Trim() }
-    else { $result['latest'] = 'FAILED' }
-  } catch { $result['latest'] = 'FAILED' }
-})
-$script:UpdHandle = $script:UpdPs.BeginInvoke()
+$script:UpdPs     = $null
+$script:UpdHandle = $null
 
-# Read the update-check result once it lands, reflect it in the header, then stop.
+# Kick one background check (no-op if the previous one hasn't finished yet).
+function Start-VersionCheck {
+  if ($script:UpdHandle -and -not $script:UpdHandle.IsCompleted) { return }
+  $script:UpdateCheck.Remove('latest')
+  $script:UpdPs = [powershell]::Create()
+  $script:UpdPs.Runspace = $script:UpdRunspace
+  [void]$script:UpdPs.AddScript({
+    # Read origin/main:VERSION from the local clone. `git fetch` updates only the
+    # remote-tracking ref (no working-tree changes); GIT_TERMINAL_PROMPT=0 keeps a
+    # missing/expired credential from hanging this background thread on a prompt.
+    try {
+      $env:GIT_TERMINAL_PROMPT = '0'
+      if (-not $repoDir) { $result['latest'] = 'FAILED'; return }
+      & git -C $repoDir rev-parse --is-inside-work-tree 2>$null | Out-Null
+      if ($LASTEXITCODE -ne 0) { $result['latest'] = 'FAILED'; return }
+      & git -C $repoDir fetch --quiet origin main 2>$null | Out-Null
+      $txt = (& git -C $repoDir show origin/main:VERSION 2>$null | Out-String)
+      if ($LASTEXITCODE -eq 0 -and $txt.Trim()) { $result['latest'] = $txt.Trim() }
+      else { $result['latest'] = 'FAILED' }
+    } catch { $result['latest'] = 'FAILED' }
+  })
+  $script:UpdHandle = $script:UpdPs.BeginInvoke()
+}
+
+# Read each check result as it lands and reflect it in the header. Positive-only: shows the
+# "update available" indicator when remote is newer; a same/FAILED result leaves the header
+# untouched (no flicker on a transient network failure). Runs continuously — cheap no-op when
+# no result is pending.
 $script:UpdTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:UpdTimer.Interval = [TimeSpan]::FromMilliseconds(700)
+$script:UpdTimer.Interval = [TimeSpan]::FromMilliseconds(1000)
 $script:UpdTimer.Add_Tick({
   if (-not $script:UpdateCheck.ContainsKey('latest')) { return }
-  $script:UpdTimer.Stop()
   $latest = [string]$script:UpdateCheck['latest']
+  $script:UpdateCheck.Remove('latest')
+  # Collect the finished pipeline so the [powershell] instance doesn't leak across checks.
+  if ($script:UpdPs) {
+    try { if ($script:UpdHandle) { [void]$script:UpdPs.EndInvoke($script:UpdHandle) } } catch {}
+    try { $script:UpdPs.Dispose() } catch {}
+    $script:UpdPs = $null; $script:UpdHandle = $null
+  }
   if ($latest -and $latest -ne 'FAILED' -and (Test-UpdateAvailable $script:OverlayVersion $latest)) {
     $UpdateText.Text = "$([char]0x2191) v$latest"
     $UpdateText.ToolTip = "Update available: v$latest (you have v$($script:OverlayVersion)). Click to open the repo, then ``git pull``."
@@ -2284,6 +2303,13 @@ $script:UpdTimer.Add_Tick({
   }
 })
 $script:UpdTimer.Start()
+
+# Re-run the check every minute; fire one immediately at startup.
+$script:UpdIntervalTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:UpdIntervalTimer.Interval = [TimeSpan]::FromMinutes(1)
+$script:UpdIntervalTimer.Add_Tick({ Start-VersionCheck })
+$script:UpdIntervalTimer.Start()
+Start-VersionCheck
 
 # Fast poll so a freshly-downloaded GIF appears promptly (Update-Gif dedups to a cheap
 # no-op when nothing has changed).
@@ -3011,8 +3037,9 @@ $Window.Add_Closed({
   # Stop the background downloader runspace so it doesn't outlive the window.
   try { if ($script:DlPs) { $script:DlPs.Stop(); $script:DlPs.Dispose() } } catch {}
   try { if ($script:DlRunspace) { $script:DlRunspace.Close(); $script:DlRunspace.Dispose() } } catch {}
-  # Stop the one-shot update-check runspace + timer.
+  # Stop the periodic update-check timers + runspace.
   if ($script:UpdTimer) { $script:UpdTimer.Stop() }
+  if ($script:UpdIntervalTimer) { $script:UpdIntervalTimer.Stop() }
   try { if ($script:UpdPs) { $script:UpdPs.Stop(); $script:UpdPs.Dispose() } } catch {}
   try { if ($script:UpdRunspace) { $script:UpdRunspace.Close(); $script:UpdRunspace.Dispose() } } catch {}
   try {
