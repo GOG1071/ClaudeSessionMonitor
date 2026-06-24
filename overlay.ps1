@@ -780,7 +780,7 @@ function Test-UpdateAvailable([string]$local, [string]$remote) {
 
 # Persisted UI settings (width + opacity).
 $UISettingsFile = Join-Path $PSScriptRoot 'settings.json'
-$script:UI = @{ width = 340.0; opacity = 0.95; visibleRows = 3; autoFitCap = 3 }
+$script:UI = @{ width = 340.0; opacity = 0.95; visibleRows = 3; autoFitCap = 3; left = $null; top = $null }
 
 # Per-state GIF config. Each path is user-configured (a local file path, or a
 # file:// / http(s) URL); an empty path means "no GIF for that state". The floating
@@ -847,6 +847,8 @@ if (Test-Path $UISettingsFile) {
     $cfg = Get-Content $UISettingsFile -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($cfg.width)   { $script:UI.width   = [double]$cfg.width }
     if ($cfg.opacity) { $script:UI.opacity = [double]$cfg.opacity }
+    if ($null -ne $cfg.left) { $script:UI.left = [double]$cfg.left }
+    if ($null -ne $cfg.top)  { $script:UI.top  = [double]$cfg.top }
     if ($cfg.visibleRows) { $script:UI.visibleRows = [int]$cfg.visibleRows }
     if ($null -ne $cfg.autoFitCap) { $script:UI.autoFitCap = [int]$cfg.autoFitCap }
     # GIF settings are additive: missing keys fall back to the defaults above.
@@ -937,6 +939,8 @@ function Save-UISettings {
   try {
     [pscustomobject]@{
       width       = $Window.Width
+      left        = $Window.Left
+      top         = $Window.Top
       opacity     = $OpacitySlider.Value
       visibleRows = $script:UI.visibleRows
       autoFitCap  = $script:UI.autoFitCap
@@ -960,6 +964,19 @@ function Save-UISettings {
 
 # Apply saved width + opacity.
 $Window.Width = [Math]::Max(240, [Math]::Min(1000, $script:UI.width))
+# Restore the last dragged position. Fall back to the XAML default (40,40) when unset, and
+# clamp into the current virtual screen so a popup saved on a now-disconnected monitor is
+# still reachable.
+if ($null -ne $script:UI.left -and $null -ne $script:UI.top) {
+  $vsLeft = [System.Windows.SystemParameters]::VirtualScreenLeft
+  $vsTop  = [System.Windows.SystemParameters]::VirtualScreenTop
+  $vsW    = [System.Windows.SystemParameters]::VirtualScreenWidth
+  $vsH    = [System.Windows.SystemParameters]::VirtualScreenHeight
+  $maxL   = $vsLeft + $vsW - 120   # keep at least a sliver on-screen to grab
+  $maxT   = $vsTop  + $vsH - 80
+  $Window.Left = [Math]::Max($vsLeft, [Math]::Min($maxL, [double]$script:UI.left))
+  $Window.Top  = [Math]::Max($vsTop,  [Math]::Min($maxT, [double]$script:UI.top))
+}
 $OpacitySlider.Value = [Math]::Max(0.25, [Math]::Min(1.0, $script:UI.opacity))
 $Window.Opacity = $OpacitySlider.Value
 $Window.Topmost = $true   # always pinned on top from first paint
@@ -980,7 +997,10 @@ $Header.Add_MouseLeftButtonDown({
     if ($el -eq $UpdateText)    { return }   # leave the update indicator clickable
     $el = if ($el -is [System.Windows.DependencyObject]) { [System.Windows.Media.VisualTreeHelper]::GetParent($el) } else { $null }
   }
+  $ol = $Window.Left; $ot = $Window.Top
   $Window.DragMove()
+  # Persist only when the window actually moved, not on a bare click in the header.
+  if ($Window.Left -ne $ol -or $Window.Top -ne $ot) { Save-UISettings }
 })
 $CloseBtn.Add_Click({ $Window.Close() })
 
