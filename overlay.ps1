@@ -648,9 +648,6 @@ function Save-Links {
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
-            <ColumnDefinition Width="Auto"/>
-            <ColumnDefinition Width="Auto"/>
-            <ColumnDefinition Width="Auto"/>
           </Grid.ColumnDefinitions>
           <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="12,0,0,0">
             <TextBlock Text="&#x25CF; Claude Sessions" Foreground="#FFE6A23C"
@@ -661,32 +658,15 @@ function Save-Links {
                        FontFamily="Segoe UI Semibold" FontSize="10" VerticalAlignment="Center"
                        Margin="6,1,0,0" Cursor="Hand" Visibility="Collapsed"/>
           </StackPanel>
-          <Button Grid.Column="1" x:Name="OpacityBtn" Content="&#x25D1;" Width="30" Height="30" Margin="0,0,8,0"
-                  Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
-                  FontSize="13" Cursor="Hand" ToolTip="Window opacity"/>
-          <Popup Grid.Column="1" x:Name="OpacityPopup" PlacementTarget="{Binding ElementName=OpacityBtn}"
-                 Placement="Bottom" StaysOpen="False" AllowsTransparency="True" VerticalOffset="2">
-            <Border CornerRadius="8" Background="#F2161616" BorderBrush="#33FFFFFF" BorderThickness="1" Padding="12,8">
-              <Slider x:Name="OpacitySlider" Minimum="0.25" Maximum="1.0" Value="0.95"
-                      Width="130" VerticalAlignment="Center"
-                      ToolTip="Window opacity" IsMoveToPointEnabled="True"/>
-            </Border>
-          </Popup>
-          <TextBlock Grid.Column="2" x:Name="CountText" Text="" Foreground="#80FFFFFF"
+          <TextBlock Grid.Column="1" x:Name="CountText" Text="" Foreground="#80FFFFFF"
                      FontFamily="Segoe UI" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
-          <Button Grid.Column="3" x:Name="GifBtn" Content="GIF" Width="34" Height="30"
+          <Button Grid.Column="2" x:Name="SettingsBtn" Content="&#x2699;" Width="30" Height="30"
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
-                  FontSize="11" Cursor="Hand" ToolTip="Configure status GIFs"/>
-          <Button Grid.Column="4" x:Name="SndBtn" Content="&#x1F509;" Width="30" Height="30"
-                  Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
-                  FontSize="13" Cursor="Hand" ToolTip="Configure status sounds"/>
-          <Button Grid.Column="5" x:Name="FitBtn" Content="&#x2922;3" Width="34" Height="30"
-                  Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
-                  FontSize="11" Cursor="Hand" ToolTip="Auto-fit cap: max sessions the list auto-grows to fit"/>
-          <Button Grid.Column="6" x:Name="ClickThruBtn" Content="&#x25CE;" Width="30" Height="30"
+                  FontSize="15" Cursor="Hand" ToolTip="Settings: opacity, GIF, sound, auto-fit"/>
+          <Button Grid.Column="3" x:Name="ClickThruBtn" Content="&#x25CE;" Width="30" Height="30"
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
                   FontSize="14" Cursor="Hand" ToolTip="Click-through: OFF (clicks hit the overlay)"/>
-          <Button Grid.Column="7" x:Name="CloseBtn" Content="&#x2715;" Width="30" Height="30"
+          <Button Grid.Column="4" x:Name="CloseBtn" Content="&#x2715;" Width="30" Height="30"
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
                   FontSize="13" Cursor="Hand"/>
         </Grid>
@@ -734,12 +714,7 @@ $ClickThruBtn = $Window.FindName('ClickThruBtn')
 $CountText  = $Window.FindName('CountText')
 $ResizeGrip = $Window.FindName('ResizeGrip')
 $ResizeGripV = $Window.FindName('ResizeGripV')
-$OpacitySlider = $Window.FindName('OpacitySlider')
-$OpacityBtn = $Window.FindName('OpacityBtn')
-$OpacityPopup = $Window.FindName('OpacityPopup')
-$GifBtn     = $Window.FindName('GifBtn')
-$SndBtn     = $Window.FindName('SndBtn')
-$FitBtn     = $Window.FindName('FitBtn')
+$SettingsBtn = $Window.FindName('SettingsBtn')
 $VersionText = $Window.FindName('VersionText')
 $UpdateText  = $Window.FindName('UpdateText')
 
@@ -972,7 +947,7 @@ function Save-UISettings {
       width       = $Window.Width
       left        = $Window.Left
       top         = $Window.Top
-      opacity     = $OpacitySlider.Value
+      opacity     = $script:UI.opacity
       visibleRows = $script:UI.visibleRows
       autoFitCap  = $script:UI.autoFitCap
       gifEnabled  = $script:Gif.enabled
@@ -1008,8 +983,8 @@ if ($null -ne $script:UI.left -and $null -ne $script:UI.top) {
   $Window.Left = [Math]::Max($vsLeft, [Math]::Min($maxL, [double]$script:UI.left))
   $Window.Top  = [Math]::Max($vsTop,  [Math]::Min($maxT, [double]$script:UI.top))
 }
-$OpacitySlider.Value = [Math]::Max(0.25, [Math]::Min(1.0, $script:UI.opacity))
-$Window.Opacity = $OpacitySlider.Value
+$script:UI.opacity = [Math]::Max(0.25, [Math]::Min(1.0, [double]$script:UI.opacity))
+$Window.Opacity = $script:UI.opacity
 $Window.Topmost = $true   # always pinned on top from first paint
 $script:UI.visibleRows = [Math]::Max(1, [Math]::Min(12, [int]$script:UI.visibleRows))
 
@@ -1020,11 +995,10 @@ $script:UI.visibleRows = [Math]::Max(1, [Math]::Min(12, [int]$script:UI.visibleR
 $script:UI.autoFitCap = [Math]::Max(1, [Math]::Min(12, [int]$script:UI.autoFitCap))
 $script:LastSessionCount = -1
 
-# Drag the window from the header — but not when interacting with the opacity slider.
+# Drag the window from the header.
 $Header.Add_MouseLeftButtonDown({
   $el = $_.OriginalSource
   while ($el) {
-    if ($el -eq $OpacitySlider) { return }
     if ($el -eq $UpdateText)    { return }   # leave the update indicator clickable
     $el = if ($el -is [System.Windows.DependencyObject]) { [System.Windows.Media.VisualTreeHelper]::GetParent($el) } else { $null }
   }
@@ -1068,15 +1042,6 @@ $ClickThruBtn.Add_Click({
     $ClickThruBtn.ToolTip = 'Click-through: ON (clicks pass through; click here to restore)'
   }
 })
-
-# Opacity slider -> window opacity.
-$OpacitySlider.Add_ValueChanged({ $Window.Opacity = $_.NewValue })
-$OpacitySlider.Add_PreviewMouseUp({ Save-UISettings })
-
-# Opacity slider is hidden by default; the button drops it down. StaysOpen="False" on the
-# popup auto-hides it on any click outside. Open-only here so the outside-click-then-button
-# sequence (the button click counts as the outside click that closes it) doesn't fight.
-$OpacityBtn.Add_Click({ $OpacityPopup.IsOpen = $true })
 
 # Right-edge grip -> horizontal resize.
 $ResizeGrip.Add_DragDelta({
@@ -2600,54 +2565,204 @@ function Start-StartupSound {
   }
 }
 
-# Lightweight settings dialog: per-state GIF paths + an enable toggle.
-function Show-GifSettings {
+# Unified settings modal: opacity, GIF, sound, and auto-fit cap in one scrollable popup.
+# Replaces the former separate Opacity popup + GIF/Sound/Auto-fit dialogs. Opacity applies
+# live (and autosaves on release, as it always has); GIF/sound/auto-fit are Save-gated.
+function Show-Settings {
   [xml]$sx = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Status GIF" Width="380" SizeToContent="Height"
+        Title="Settings" Width="392" Height="600"
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize"
         WindowStartupLocation="CenterScreen">
+  <Window.Resources>
+    <!-- Same minimal dark scrollbar as the main overlay (thin, rounded, low-contrast). -->
+    <Style x:Key="MinimalDarkScrollBar" TargetType="{x:Type ScrollBar}">
+      <Setter Property="Width" Value="6"/>
+      <Setter Property="MinWidth" Value="6"/>
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="{x:Type ScrollBar}">
+            <Grid Background="Transparent" Width="6">
+              <Track x:Name="PART_Track" IsDirectionReversed="True">
+                <Track.DecreaseRepeatButton>
+                  <RepeatButton Command="{x:Static ScrollBar.PageUpCommand}" Opacity="0" IsHitTestVisible="False"/>
+                </Track.DecreaseRepeatButton>
+                <Track.Thumb>
+                  <Thumb Background="#66000000" BorderThickness="0">
+                    <Thumb.Template>
+                      <ControlTemplate TargetType="{x:Type Thumb}">
+                        <Border Background="{TemplateBinding Background}" CornerRadius="3"/>
+                      </ControlTemplate>
+                    </Thumb.Template>
+                  </Thumb>
+                </Track.Thumb>
+                <Track.IncreaseRepeatButton>
+                  <RepeatButton Command="{x:Static ScrollBar.PageDownCommand}" Opacity="0" IsHitTestVisible="False"/>
+                </Track.IncreaseRepeatButton>
+              </Track>
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
   <Border x:Name="DragRoot" CornerRadius="10" Background="#F2161616" BorderBrush="#33FFFFFF" BorderThickness="1" Padding="14">
-    <StackPanel>
-      <TextBlock Text="Status GIF paths" Foreground="#FFE6A23C" FontFamily="Segoe UI Semibold" FontSize="13" Margin="0,0,0,10"/>
-      <CheckBox x:Name="EnabledChk" Content="Show status GIF" Foreground="#FFFFFFFF" Margin="0,0,0,10"/>
-      <TextBlock Text="Preset (pick to load &#xB7; type a name + Save to store)" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
-      <DockPanel Margin="0,2,0,12" LastChildFill="True">
-        <Button x:Name="PresetDelBtn" DockPanel.Dock="Right" Content="Delete" Width="58" Margin="6,0,0,0" ToolTip="Delete the named preset"/>
-        <Button x:Name="PresetSaveBtn" DockPanel.Dock="Right" Content="Save" Width="50" Margin="6,0,0,0" ToolTip="Save current paths as this preset (overwrites a same-named one)"/>
-        <ComboBox x:Name="PresetCombo" IsEditable="True"/>
-      </DockPanel>
-      <TextBlock Text="Running (busy)" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
-      <TextBox x:Name="RunBox" Margin="0,2,0,8"/>
-      <TextBlock Text="Needs input" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
-      <TextBox x:Name="NeedBox" Margin="0,2,0,8"/>
-      <TextBlock Text="Idle" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
-      <TextBox x:Name="IdleBox" Margin="0,2,0,12"/>
-      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-        <Button x:Name="ResetBtn" Content="Reset" Width="70" Margin="0,0,8,0"/>
+    <DockPanel LastChildFill="True">
+      <TextBlock DockPanel.Dock="Top" Text="Settings" Foreground="#FFE6A23C" FontFamily="Segoe UI Semibold" FontSize="14" Margin="0,0,0,10"/>
+      <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
         <Button x:Name="CancelBtn" Content="Cancel" Width="70" Margin="0,0,8,0"/>
         <Button x:Name="SaveBtn" Content="Save" Width="70"/>
       </StackPanel>
-    </StackPanel>
+      <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" PanningMode="VerticalOnly">
+        <ScrollViewer.Resources>
+          <Style TargetType="{x:Type ScrollBar}" BasedOn="{StaticResource MinimalDarkScrollBar}"/>
+        </ScrollViewer.Resources>
+        <StackPanel Margin="0,0,8,0">
+
+          <!-- Opacity -->
+          <TextBlock Text="Window opacity" Foreground="#FFE6A23C" FontFamily="Segoe UI Semibold" FontSize="13" Margin="0,0,0,6"/>
+          <StackPanel Orientation="Horizontal" Margin="0,0,0,14">
+            <Slider x:Name="OpacitySlider" Minimum="0.25" Maximum="1.0" Width="290" VerticalAlignment="Center"
+                    IsMoveToPointEnabled="True"/>
+            <TextBlock x:Name="OpacityVal" Text="95%" Foreground="#FFFFFFFF" FontFamily="Segoe UI Semibold" FontSize="13" VerticalAlignment="Center" Margin="10,0,0,0" Width="40" TextAlignment="Center"/>
+          </StackPanel>
+
+          <!-- Auto-fit cap -->
+          <TextBlock Text="Auto-fit cap" Foreground="#FFE6A23C" FontFamily="Segoe UI Semibold" FontSize="13" Margin="0,0,0,4"/>
+          <TextBlock Text="The list auto-grows to show every session, but only while the total is at or below this many. Above it, extra rows scroll." Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,8"/>
+          <StackPanel Orientation="Horizontal" Margin="0,0,0,14">
+            <Slider x:Name="CapSlider" Minimum="1" Maximum="12" Width="290" VerticalAlignment="Center"
+                    TickFrequency="1" IsSnapToTickEnabled="True" IsMoveToPointEnabled="True"/>
+            <TextBlock x:Name="CapVal" Text="3" Foreground="#FFFFFFFF" FontFamily="Segoe UI Semibold" FontSize="14" VerticalAlignment="Center" Margin="10,0,0,0" Width="40" TextAlignment="Center"/>
+          </StackPanel>
+
+          <Border Height="1" Background="#22FFFFFF" Margin="0,0,0,14"/>
+
+          <!-- Status GIF -->
+          <TextBlock Text="Status GIF" Foreground="#FFE6A23C" FontFamily="Segoe UI Semibold" FontSize="13" Margin="0,0,0,8"/>
+          <CheckBox x:Name="EnabledChk" Content="Show status GIF" Foreground="#FFFFFFFF" Margin="0,0,0,10"/>
+          <TextBlock Text="Preset (pick to load &#xB7; type a name + Save to store)" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
+          <DockPanel Margin="0,2,0,12" LastChildFill="True">
+            <Button x:Name="PresetDelBtn" DockPanel.Dock="Right" Content="Delete" Width="58" Margin="6,0,0,0" ToolTip="Delete the named preset"/>
+            <Button x:Name="PresetSaveBtn" DockPanel.Dock="Right" Content="Save" Width="50" Margin="6,0,0,0" ToolTip="Save current paths as this preset (overwrites a same-named one)"/>
+            <ComboBox x:Name="PresetCombo" IsEditable="True"/>
+          </DockPanel>
+          <TextBlock Text="Running (busy)" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
+          <TextBox x:Name="RunBox" Margin="0,2,0,8"/>
+          <TextBlock Text="Needs input" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
+          <TextBox x:Name="NeedBox" Margin="0,2,0,8"/>
+          <TextBlock Text="Idle" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
+          <TextBox x:Name="IdleBox" Margin="0,2,0,8"/>
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,0,0,14">
+            <Button x:Name="GifResetBtn" Content="Reset GIFs" Width="90"/>
+          </StackPanel>
+
+          <Border Height="1" Background="#22FFFFFF" Margin="0,0,0,14"/>
+
+          <!-- Status sound -->
+          <TextBlock Text="Status sound (.wav / .mp3)" Foreground="#FFE6A23C" FontFamily="Segoe UI Semibold" FontSize="13" Margin="0,0,0,8"/>
+          <CheckBox x:Name="SndEnabledChk" Content="Play sound on state change" Foreground="#FFFFFFFF" Margin="0,0,0,10"/>
+          <TextBlock Text="Preset (pick to load &#xB7; type a name + Save to store)" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
+          <DockPanel Margin="0,2,0,12" LastChildFill="True">
+            <Button x:Name="SndPresetDelBtn" DockPanel.Dock="Right" Content="Delete" Width="58" Margin="6,0,0,0" ToolTip="Delete the named preset"/>
+            <Button x:Name="SndPresetSaveBtn" DockPanel.Dock="Right" Content="Save" Width="50" Margin="6,0,0,0" ToolTip="Save current sound config as this preset (overwrites a same-named one)"/>
+            <ComboBox x:Name="SndPresetCombo" IsEditable="True"/>
+          </DockPanel>
+          <TextBlock Text="Running (busy)" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
+          <DockPanel Margin="0,2,0,2" LastChildFill="True">
+            <CheckBox x:Name="SndRunEnChk" DockPanel.Dock="Left" VerticalAlignment="Center" Margin="0,0,8,0" ToolTip="Enable this sound"/>
+            <TextBox x:Name="SndRunBox"/>
+          </DockPanel>
+          <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+            <CheckBox x:Name="SndRunNagChk" Content="Re-nag" Foreground="#FFFFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <TextBlock Text="every" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,4,0"/>
+            <TextBox x:Name="SndRunNagInt" Width="40" VerticalAlignment="Center" ToolTip="Min seconds between re-nags"/>
+            <TextBlock Text="-" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="3,0,3,0"/>
+            <TextBox x:Name="SndRunNagIntMax" Width="40" VerticalAlignment="Center" ToolTip="Max seconds between re-nags (= min for a fixed interval)"/>
+            <TextBlock Text="s," Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="3,0,8,0"/>
+            <TextBox x:Name="SndRunNagMax" Width="38" VerticalAlignment="Center"/>
+            <TextBlock Text="times (0 = no limit)" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="4,0,0,0"/>
+          </StackPanel>
+          <TextBlock Text="Needs input" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
+          <DockPanel Margin="0,2,0,2" LastChildFill="True">
+            <CheckBox x:Name="SndNeedEnChk" DockPanel.Dock="Left" VerticalAlignment="Center" Margin="0,0,8,0" ToolTip="Enable this sound"/>
+            <TextBox x:Name="SndNeedBox"/>
+          </DockPanel>
+          <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+            <CheckBox x:Name="SndNeedNagChk" Content="Re-nag" Foreground="#FFFFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <TextBlock Text="every" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,4,0"/>
+            <TextBox x:Name="SndNeedNagInt" Width="40" VerticalAlignment="Center" ToolTip="Min seconds between re-nags"/>
+            <TextBlock Text="-" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="3,0,3,0"/>
+            <TextBox x:Name="SndNeedNagIntMax" Width="40" VerticalAlignment="Center" ToolTip="Max seconds between re-nags (= min for a fixed interval)"/>
+            <TextBlock Text="s," Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="3,0,8,0"/>
+            <TextBox x:Name="SndNeedNagMax" Width="38" VerticalAlignment="Center"/>
+            <TextBlock Text="times (0 = no limit)" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="4,0,0,0"/>
+          </StackPanel>
+          <TextBlock Text="Idle" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
+          <DockPanel Margin="0,2,0,2" LastChildFill="True">
+            <CheckBox x:Name="SndIdleEnChk" DockPanel.Dock="Left" VerticalAlignment="Center" Margin="0,0,8,0" ToolTip="Enable this sound"/>
+            <TextBox x:Name="SndIdleBox"/>
+          </DockPanel>
+          <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+            <CheckBox x:Name="SndIdleNagChk" Content="Re-nag" Foreground="#FFFFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <TextBlock Text="every" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,4,0"/>
+            <TextBox x:Name="SndIdleNagInt" Width="40" VerticalAlignment="Center" ToolTip="Min seconds between re-nags"/>
+            <TextBlock Text="-" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="3,0,3,0"/>
+            <TextBox x:Name="SndIdleNagIntMax" Width="40" VerticalAlignment="Center" ToolTip="Max seconds between re-nags (= min for a fixed interval)"/>
+            <TextBlock Text="s," Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="3,0,8,0"/>
+            <TextBox x:Name="SndIdleNagMax" Width="38" VerticalAlignment="Center"/>
+            <TextBlock Text="times (0 = no limit)" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="4,0,0,0"/>
+          </StackPanel>
+          <TextBlock Text="Volume" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
+          <StackPanel Orientation="Horizontal" Margin="0,2,0,8">
+            <Slider x:Name="SndVolSlider" Minimum="0" Maximum="1" Width="282" VerticalAlignment="Center"
+                    TickFrequency="0.05" IsMoveToPointEnabled="True"/>
+            <TextBlock x:Name="SndVolVal" Text="80%" Foreground="#FFFFFFFF" FontFamily="Segoe UI Semibold" FontSize="13" VerticalAlignment="Center" Margin="10,0,0,0" Width="40" TextAlignment="Center"/>
+          </StackPanel>
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button x:Name="SndTestBtn" Content="Test &#x25B6;" Width="70" Margin="0,0,8,0"/>
+            <Button x:Name="SndResetBtn" Content="Reset sounds" Width="100"/>
+          </StackPanel>
+
+        </StackPanel>
+      </ScrollViewer>
+    </DockPanel>
   </Border>
 </Window>
 "@
   $r = New-Object System.Xml.XmlNodeReader $sx
   $w = [Windows.Markup.XamlReader]::Load($r)
   # Borderless window has no title bar -> let the user drag it by the chrome. Interactive
-  # children (TextBox/Button/ComboBox/CheckBox) mark their own clicks handled, so DragMove
-  # only fires on empty background. DragMove must run while the button is down (it is here).
+  # children mark their own clicks handled, so DragMove only fires on empty background.
   $w.FindName('DragRoot').Add_MouseLeftButtonDown({ try { $w.DragMove() } catch {} })
+
+  # --- Opacity (live preview; autosaves on release, as it always has) -----------------
+  $op = $w.FindName('OpacitySlider'); $opv = $w.FindName('OpacityVal')
+  $op.Value = [Math]::Max(0.25, [Math]::Min(1.0, [double]$script:UI.opacity))
+  $opv.Text = [string][int]([Math]::Round($op.Value * 100)) + '%'
+  $op.Add_ValueChanged({
+    $opv.Text = [string][int]([Math]::Round($op.Value * 100)) + '%'
+    $script:UI.opacity = $op.Value
+    $Window.Opacity = $op.Value
+  })
+  $op.Add_PreviewMouseUp({ Save-UISettings })
+
+  # --- Auto-fit cap (Save-gated) ------------------------------------------------------
+  $cap = $w.FindName('CapSlider'); $capv = $w.FindName('CapVal')
+  $cap.Value = [Math]::Max(1, [Math]::Min(12, [int]$script:UI.autoFitCap))
+  $capv.Text = [string][int]$cap.Value
+  $cap.Add_ValueChanged({ $capv.Text = [string][int]$cap.Value })
+
+  # --- GIF (Save-gated) ---------------------------------------------------------------
   $en = $w.FindName('EnabledChk')
   $rb = $w.FindName('RunBox'); $nb = $w.FindName('NeedBox'); $ib = $w.FindName('IdleBox')
   $en.IsChecked = $script:Gif.enabled
   $rb.Text = $script:Gif.paths.running
   $nb.Text = $script:Gif.paths.waiting
   $ib.Text = $script:Gif.paths.idle
-  # Presets: pick from the dropdown to load a saved path set into the three boxes; type a name
-  # and Save to store the current boxes (overwriting a same-named preset); Delete removes it.
   $pc = $w.FindName('PresetCombo')
   $refreshGifPresets = {
     param($select)
@@ -2681,128 +2796,13 @@ function Show-GifSettings {
       & $refreshGifPresets ''
     }
   })
-  # NOTE: do NOT use .GetNewClosure() on these handlers. GetNewClosure wraps the block
-  # in a new module where $script: resolves to that module (so $script:Gif is $null and
-  # the handler throws). The dialog is modal, so these plain scriptblocks keep access to
-  # the function's local controls AND the real $script:Gif scope.
-  $w.FindName('ResetBtn').Add_Click({ $rb.Text = ''; $nb.Text = ''; $ib.Text = '' })
-  $w.FindName('CancelBtn').Add_Click({ $w.Close() })
-  $w.FindName('SaveBtn').Add_Click({
-    $script:Gif.enabled       = [bool]$en.IsChecked
-    $script:Gif.paths.running = $rb.Text.Trim()
-    $script:Gif.paths.waiting = $nb.Text.Trim()
-    $script:Gif.paths.idle    = $ib.Text.Trim()
-    Save-UISettings
-    # Paths may have changed -> drop stale decodes + downloaded bytes so new paths reload.
-    $script:GifCache.Clear(); $script:GifBytes.Clear(); $script:GifQueued.Clear()
-    $script:GifShownPath = ''
-    Update-Gif $true
-    $w.Close()
-  })
-  # The overlay is a no-activate window, so a modal opened from it gets MOUSE clicks
-  # but not KEYBOARD focus (typed text would go to the terminal). Force this dialog to
-  # the foreground using the same AttachThreadInput trick the overlay uses elsewhere,
-  # then drop the caret into the first field so typing works immediately.
-  $w.Add_Loaded({
-    try {
-      $hh = (New-Object System.Windows.Interop.WindowInteropHelper $w).Handle
-      if ($hh -ne [IntPtr]::Zero) { [WinTools]::Focus($hh) }
-    } catch {}
-    $rb.Focus() | Out-Null
-    [System.Windows.Input.Keyboard]::Focus($rb) | Out-Null
-  })
-  # Suspend the main overlay's HWND_TOPMOST re-assert while this modal is up; otherwise the
-  # 500ms timer keeps re-stacking the overlay above the dialog and hides it. ShowDialog runs
-  # a nested message loop, so the timer keeps ticking and observes this flag during the wait.
-  $script:dialogOpen = $true
-  try { [void]$w.ShowDialog() } finally { $script:dialogOpen = $false }
-}
+  # NOTE: do NOT use .GetNewClosure() on these handlers. GetNewClosure wraps the block in a
+  # new module where $script: resolves to that module (so $script:Gif is $null and the handler
+  # throws). The dialog is modal, so these plain scriptblocks keep access to the function's
+  # local controls AND the real $script: overlay scope.
+  $w.FindName('GifResetBtn').Add_Click({ $rb.Text = ''; $nb.Text = ''; $ib.Text = '' })
 
-function Show-SoundSettings {
-  [xml]$sx = @"
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Status Sound" Width="380" SizeToContent="Height"
-        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
-        Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize"
-        WindowStartupLocation="CenterScreen">
-  <Border x:Name="DragRoot" CornerRadius="10" Background="#F2161616" BorderBrush="#33FFFFFF" BorderThickness="1" Padding="14">
-    <StackPanel>
-      <TextBlock Text="Status sound paths (.wav / .mp3)" Foreground="#FFE6A23C" FontFamily="Segoe UI Semibold" FontSize="13" Margin="0,0,0,10"/>
-      <CheckBox x:Name="SndEnabledChk" Content="Play sound on state change" Foreground="#FFFFFFFF" Margin="0,0,0,10"/>
-      <TextBlock Text="Preset (pick to load &#xB7; type a name + Save to store)" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
-      <DockPanel Margin="0,2,0,12" LastChildFill="True">
-        <Button x:Name="SndPresetDelBtn" DockPanel.Dock="Right" Content="Delete" Width="58" Margin="6,0,0,0" ToolTip="Delete the named preset"/>
-        <Button x:Name="SndPresetSaveBtn" DockPanel.Dock="Right" Content="Save" Width="50" Margin="6,0,0,0" ToolTip="Save current sound config as this preset (overwrites a same-named one)"/>
-        <ComboBox x:Name="SndPresetCombo" IsEditable="True"/>
-      </DockPanel>
-      <TextBlock Text="Running (busy)" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
-      <DockPanel Margin="0,2,0,2" LastChildFill="True">
-        <CheckBox x:Name="SndRunEnChk" DockPanel.Dock="Left" VerticalAlignment="Center" Margin="0,0,8,0" ToolTip="Enable this sound"/>
-        <TextBox x:Name="SndRunBox"/>
-      </DockPanel>
-      <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-        <CheckBox x:Name="SndRunNagChk" Content="Re-nag" Foreground="#FFFFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
-        <TextBlock Text="every" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,4,0"/>
-        <TextBox x:Name="SndRunNagInt" Width="40" VerticalAlignment="Center" ToolTip="Min seconds between re-nags"/>
-        <TextBlock Text="-" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="3,0,3,0"/>
-        <TextBox x:Name="SndRunNagIntMax" Width="40" VerticalAlignment="Center" ToolTip="Max seconds between re-nags (= min for a fixed interval)"/>
-        <TextBlock Text="s," Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="3,0,8,0"/>
-        <TextBox x:Name="SndRunNagMax" Width="38" VerticalAlignment="Center"/>
-        <TextBlock Text="times (0 = no limit)" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="4,0,0,0"/>
-      </StackPanel>
-      <TextBlock Text="Needs input" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
-      <DockPanel Margin="0,2,0,2" LastChildFill="True">
-        <CheckBox x:Name="SndNeedEnChk" DockPanel.Dock="Left" VerticalAlignment="Center" Margin="0,0,8,0" ToolTip="Enable this sound"/>
-        <TextBox x:Name="SndNeedBox"/>
-      </DockPanel>
-      <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-        <CheckBox x:Name="SndNeedNagChk" Content="Re-nag" Foreground="#FFFFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
-        <TextBlock Text="every" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,4,0"/>
-        <TextBox x:Name="SndNeedNagInt" Width="40" VerticalAlignment="Center" ToolTip="Min seconds between re-nags"/>
-        <TextBlock Text="-" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="3,0,3,0"/>
-        <TextBox x:Name="SndNeedNagIntMax" Width="40" VerticalAlignment="Center" ToolTip="Max seconds between re-nags (= min for a fixed interval)"/>
-        <TextBlock Text="s," Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="3,0,8,0"/>
-        <TextBox x:Name="SndNeedNagMax" Width="38" VerticalAlignment="Center"/>
-        <TextBlock Text="times (0 = no limit)" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="4,0,0,0"/>
-      </StackPanel>
-      <TextBlock Text="Idle" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
-      <DockPanel Margin="0,2,0,2" LastChildFill="True">
-        <CheckBox x:Name="SndIdleEnChk" DockPanel.Dock="Left" VerticalAlignment="Center" Margin="0,0,8,0" ToolTip="Enable this sound"/>
-        <TextBox x:Name="SndIdleBox"/>
-      </DockPanel>
-      <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
-        <CheckBox x:Name="SndIdleNagChk" Content="Re-nag" Foreground="#FFFFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
-        <TextBlock Text="every" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="0,0,4,0"/>
-        <TextBox x:Name="SndIdleNagInt" Width="40" VerticalAlignment="Center" ToolTip="Min seconds between re-nags"/>
-        <TextBlock Text="-" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="3,0,3,0"/>
-        <TextBox x:Name="SndIdleNagIntMax" Width="40" VerticalAlignment="Center" ToolTip="Max seconds between re-nags (= min for a fixed interval)"/>
-        <TextBlock Text="s," Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="3,0,8,0"/>
-        <TextBox x:Name="SndIdleNagMax" Width="38" VerticalAlignment="Center"/>
-        <TextBlock Text="times (0 = no limit)" Foreground="#80FFFFFF" FontSize="11" VerticalAlignment="Center" Margin="4,0,0,0"/>
-      </StackPanel>
-      <TextBlock Text="Volume" Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11"/>
-      <StackPanel Orientation="Horizontal" Margin="0,2,0,12">
-        <Slider x:Name="SndVolSlider" Minimum="0" Maximum="1" Width="270" VerticalAlignment="Center"
-                TickFrequency="0.05" IsMoveToPointEnabled="True"/>
-        <TextBlock x:Name="SndVolVal" Text="80%" Foreground="#FFFFFFFF" FontFamily="Segoe UI Semibold" FontSize="13" VerticalAlignment="Center" Margin="10,0,0,0" Width="40" TextAlignment="Center"/>
-      </StackPanel>
-      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-        <Button x:Name="TestBtn" Content="Test ▶" Width="70" Margin="0,0,8,0"/>
-        <Button x:Name="ResetBtn" Content="Reset" Width="70" Margin="0,0,8,0"/>
-        <Button x:Name="CancelBtn" Content="Cancel" Width="70" Margin="0,0,8,0"/>
-        <Button x:Name="SaveBtn" Content="Save" Width="70"/>
-      </StackPanel>
-    </StackPanel>
-  </Border>
-</Window>
-"@
-  $r = New-Object System.Xml.XmlNodeReader $sx
-  $w = [Windows.Markup.XamlReader]::Load($r)
-  # Borderless window has no title bar -> let the user drag it by the chrome. Interactive
-  # children (TextBox/Button/ComboBox/CheckBox) mark their own clicks handled, so DragMove
-  # only fires on empty background. DragMove must run while the button is down (it is here).
-  $w.FindName('DragRoot').Add_MouseLeftButtonDown({ try { $w.DragMove() } catch {} })
+  # --- Sound (Save-gated) -------------------------------------------------------------
   $sen = $w.FindName('SndEnabledChk')
   $srb = $w.FindName('SndRunBox'); $snb = $w.FindName('SndNeedBox'); $sib = $w.FindName('SndIdleBox')
   $sre = $w.FindName('SndRunEnChk'); $sne = $w.FindName('SndNeedEnChk'); $sie = $w.FindName('SndIdleEnChk')
@@ -2824,10 +2824,7 @@ function Show-SoundSettings {
   $svval.Text = [string][int]([Math]::Round($svol.Value * 100)) + '%'
   $svol.Add_ValueChanged({ $svval.Text = [string][int]([Math]::Round($svol.Value * 100)) + '%' })
   # Parse nag fields defensively: interval >= 1s, max >= 0 (0 = unlimited); blank/garbage -> fallback.
-  # Defined once here so both preset-save and the main Save reuse it.
   $parseInt = { param($txt, $cur, $min) $v = 0; if ([int]::TryParse(($txt.Trim()), [ref]$v)) { [Math]::Max($min, $v) } else { $cur } }
-  # Presets: pick from the dropdown to load a whole saved sound config; type a name and Save to
-  # store the current config (overwriting a same-named preset); Delete removes it.
   $spc = $w.FindName('SndPresetCombo')
   $refreshSndPresets = {
     param($select)
@@ -2876,9 +2873,7 @@ function Show-SoundSettings {
       & $refreshSndPresets ''
     }
   })
-  # NOTE: do NOT use .GetNewClosure() on these handlers (see Show-GifSettings). The dialog
-  # is modal, so these plain scriptblocks keep access to the local controls AND $script:Snd.
-  $w.FindName('ResetBtn').Add_Click({
+  $w.FindName('SndResetBtn').Add_Click({
     $srb.Text = ''; $snb.Text = ''; $sib.Text = ''
     $sre.IsChecked = $true; $sne.IsChecked = $true; $sie.IsChecked = $true
     $rnc.IsChecked = $false; $rni.Text = '60'; $rnm.Text = '0'
@@ -2887,14 +2882,25 @@ function Show-SoundSettings {
   })
   # Test plays whichever sound box is filled (running first), resolving the path right now
   # so a freshly-typed URL is fetched and heard without needing to Save or wait.
-  $w.FindName('TestBtn').Add_Click({
+  $w.FindName('SndTestBtn').Add_Click({
     $p = $srb.Text.Trim(); if (-not $p) { $p = $snb.Text.Trim() }; if (-not $p) { $p = $sib.Text.Trim() }
     $script:Snd.volume = [Math]::Max(0.0, [Math]::Min(1.0, [double]$svol.Value))  # Test honors the slider live
     $f = Get-SoundFileSync $p
     if ($f) { Play-SoundFile $f }
   })
+
+  # --- Cancel / Save ------------------------------------------------------------------
   $w.FindName('CancelBtn').Add_Click({ $w.Close() })
   $w.FindName('SaveBtn').Add_Click({
+    # Auto-fit cap.
+    $newCap = [Math]::Max(1, [Math]::Min(12, [int]$cap.Value))
+    $script:UI.autoFitCap = $newCap
+    # GIF.
+    $script:Gif.enabled       = [bool]$en.IsChecked
+    $script:Gif.paths.running = $rb.Text.Trim()
+    $script:Gif.paths.waiting = $nb.Text.Trim()
+    $script:Gif.paths.idle    = $ib.Text.Trim()
+    # Sound.
     $script:Snd.enabled       = [bool]$sen.IsChecked
     $script:Snd.volume        = [Math]::Max(0.0, [Math]::Min(1.0, [double]$svol.Value))
     $script:Snd.paths.running = $srb.Text.Trim()
@@ -2903,7 +2909,6 @@ function Show-SoundSettings {
     $script:Snd.pathEnabled.running = [bool]$sre.IsChecked
     $script:Snd.pathEnabled.waiting = [bool]$sne.IsChecked
     $script:Snd.pathEnabled.idle    = [bool]$sie.IsChecked
-    # $parseInt is defined once near the top of this function (shared with preset-save).
     $script:Snd.nag.running.enabled     = [bool]$rnc.IsChecked
     $script:Snd.nag.running.interval    = & $parseInt $rni.Text $script:Snd.nag.running.interval 1
     $script:Snd.nag.running.intervalMax = & $parseInt $rnx.Text $script:Snd.nag.running.intervalMax 1
@@ -2917,84 +2922,27 @@ function Show-SoundSettings {
     $script:Snd.nag.idle.intervalMax    = & $parseInt $inx.Text $script:Snd.nag.idle.intervalMax 1
     $script:Snd.nag.idle.max            = & $parseInt $inm.Text $script:Snd.nag.idle.max 0
     Save-UISettings
+    # GIF paths may have changed -> drop stale decodes + downloaded bytes so new paths reload.
+    $script:GifCache.Clear(); $script:GifBytes.Clear(); $script:GifQueued.Clear()
+    $script:GifShownPath = ''
+    Update-Gif $true
     Prewarm-Sounds      # fetch any newly-entered remote sounds so the next transition plays
-    # Per-session re-nag re-reads $script:Snd.nag live every tick, so changed nag settings
-    # take effect on the next refresh with no timer to (re)arm here.
-    $w.Close()
-  })
-  $w.Add_Loaded({
-    try {
-      $hh = (New-Object System.Windows.Interop.WindowInteropHelper $w).Handle
-      if ($hh -ne [IntPtr]::Zero) { [WinTools]::Focus($hh) }
-    } catch {}
-    $srb.Focus() | Out-Null
-    [System.Windows.Input.Keyboard]::Focus($srb) | Out-Null
-  })
-  # Suspend the main overlay's HWND_TOPMOST re-assert while this modal is up; otherwise the
-  # 500ms timer keeps re-stacking the overlay above the dialog and hides it. ShowDialog runs
-  # a nested message loop, so the timer keeps ticking and observes this flag during the wait.
-  $script:dialogOpen = $true
-  try { [void]$w.ShowDialog() } finally { $script:dialogOpen = $false }
-}
-
-$GifBtn.Add_Click({ Show-GifSettings })
-$SndBtn.Add_Click({ Show-SoundSettings })
-
-# Reflect the current auto-fit cap on the header button (e.g. "⤢3").
-function Update-FitButton {
-  if ($FitBtn) { $FitBtn.Content = ([char]0x2922).ToString() + [int]$script:UI.autoFitCap }
-}
-
-function Show-FitSettings {
-  [xml]$fx = @"
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Auto-fit" Width="300" SizeToContent="Height"
-        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
-        Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize"
-        WindowStartupLocation="CenterScreen">
-  <Border CornerRadius="10" Background="#F2161616" BorderBrush="#33FFFFFF" BorderThickness="1" Padding="14">
-    <StackPanel>
-      <TextBlock Text="Auto-fit cap" Foreground="#FFE6A23C" FontFamily="Segoe UI Semibold" FontSize="13" Margin="0,0,0,8"/>
-      <TextBlock Text="The list auto-grows to show every session, but only while the total is at or below this many. Above it, extra rows scroll." Foreground="#80FFFFFF" FontFamily="Segoe UI" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,12"/>
-      <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
-        <Slider x:Name="CapSlider" Minimum="1" Maximum="12" Width="200" VerticalAlignment="Center"
-                TickFrequency="1" IsSnapToTickEnabled="True" IsMoveToPointEnabled="True"/>
-        <TextBlock x:Name="CapVal" Text="3" Foreground="#FFFFFFFF" FontFamily="Segoe UI Semibold" FontSize="14" VerticalAlignment="Center" Margin="10,0,0,0" Width="24" TextAlignment="Center"/>
-      </StackPanel>
-      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-        <Button x:Name="CancelBtn" Content="Cancel" Width="70" Margin="0,0,8,0"/>
-        <Button x:Name="SaveBtn" Content="Save" Width="70"/>
-      </StackPanel>
-    </StackPanel>
-  </Border>
-</Window>
-"@
-  $r = New-Object System.Xml.XmlNodeReader $fx
-  $w = [Windows.Markup.XamlReader]::Load($r)
-  $sl = $w.FindName('CapSlider'); $lbl = $w.FindName('CapVal')
-  $sl.Value = [Math]::Max(1, [Math]::Min(12, [int]$script:UI.autoFitCap))
-  $lbl.Text = [string][int]$sl.Value
-  # Plain scriptblocks (no GetNewClosure) so $script: stays the real overlay scope.
-  $sl.Add_ValueChanged({ $lbl.Text = [string][int]$sl.Value })
-  $w.FindName('CancelBtn').Add_Click({ $w.Close() })
-  $w.FindName('SaveBtn').Add_Click({
-    $script:UI.autoFitCap = [Math]::Max(1, [Math]::Min(12, [int]$sl.Value))
-    Save-UISettings
-    Update-FitButton
-    # Apply the new cap immediately (grow-only): fit the current rows if within cap.
-    if ($List.Items.Count -le [int]$script:UI.autoFitCap -and [int]$script:UI.visibleRows -lt $List.Items.Count) {
+    # Apply the new auto-fit cap immediately (grow-only): fit current rows if within cap.
+    if ($List.Items.Count -le $newCap -and [int]$script:UI.visibleRows -lt $List.Items.Count) {
       $script:UI.visibleRows = [int]$List.Items.Count
     }
     Apply-ListSnapHeight
     $w.Close()
   })
+
+  # The overlay is a no-activate window, so a modal opened from it gets MOUSE clicks but not
+  # KEYBOARD focus (typed text would go to the terminal). Force this dialog to the foreground
+  # using the same AttachThreadInput trick the overlay uses elsewhere.
   $w.Add_Loaded({
     try {
       $hh = (New-Object System.Windows.Interop.WindowInteropHelper $w).Handle
       if ($hh -ne [IntPtr]::Zero) { [WinTools]::Focus($hh) }
     } catch {}
-    $sl.Focus() | Out-Null
   })
   # Suspend the main overlay's HWND_TOPMOST re-assert while this modal is up; otherwise the
   # 500ms timer keeps re-stacking the overlay above the dialog and hides it. ShowDialog runs
@@ -3003,8 +2951,7 @@ function Show-FitSettings {
   try { [void]$w.ShowDialog() } finally { $script:dialogOpen = $false }
 }
 
-$FitBtn.Add_Click({ Show-FitSettings })
-Update-FitButton
+$SettingsBtn.Add_Click({ Show-Settings })
 
 # Keep the GIF window on every virtual desktop: pin it (Windows-side) once visible;
 # if pinning is unavailable, fall back to following the active desktop.
@@ -3056,13 +3003,9 @@ $topmostTimer.Add_Tick({
   # so skipping here costs no z-order safety — other apps only grab the top slot when you're
   # interacting with them, i.e. the mouse is NOT over the overlay.
   if ($Window.IsMouseOver) { return }
-  # A settings dialog (GIF/sound/fit) is modal and Topmost; re-asserting here would re-stack
-  # the main overlay above it. Skip until it closes.
+  # The settings modal (opacity/GIF/sound/auto-fit) is Topmost; re-asserting here would
+  # re-stack the main overlay above it. Skip until it closes.
   if ($script:dialogOpen) { return }
-  # The opacity slider lives in a drop-down Popup (its own top-level window placed below the
-  # button, so it falls outside $Window bounds and the IsMouseOver guard misses it). Re-asserting
-  # would cover it — skip while it's open.
-  if ($OpacityPopup -and $OpacityPopup.IsOpen) { return }
   [WinTools]::ReassertTopmost($script:overlayHwnd)
 })
 

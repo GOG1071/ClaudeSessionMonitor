@@ -4,6 +4,12 @@ All notable changes to the Claude Session Monitor overlay are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.0.8] - 2026-06-24
+
+- Merged opacity, GIF, sound, and auto-fit settings into one scrollable popup
+  opened from a single ⚙ gear button, replacing the four separate header
+  buttons. The popup uses the same minimal scrollbar as the main overlay.
+
 ## [1.0.7] - 2026-06-24
 
 - The GIF and sound settings popups can now be dragged around — grab either by
