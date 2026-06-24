@@ -4,12 +4,15 @@ All notable changes to the Claude Session Monitor overlay are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.0.6] - 2026-06-24
+
+- Hover the version in the header to see the latest changelog entry, sourced
+  from this file.
+
 ## [1.0.5] - 2026-06-24
 
 - Remember the overlay popup's last position — it now reopens where you last
   dragged it (clamped onto the current screen if a monitor went away).
-- Hover the version in the header to see the latest changelog entry, sourced
-  from this file.
 
 ## [1.0.4] - 2026-06-24
 
