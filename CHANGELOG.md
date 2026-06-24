@@ -8,7 +8,9 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 - Merged opacity, GIF, sound, and auto-fit settings into one scrollable popup
   opened from a single ⚙ gear button, replacing the four separate header
-  buttons. The popup uses the same minimal scrollbar as the main overlay.
+  buttons. The popup uses the same minimal scrollbar as the main overlay, and
+  its buttons, sliders, text fields, checkboxes, and preset pickers are
+  restyled with rounded corners to match the overlay chrome.
 
 ## [1.0.7] - 2026-06-24
 

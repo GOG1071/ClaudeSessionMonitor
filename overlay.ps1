@@ -2608,6 +2608,172 @@ function Show-Settings {
         </Setter.Value>
       </Setter>
     </Style>
+
+    <!-- Rounded, dark-themed controls so the whole popup matches the overlay chrome. -->
+    <Style TargetType="{x:Type Button}">
+      <Setter Property="Foreground" Value="#FFFFFFFF"/>
+      <Setter Property="Background" Value="#22FFFFFF"/>
+      <Setter Property="BorderBrush" Value="#33FFFFFF"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Height" Value="26"/>
+      <Setter Property="Padding" Value="8,2"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="FontFamily" Value="Segoe UI"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="{x:Type Button}">
+            <Border x:Name="bd" CornerRadius="6" Background="{TemplateBinding Background}"
+                    BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#33FFFFFF"/></Trigger>
+              <Trigger Property="IsPressed" Value="True"><Setter TargetName="bd" Property="Background" Value="#44FFFFFF"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="{x:Type TextBox}">
+      <Setter Property="Foreground" Value="#FFFFFFFF"/>
+      <Setter Property="CaretBrush" Value="#FFFFFFFF"/>
+      <Setter Property="Background" Value="#22000000"/>
+      <Setter Property="BorderBrush" Value="#44FFFFFF"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Padding" Value="5,3"/>
+      <Setter Property="FontFamily" Value="Segoe UI"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="{x:Type TextBox}">
+            <Border CornerRadius="5" Background="{TemplateBinding Background}"
+                    BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}">
+              <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}"/>
+            </Border>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="{x:Type CheckBox}">
+      <Setter Property="Foreground" Value="#FFFFFFFF"/>
+      <Setter Property="FontFamily" Value="Segoe UI"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="{x:Type CheckBox}">
+            <StackPanel Orientation="Horizontal" Background="Transparent">
+              <Border x:Name="box" Width="16" Height="16" CornerRadius="4" VerticalAlignment="Center"
+                      Background="#22000000" BorderBrush="#66FFFFFF" BorderThickness="1">
+                <Path x:Name="check" Data="M3,7 L6,10 L12,3" Stroke="#FFE6A23C" StrokeThickness="2"
+                      StrokeStartLineCap="Round" StrokeEndLineCap="Round" Visibility="Collapsed"/>
+              </Border>
+              <ContentPresenter Margin="6,0,0,0" VerticalAlignment="Center"/>
+            </StackPanel>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="check" Property="Visibility" Value="Visible"/>
+                <Setter TargetName="box" Property="Background" Value="#33E6A23C"/>
+                <Setter TargetName="box" Property="BorderBrush" Value="#AAE6A23C"/>
+              </Trigger>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="box" Property="BorderBrush" Value="#AAFFFFFF"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="{x:Type Slider}">
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="{x:Type Slider}">
+            <Grid VerticalAlignment="Center" MinHeight="18">
+              <Border Height="4" CornerRadius="2" Background="#33FFFFFF" VerticalAlignment="Center"/>
+              <Track x:Name="PART_Track">
+                <Track.DecreaseRepeatButton>
+                  <RepeatButton Command="{x:Static Slider.DecreaseLarge}" Opacity="0" Focusable="False"/>
+                </Track.DecreaseRepeatButton>
+                <Track.IncreaseRepeatButton>
+                  <RepeatButton Command="{x:Static Slider.IncreaseLarge}" Opacity="0" Focusable="False"/>
+                </Track.IncreaseRepeatButton>
+                <Track.Thumb>
+                  <Thumb Width="14" Height="14">
+                    <Thumb.Template>
+                      <ControlTemplate TargetType="{x:Type Thumb}">
+                        <Ellipse x:Name="th" Fill="#FFE6A23C" Stroke="#FFFFFFFF" StrokeThickness="0.5"/>
+                      </ControlTemplate>
+                    </Thumb.Template>
+                  </Thumb>
+                </Track.Thumb>
+              </Track>
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="{x:Type ComboBoxItem}">
+      <Setter Property="Foreground" Value="#FFFFFFFF"/>
+      <Setter Property="Padding" Value="7,4"/>
+      <Setter Property="FontFamily" Value="Segoe UI"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="{x:Type ComboBoxItem}">
+            <Border x:Name="ib" CornerRadius="4" Background="Transparent" Padding="{TemplateBinding Padding}">
+              <ContentPresenter/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="ib" Property="Background" Value="#33FFFFFF"/></Trigger>
+              <Trigger Property="IsHighlighted" Value="True"><Setter TargetName="ib" Property="Background" Value="#33E6A23C"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="{x:Type ComboBox}">
+      <Setter Property="Foreground" Value="#FFFFFFFF"/>
+      <Setter Property="Background" Value="#22000000"/>
+      <Setter Property="BorderBrush" Value="#44FFFFFF"/>
+      <Setter Property="Height" Value="26"/>
+      <Setter Property="FontFamily" Value="Segoe UI"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="{x:Type ComboBox}">
+            <Grid>
+              <Border x:Name="bd" CornerRadius="5" Background="{TemplateBinding Background}"
+                      BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1"/>
+              <ToggleButton Focusable="False" ClickMode="Press" Background="Transparent" BorderThickness="0"
+                            IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
+                <ToggleButton.Template>
+                  <ControlTemplate TargetType="{x:Type ToggleButton}">
+                    <Grid Background="Transparent">
+                      <Path HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,8,0"
+                            Data="M0,0 L4,4 L8,0 Z" Fill="#99FFFFFF"/>
+                    </Grid>
+                  </ControlTemplate>
+                </ToggleButton.Template>
+              </ToggleButton>
+              <TextBox x:Name="PART_EditableTextBox" Style="{x:Null}" Margin="5,0,22,0" VerticalAlignment="Center"
+                       Background="Transparent" Foreground="#FFFFFFFF" CaretBrush="#FFFFFFFF" BorderThickness="0"
+                       IsReadOnly="{TemplateBinding IsReadOnly}"/>
+              <Popup x:Name="PART_Popup" Placement="Bottom" Focusable="False" AllowsTransparency="True"
+                     IsOpen="{TemplateBinding IsDropDownOpen}" PopupAnimation="Slide">
+                <Border CornerRadius="5" Background="#F7161616" BorderBrush="#44FFFFFF" BorderThickness="1"
+                        MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}"
+                        MaxHeight="200" Margin="0,2,0,4">
+                  <ScrollViewer>
+                    <ScrollViewer.Resources>
+                      <Style TargetType="{x:Type ScrollBar}" BasedOn="{StaticResource MinimalDarkScrollBar}"/>
+                    </ScrollViewer.Resources>
+                    <ItemsPresenter/>
+                  </ScrollViewer>
+                </Border>
+              </Popup>
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
   </Window.Resources>
   <Border x:Name="DragRoot" CornerRadius="10" Background="#F2161616" BorderBrush="#33FFFFFF" BorderThickness="1" Padding="14">
     <DockPanel LastChildFill="True">
