@@ -3195,6 +3195,13 @@ $topmostTimer.Add_Tick({
   # re-stack the main overlay above it. Skip until it closes.
   if ($script:dialogOpen) { return }
   [WinTools]::ReassertTopmost($script:overlayHwnd)
+  # The GIF window is a separate Topmost window and suffers the same z-order drop when a
+  # terminal grabs the top slot — defend it here too. Only when visible (no point pushing a
+  # hidden window) and not moused-over (it's already on top then, and we don't want to
+  # interfere while the user drags/resizes it).
+  if ($script:gifHwnd -ne [IntPtr]::Zero -and $script:gifWindow.IsVisible -and -not $script:gifWindow.IsMouseOver) {
+    [WinTools]::ReassertTopmost($script:gifHwnd)
+  }
 })
 
 # Pin the overlay: always-on-top + pinned/followed across every virtual desktop.

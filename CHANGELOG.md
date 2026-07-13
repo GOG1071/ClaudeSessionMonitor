@@ -4,6 +4,13 @@ All notable changes to the Claude Session Monitor overlay are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.0.10] - 2026-07-13
+
+- The GIF window no longer falls behind other windows over time. Its topmost
+  z-order is now re-asserted on the same timer as the main overlay, fixing the
+  case where a terminal grabbing the top slot would silently drop the GIF
+  window's always-on-top state.
+
 ## [1.0.9] - 2026-06-24
 
 - Clicking the "update available" indicator now runs `git pull` and relaunches
