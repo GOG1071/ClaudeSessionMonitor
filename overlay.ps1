@@ -634,7 +634,11 @@ function Save-Links {
       </Setter>
     </Style>
   </Window.Resources>
-  <Border CornerRadius="10" Background="#E6141414" BorderBrush="#33FFFFFF" BorderThickness="1">
+  <!-- Outer host: RootShell holds everything that fades away while click-through is on
+       and the cursor is over the overlay; ClickThruBtn floats above it so the toggle
+       stays visible and clickable even when the shell is fully transparent. -->
+  <Grid>
+  <Border x:Name="RootShell" CornerRadius="10" Background="#E6141414" BorderBrush="#33FFFFFF" BorderThickness="1">
     <Border.Effect>
       <DropShadowEffect BlurRadius="18" ShadowDepth="2" Opacity="0.5" Color="Black"/>
     </Border.Effect>
@@ -663,9 +667,8 @@ function Save-Links {
           <Button Grid.Column="2" x:Name="SettingsBtn" Content="&#x2699;" Width="30" Height="30"
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
                   FontSize="15" Cursor="Hand" ToolTip="Settings: opacity, GIF, sound, auto-fit"/>
-          <Button Grid.Column="3" x:Name="ClickThruBtn" Content="&#x25CE;" Width="30" Height="30"
-                  Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
-                  FontSize="14" Cursor="Hand" ToolTip="Click-through: OFF (clicks hit the overlay)"/>
+          <!-- Reserves the slot; the real button floats outside RootShell (see below). -->
+          <Border Grid.Column="3" Width="30" Background="Transparent"/>
           <Button Grid.Column="4" x:Name="CloseBtn" Content="&#x2715;" Width="30" Height="30"
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
                   FontSize="13" Cursor="Hand"/>
@@ -700,12 +703,20 @@ function Save-Links {
       </Thumb>
     </Grid>
   </Border>
+  <!-- Sits over RootShell's reserved header slot, so it keeps full opacity while the
+       rest of the overlay fades out under the cursor. -->
+  <Button x:Name="ClickThruBtn" Content="&#x25CE;" Width="30" Height="30"
+          HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,3,31,0"
+          Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
+          FontSize="14" Cursor="Hand" ToolTip="Click-through: OFF (clicks hit the overlay)"/>
+  </Grid>
 </Window>
 "@
 
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $Window = [Windows.Markup.XamlReader]::Load($reader)
 
+$RootShell  = $Window.FindName('RootShell')
 $Header     = $Window.FindName('Header')
 $List       = $Window.FindName('List')
 $ScrollHost = $Window.FindName('ScrollHost')
@@ -1036,8 +1047,10 @@ $UpdateText.Add_MouseLeftButtonUp({
 
 # Click-through toggle. While enabled, a fast timer keeps WS_EX_TRANSPARENT on (true
 # cross-app pass-through) EXCEPT while the cursor is over the toggle button, so that one
-# spot stays clickable to restore. Recomputing the button rect each tick keeps it correct
-# as the window moves or the list grows.
+# spot stays clickable to restore. The same tick fades RootShell out entirely whenever the
+# cursor is over the overlay (but not over the button), so the overlay never hides what is
+# underneath while you are working there. Recomputing the rects each tick keeps them
+# correct as the window moves or the list grows.
 $script:CtTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:CtTimer.Interval = [TimeSpan]::FromMilliseconds(25)
 $script:CtTimer.Add_Tick({
@@ -1048,6 +1061,11 @@ $script:CtTimer.Add_Tick({
     $p  = [ClickThrough]::GetCursor()
     $overBtn = ($p.X -ge $tl.X -and $p.X -lt $br.X -and $p.Y -ge $tl.Y -and $p.Y -lt $br.Y)
     [ClickThrough]::SetPassThrough($script:overlayHwnd, (-not $overBtn))
+
+    $wtl = $Window.PointToScreen([System.Windows.Point]::new(0,0))
+    $wbr = $Window.PointToScreen([System.Windows.Point]::new($Window.ActualWidth, $Window.ActualHeight))
+    $overWin = ($p.X -ge $wtl.X -and $p.X -lt $wbr.X -and $p.Y -ge $wtl.Y -and $p.Y -lt $wbr.Y)
+    $RootShell.Opacity = if ($overWin -and -not $overBtn) { 0.0 } else { 1.0 }
   } catch {}
 })
 $ClickThruBtn.Add_Click({
@@ -1055,6 +1073,7 @@ $ClickThruBtn.Add_Click({
     [ClickThrough]::Enabled = $false
     $script:CtTimer.Stop()
     if ($script:overlayHwnd) { [ClickThrough]::SetPassThrough($script:overlayHwnd, $false) }  # restore interaction
+    $RootShell.Opacity = 1.0                                                                  # undo any hover fade
     $ClickThruBtn.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#99FFFFFF')
     $ClickThruBtn.ToolTip = 'Click-through: OFF (clicks hit the overlay)'
   } else {

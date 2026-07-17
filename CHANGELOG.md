@@ -4,6 +4,13 @@ All notable changes to the Claude Session Monitor overlay are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.0.11] - 2026-07-17
+
+- While click-through is on, the overlay now fades out completely whenever the
+  cursor is over it, so it never hides what is underneath while you work there.
+  The click-through toggle button stays visible and clickable throughout, so you
+  can always restore the overlay.
+
 ## [1.0.10] - 2026-07-13
 
 - The GIF window no longer falls behind other windows over time. Its topmost
