@@ -1067,6 +1067,19 @@ $script:CtTimer.Add_Tick({
     $overWin = ($p.X -ge $wtl.X -and $p.X -lt $wbr.X -and $p.Y -ge $wtl.Y -and $p.Y -lt $wbr.Y)
     $RootShell.Opacity = if ($overWin -and -not $overBtn) { 0.0 } else { 1.0 }
   } catch {}
+
+  # The GIF window gets the same treatment: pass clicks through and fade out under the
+  # cursor. It has no toggle of its own, so the whole window fades.
+  try {
+    if ($script:gifWindow.IsVisible -and $script:gifHwnd) {
+      [ClickThrough]::SetPassThrough($script:gifHwnd, $true)
+      $p   = [ClickThrough]::GetCursor()
+      $gtl = $script:gifWindow.PointToScreen([System.Windows.Point]::new(0,0))
+      $gbr = $script:gifWindow.PointToScreen([System.Windows.Point]::new($script:gifWindow.ActualWidth, $script:gifWindow.ActualHeight))
+      $overGif = ($p.X -ge $gtl.X -and $p.X -lt $gbr.X -and $p.Y -ge $gtl.Y -and $p.Y -lt $gbr.Y)
+      $script:gifWindow.Opacity = if ($overGif) { 0.0 } else { 1.0 }
+    }
+  } catch {}
 })
 $ClickThruBtn.Add_Click({
   if ([ClickThrough]::Enabled) {
@@ -1074,6 +1087,8 @@ $ClickThruBtn.Add_Click({
     $script:CtTimer.Stop()
     if ($script:overlayHwnd) { [ClickThrough]::SetPassThrough($script:overlayHwnd, $false) }  # restore interaction
     $RootShell.Opacity = 1.0                                                                  # undo any hover fade
+    if ($script:gifHwnd) { [ClickThrough]::SetPassThrough($script:gifHwnd, $false) }          # GIF draggable again
+    try { $script:gifWindow.Opacity = 1.0 } catch {}
     $ClickThruBtn.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#99FFFFFF')
     $ClickThruBtn.ToolTip = 'Click-through: OFF (clicks hit the overlay)'
   } else {
