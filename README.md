@@ -100,6 +100,12 @@ for it. The floating GIF window only appears when the current state has a GIF co
   fills the fields — click the dialog's main **Save** to apply it. Presets persist in
   `settings.json` (`gifPresets` / `sndPresets`).
 
+## Linux (Bazzite / Steam Deck)
+
+On Linux the monitor is a Decky Loader plugin that shows up in Gaming Mode's
+Quick Access menu, with toasts when an agent needs input or finishes. See
+[`decky/README.md`](decky/README.md). The Windows overlay is unchanged.
+
 ## Requirements
 
 - Windows 10/11 with Windows PowerShell 5.1 (built in).

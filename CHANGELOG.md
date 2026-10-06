@@ -4,6 +4,13 @@ All notable changes to the Claude Session Monitor overlay are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+- **Linux / Bazzite support** as a Decky Loader plugin (`decky/`). It lists
+  herdr agents in the Gaming Mode Quick Access menu, sends a toast when an
+  agent needs input or finishes (with the same 6s debounce as the overlay), and
+  lets you tap an agent to send it a prompt with `herdr agent prompt`.
+
 ## [2.0.0] - 2026-09-07
 
 - **Herdr edition.** The overlay no longer reads `~/.claude/sessions/*.json` or
