@@ -1,0 +1,11 @@
+{
+  "name": "Claude Session Monitor",
+  "author": "GOG1071",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["utility", "notifications"],
+    "description": "Shows the coding agents running in herdr and notifies you when one needs input or finishes.",
+    "image": "https://opengraph.githubassets.com/1/GOG1071/ClaudeSessionMonitor"
+  }
+}

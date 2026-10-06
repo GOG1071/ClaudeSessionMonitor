@@ -1,6 +1,6 @@
-# Claude Sessions Overlay
-# A frameless, always-on-top WPF overlay that shows every running Claude Code
-# session globally by reading ~/.claude/sessions/<pid>.json files.
+# Claude Sessions Overlay (herdr edition)
+# A frameless, always-on-top WPF overlay that shows every AI coding agent running
+# inside Herdr (https://herdr.dev), polled live via `herdr agent list`.
 
 # Single-instance guard (last-one-wins): if a previous overlay is running, kill
 # it so this new instance takes over. We track the live overlay via a PID file.
@@ -345,10 +345,16 @@ class SessionState {
   # --- Raw session facts ---
   [int]    $Pid
   [string] $Cwd
-  [string] $SessionId
-  [string] $Status        # native status, only ever 'busy' | 'idle'
+  [string] $SessionId      # herdr: the pane id (w1:p3) — unique per live agent
+  [string] $Status         # herdr agent_status: 'working' | 'blocked' | 'idle' | 'done' | 'unknown'
   [long]   $UpdatedAt
   [string] $Version
+
+  # --- Herdr-specific facts ---
+  [string] $PaneId         # pane id, also used as the row key + CLI target
+  [string] $AgentKind      # detected agent kind: claude, opencode, codex, ...
+  [string] $Title          # stripped terminal title (the task the agent is on)
+  [long]   $StateChangeSeq # herdr's own change counter → drives the relative-age stamp
 
   # --- Derived lifecycle state ---
   [bool]   $IsAlive
@@ -356,184 +362,106 @@ class SessionState {
   [string] $Color         # row-tint key: 'busy' | 'waiting' | 'stale' | 'idle'
   [string] $StatusText
 
-  # --- Transcript-derived (filled by Enrich) ---
-  [string] $Activity = ''
-  [string] $Prompt   = ''
-  [string] $Model    = ''
-  [long]   $ContextTokens = 0    # current context-window fill = last assistant turn's input+cache tokens
-
-  # --- Subagent (child row) facts. A child is a Task/Agent spawn nested under its
-  #     parent session; it has no pid/session file of its own, so these are filled by
-  #     the child constructor below (from the session-subagents marker), not the JSON ctor. ---
-  [bool]   $IsChild    = $false  # nested under a parent (indented, keyed by agentId)
-  [bool]   $IsSubagent = $false  # display with subagent treatment (tint/label, non-messageable)
-  [string] $AgentId   = ''      # unique per subagent → row identity for children
-  [string] $AgentType = ''      # e.g. 't1k-debugger' (from SubagentStart agent_type)
-  [string] $Task      = ''      # first line of the spawn prompt
+  # --- Derived display fields (from the herdr agent record) ---
+  [string] $Activity = ''   # shown as the row subtitle: terminal title or cwd
+  [string] $Prompt   = ''   # last prompt is not exposed by herdr; kept for hooks compat
 
   # --- Per-tick snapshot (relative-time string is recomputed each refresh) ---
   [string] $AgeText = ''
 
-  # Construct from the parsed session JSON plus the liveness verdict (the alive
-  # set is a script-scope lookup, so the caller resolves it and passes the bool).
-  SessionState([object]$json, [bool]$isAlive) {
-    $this.Pid       = [int]$json.pid
+  # Construct from one `herdr agent list` record plus the overall liveness verdict.
+  # Herdr only lists agents it currently sees in a pane, so every record is alive.
+  SessionState([object]$json) {
+    $this.PaneId    = "$($json.pane_id)"
+    $this.SessionId = $this.PaneId
+    $this.AgentKind = "$($json.agent)"
     $this.Cwd       = "$($json.cwd)"
-    $this.SessionId = "$($json.sessionId)"
-    $this.Status    = "$($json.status)"
-    $this.UpdatedAt = [long]$json.updatedAt
-    $this.Version   = "$($json.version)"
-    $this.IsAlive   = $isAlive
-    $this.IsBusy    = ($this.Status -eq 'busy')
+    $this.Title     = "$($json.terminal_title_stripped)"
+    $this.Status    = "$($json.agent_status)"
+    $this.StateChangeSeq = [long]$json.state_change_seq
 
-    if (-not $isAlive) {
-      $this.Color = 'stale'; $this.StatusText = 'ended'
-    } else {
-      $this.Color = $this.Status; $this.StatusText = $this.Status
+    $this.Pid     = 0        # herdr agents are keyed by pane id, not a Win32 pid
+    $this.UpdatedAt = 0
+    $this.Version = ''
+    $this.IsAlive = $true
+    $this.IsBusy  = ($this.Status -eq 'working')
+
+    $this.Color      = [SessionState]::ColorFor($this.Status)
+    $this.StatusText = [SessionState]::StatusTextFor($this.Status)
+  }
+
+  # herdr agent_status -> row-tint key.
+  static [string] ColorFor([string]$status) {
+    switch ($status) {
+      'working' { return 'busy' }
+      'blocked' { return 'waiting' }
+      'done'    { return 'done' }
+      'idle'    { return 'idle' }
+      default   { return 'idle' }   # 'unknown' and anything else
     }
+    return 'idle'
   }
 
-  # Child (subagent) constructor. Subagents have no pid and no ~/.claude/sessions file;
-  # they are discovered from the parent's session-subagents marker dir (Get-LiveSubagents),
-  # so the parent supplies cwd + sessionId and the marker supplies the rest. A child is
-  # only ever constructed while its marker is live, so it is always alive/busy.
-  SessionState([string]$agentId, [string]$parentSid, [string]$cwd, [string]$agentType, [string]$task, [long]$updatedAt) {
-    $this.IsChild    = $true
-    $this.IsSubagent = $true
-    $this.AgentId    = $agentId
-    $this.SessionId  = $parentSid          # parent linkage (not the child's own id)
-    $this.Cwd        = $cwd
-    $this.AgentType  = if ($agentType) { $agentType } else { 'subagent' }
-    $this.Task       = $task
-    $this.UpdatedAt  = $updatedAt
-    $this.IsAlive    = $true
-    $this.IsBusy     = $true
-    $this.Color      = 'child'
-    $this.StatusText = 'subagent'
+  # herdr agent_status -> human label.
+  static [string] StatusTextFor([string]$status) {
+    switch ($status) {
+      'working' { return 'working' }
+      'blocked' { return 'needs input' }
+      'done'    { return 'done' }
+      'idle'    { return 'idle' }
+      default   { return 'unknown' }
+    }
+    return 'unknown'
   }
 
-  # Row identity: children key on their unique agentId, parents on their sessionId.
-  # (Agent ids are dash-free hex, session ids are UUIDs — they never collide.)
+  # Row identity: the herdr pane id (unique while the agent lives).
   [string] RowKey() {
-    if ($this.IsChild) { return $this.AgentId }
-    return $this.SessionId
-  }
-
-  # Promote an alive, non-busy session to the waiting state. The attention-marker
-  # file check is script-scope IO; the model only owns the resulting label.
-  [void] MarkWaiting() {
-    $this.Color = 'waiting'; $this.StatusText = 'needs input'
-  }
-
-  # Push transcript-derived fields in (computed by Get-SessionActivity).
-  [void] Enrich([object]$activity) {
-    if (-not $activity) { return }
-    $this.Activity      = "$($activity.activity)"
-    $this.Prompt        = "$($activity.prompt)"
-    $this.Model         = "$($activity.model)"
-    $this.ContextTokens = [long]$activity.context
-  }
-
-  # Override the activity line with the live hook signal (session-activity.cjs),
-  # which carries the precise current tool + target. Wins over the transcript-derived
-  # Activity because it is both fresher and more specific. Empty input is a no-op.
-  [void] SetActivity([string]$a) {
-    if ($a) { $this.Activity = $a }
-  }
-
-  # Override the prompt with the live hook signal (session-prompt.cjs), which captures
-  # the exact prompt at submit time. Wins over the transcript-derived Prompt because it
-  # is both verbatim and not subject to the tail-window loss. Empty input is a no-op.
-  [void] SetPrompt([string]$p) {
-    if ($p) { $this.Prompt = $p }
+    return $this.PaneId
   }
 
   # Refresh the relative-age snapshot against the current clock (called per tick).
+  # Herdr exposes no wall-clock timestamps, so the age column shows the state-change
+  # sequence number instead: a monotonically increasing counter that bumps every time
+  # the agent's lifecycle state changes. Lower = longer since last change.
   [void] StampAge([long]$now) {
-    # A zero/absent timestamp would otherwise read as ~20615d (age measured from the Unix
-    # epoch). Show nothing instead — true for a session JSON caught mid-write.
-    if ($this.UpdatedAt -le 0) { $this.AgeText = ''; return }
-    $this.AgeText = [SessionState]::FormatAge($now - $this.UpdatedAt)
+    $this.AgeText = if ($this.StateChangeSeq -gt 0) { "seq $($this.StateChangeSeq)" } else { '' }
   }
 
   # --- Display projections (consumed by Set-RowData) ---
 
   [string] Name() {
-    if ($this.IsChild) { return $this.AgentType }
-    if ([string]::IsNullOrWhiteSpace($this.Cwd)) { return 'unknown' }
+    if ([string]::IsNullOrWhiteSpace($this.Cwd)) { return $this.AgentKind }
     $leaf = [System.IO.Path]::GetFileName($this.Cwd.TrimEnd([char]'\', [char]'/'))
     if (-not [string]::IsNullOrWhiteSpace($leaf)) { return $leaf }
     return $this.Cwd
   }
 
   [string] Sub() {
-    if ($this.IsChild) { if ($this.Task) { return $this.Task } return 'working' }
+    if ($this.Title) { return $this.Title }
     if ($this.Activity) { return $this.Activity }
-    return "$($this.StatusText) $([SessionState]::Sep) pid $($this.Pid)"
+    return "$($this.StatusText) $([SessionState]::Sep) $($this.AgentKind)"
   }
 
-  # Current context-window fill (e.g. "ctx 139K"); empty until a turn is recorded.
-  [string] CtxText() {
-    if ($this.ContextTokens -le 0) { return '' }
-    return "ctx $([SessionState]::FormatCtx($this.ContextTokens))"
-  }
+  [string] CtxText() { return '' }   # herdr exposes no token usage; column stays collapsed
 
   [string] MetaText() {
-    $parts = @()
-    $m = [SessionState]::FormatModel($this.Model)
-    if ($m)            { $parts += $m }
-    if ($this.Version) { $parts += "v$($this.Version)" }
-    return ($parts -join " $([SessionState]::Sep) ")
+    return "$($this.AgentKind) $([SessionState]::Sep) $($this.StatusText)"
   }
 
   [string] Tip() {
-    if ($this.IsChild) {
-      $tip = "subagent $([SessionState]::Sep) $($this.AgentType)"
-      if ($this.Task) { $tip += "`n`n$($this.Task)" }
-      return $tip
-    }
-    $tip = "pid $($this.Pid) $([SessionState]::Sep) v$($this.Version) $([SessionState]::Sep) $($this.StatusText)`n$($this.Cwd)"
-    if ($this.Prompt)   { $tip += "`n`nprompt: $($this.Prompt)" }
-    if ($this.Activity) { $tip += "`n`n$($this.Activity)" }
+    $tip = "$($this.AgentKind) $([SessionState]::Sep) $($this.StatusText) $([SessionState]::Sep) pane $($this.PaneId)`n$($this.Cwd)"
+    if ($this.Title)    { $tip += "`n`n$($this.Title)" }
     return $tip
   }
 
   # --- Pure static formatters (folded in from the old script-level Format-* fns) ---
-
-  static [string] FormatAge([long]$ms) {
-    if ($ms -le 0) { return 'now' }
-    $s = [int]($ms / 1000)
-    if ($s -lt 60) { return "${s}s" }
-    $m = [int]($s / 60)
-    if ($m -lt 60) { return "${m}m" }
-    $h = [int]($m / 60)
-    if ($h -lt 24) { return "${h}h" }
-    $d = [int]($h / 24)
-    return "${d}d"
-  }
-
-  # Token count -> compact label: 139234 -> "139K"; 1200000 -> "1.2M".
-  static [string] FormatCtx([long]$n) {
-    if ($n -le 0)        { return '0' }
-    if ($n -lt 1000)     { return "$n" }
-    if ($n -lt 1000000)  { return "$([int][math]::Round($n / 1000.0))K" }
-    return "$([math]::Round($n / 1000000.0, 1))M"
-  }
-
-  # "claude-opus-4-8" -> "opus 4.8"; "claude-haiku-4-5-20251001" -> "haiku 4.5".
-  static [string] FormatModel([string]$m) {
-    if (-not $m) { return '' }
-    $x = $m -replace '^claude-', '' -replace '-\d{8}$', ''   # strip prefix + trailing date stamp
-    $mt = [regex]::Match($x, '^([a-z]+)-(\d+)-(\d+)')
-    if ($mt.Success) { return "$($mt.Groups[1].Value) $($mt.Groups[2].Value).$($mt.Groups[3].Value)" }
-    return $x
-  }
 
   # Status -> row background tint (base + hover shades). Replaces the old status dot.
   static [hashtable] Tint([string]$color) {
     switch ($color) {
       'busy'    { return @{ base = '#2E3FB950'; hover = '#4D3FB950' } }   # green  = running
       'waiting' { return @{ base = '#38D29922'; hover = '#57D29922' } }   # yellow = waiting for input
+      'done'    { return @{ base = '#387AC2FF'; hover = '#577AC2FF' } }   # blue   = finished its turn
       'stale'   { return @{ base = '#33F85149'; hover = '#52F85149' } }   # red    = process ended
       'idle'    { return @{ base = '#386E7681'; hover = '#576E7681' } }   # gray   = idle
       'child'   { return @{ base = '#332D9A7D'; hover = '#502D9A7D' } }   # teal   = live subagent
@@ -542,56 +470,39 @@ class SessionState {
   }
 }
 
-$SessionsDir = Join-Path $env:USERPROFILE '.claude\sessions'
-# waiting markers written by scripts\session-attention.cjs (Notification hook).
-# The native session JSON only ever carries busy/idle, so this sidecar is the sole
-# source for the "Claude is waiting for the user" state.
-$AttentionDir = Join-Path $env:USERPROFILE '.claude\session-attention'
-# live activity written by scripts\session-activity.cjs (PreToolUse hook). Carries the
-# precise "what right now" line ("Editing overlay.ps1", "Bash: git status") that the
-# transcript tail-parse can't surface — only ever shown while the session is busy.
-$StatusDir = Join-Path $env:USERPROFILE '.claude\session-status'
-# last user prompt written by scripts\session-prompt.cjs (UserPromptSubmit hook). Captures
-# the exact prompt at submit time, so the row shows it verbatim instead of the lossy
-# transcript tail-parse. Persists across the session (overwritten on each new prompt).
-$PromptDir = Join-Path $env:USERPROFILE '.claude\session-prompt'
-# live subagents written by scripts\session-subagent-activity? No — scripts\subagent-activity.cjs
-# (SubagentStart/SubagentStop hooks). One file per live Task/Agent spawn, grouped by the
-# PARENT session_id (the directory) so the overlay can nest each child under its parent row:
-#   ~/.claude/session-subagents/<parentSessionId>/<agentId>.json  ->  { agentType; task; startedAt }
-# SubagentStop deletes the file; the overlay reaps a parent's whole dir when its native
-# session is gone and skips markers older than $SubagentStaleMs, so a missed stop can't
-# pin a ghost child forever.
-$SubagentDir = Join-Path $env:USERPROFILE '.claude\session-subagents'
-$SubagentStaleMs = 1800000   # 30m backstop: ignore + reap a marker this old (missed SubagentStop)
+# ---------------------------------------------------------------------------
+# Herdr data source.
+# The overlay polls `herdr agent list` (JSON over the local API socket) every
+# tick. Herdr detects the coding agent inside each pane (claude, opencode,
+# codex, ...) and classifies its lifecycle state: working / blocked / idle /
+# done / unknown. A pane id ("w1:p3") is the unique, stable row key AND the
+# CLI target for focus and prompt delivery.
+# ---------------------------------------------------------------------------
+$HerdrBin = 'herdr'   # resolved from PATH; %LOCALAPPDATA%\Programs\Herdr\bin is on PATH after install
 
-# Persisted "links": claudePid -> terminal window handle, for sessions whose window
-# title can't be auto-matched (right-click a row to link it to the current terminal).
-# Keyed by Claude PID (not sessionId) so a link survives /clear, which mints a new
-# sessionId but leaves the process -- and its terminal window -- unchanged.
-$LinksFile = Join-Path $PSScriptRoot 'links.json'
-$script:Links = @{}
-# In-memory "last seen present" stamp (unix ms) per linked claudePid. A link is reaped
-# once its Claude process has been absent from the alive set for longer than
-# $StaleLinkMs, so links.json stays bounded instead of growing forever across sessions.
-# (The grace window also absorbs a transient disappearance between ticks.)
-$script:LinkSeen = @{}
-$StaleLinkMs = 24 * 60 * 60 * 1000   # 1 day
-if (Test-Path $LinksFile) {
+# One poll of `herdr agent list`. Returns a [SessionState[]], or $null when the
+# herdr server is not running (the overlay then shows the "herdr offline" row).
+$script:HerdrListCache = $null
+$script:HerdrListCacheAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+function Get-HerdrAgents {
+  $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  if ($script:HerdrListCache -and ($now - $script:HerdrListCacheAt) -lt 1200) {
+    return $script:HerdrListCache   # de-dup bursts (row click + tick within the same second)
+  }
+  $out = New-Object System.Collections.Generic.List[object]
   try {
-    $loadNow = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    (Get-Content $LinksFile -Raw -Encoding UTF8 | ConvertFrom-Json).PSObject.Properties | ForEach-Object {
-      $script:Links[[int]$_.Name] = [int64]$_.Value     # keys normalized to int to match the alive-PID set
-      $script:LinkSeen[[int]$_.Name] = $loadNow          # seed grace so disk links aren't reaped instantly
+    $raw = & $HerdrBin agent list 2>$null
+    if ($LASTEXITCODE -eq 0 -and $raw) {
+      $resp = ($raw -join "`n") | ConvertFrom-Json
+      foreach ($a in $resp.result.agents) {
+        if (-not $a.pane_id) { continue }
+        $out.Add([SessionState]::new($a))
+      }
     }
   } catch {}
-}
-function Save-Links {
-  try {
-    $o = New-Object psobject
-    foreach ($k in $script:Links.Keys) { $o | Add-Member -NotePropertyName $k -NotePropertyValue $script:Links[$k] }
-    $o | ConvertTo-Json -Compress | Set-Content -Path $LinksFile -Encoding UTF8
-  } catch {}
+  $script:HerdrListCache = $out.ToArray()
+  $script:HerdrListCacheAt = $now
+  return $script:HerdrListCache
 }
 
 [xml]$xaml = @"
@@ -853,6 +764,14 @@ $script:SndSessionStates = @{}        # sessionId -> last sound-state fired/seen
 # replayed after a random delay in [interval, intervalMax]s, up to `max` times.
 # sessionId -> @{ lastNag = <ms>; count; nextDelay = <ms> } (nextDelay re-rolled each replay).
 $script:SndNag = @{}
+# State-flap debounce. Herdr classifies a pane from its screen content, so while a main
+# agent runs a Task/subagent INSIDE that pane, the pane's reported state flaps
+# (working -> idle/unknown -> working ...) at every subagent start/finish. Each flap used
+# to be a sound "transition" -> SFX spam. A candidate state must now hold steady for
+# $SndStableMs before it counts; a flap back within the window is absorbed silently.
+$SndStableMs = 6000
+$script:SndPending     = @{}   # sessionId -> @{ state; since = <unix ms> } candidate not yet confirmed
+$script:SndPendingSt   = @{}   # sessionId -> last sound-state the debounce was computed against
 # Remote sounds can't be streamed reliably through MediaPlayer (hotlink/UA/TLS), so they
 # are fetched to a temp file off the UI thread (same approach as the GIF downloader) and
 # played from disk. These mirror the $Gif* download plumbing.
@@ -1227,131 +1146,69 @@ $Window.Add_SourceInitialized({
   if ($script:overlayHwnd -ne [IntPtr]::Zero) { [WinTools]::SetNoActivate($script:overlayHwnd) }
 })
 
-function Get-AliveProcessIds {
-  $set = @{}
-  foreach ($p in Get-Process -ErrorAction SilentlyContinue) { $set[$p.Id] = $true }
-  return $set
-}
+# ---------------------------------------------------------------------------
+# Herdr agent actions (focus + prompt delivery) via the herdr CLI.
+# ---------------------------------------------------------------------------
 
-# Read a session's transcript tail and summarise what it's currently doing, the most
-# recent user prompt, and the model in use. Cached per session keyed on updatedAt, so
-# idle sessions aren't re-parsed every tick.
-# Returns @{ activity = <what it's doing>; prompt = <last user prompt>; model = <model id> }.
-$script:ActivityCache = @{}
-function Get-SessionActivity($cwd, $sessionId, $updatedAt) {
-  $empty = @{ activity = ''; prompt = ''; model = ''; context = 0 }
-  if (-not $sessionId -or -not $cwd) { return $empty }
-  $cached = $script:ActivityCache[$sessionId]
-  if ($cached -and $cached.upd -eq $updatedAt) { return $cached.val }
+# Bring the workspace hosting $paneId to the foreground. `herdr agent focus`
+# only selects the pane inside the herdr UI; when the herdr window itself is
+# behind other windows, the workspace label (falling back to the pane's cwd
+# leaf) is matched against top-level window titles to raise the right one.
+function Focus-HerdrAgent([string]$paneId, [string]$cwd) {
+  if ([string]::IsNullOrWhiteSpace($paneId)) { return $false }
 
-  $enc  = ($cwd -replace '[^A-Za-z0-9]', '-')
-  $path = Join-Path $env:USERPROFILE ".claude\projects\$enc\$sessionId.jsonl"
-  $val  = @{ activity = ''; prompt = ''; model = ''; context = 0 }
-  if (Test-Path $path) {
-    try {
-      $lastUser = ''; $lastAsst = ''; $lastTool = ''; $lastModel = ''; $lastCtx = [long]0
-      foreach ($ln in (Get-Content -Path $path -Tail 80 -Encoding UTF8 -ErrorAction Stop)) {
-        if ([string]::IsNullOrWhiteSpace($ln)) { continue }
-        try { $d = $ln | ConvertFrom-Json } catch { continue }
-        $m = $d.message
-        if (-not $m) { continue }
-        $c = $m.content
-        if ($m.role -eq 'user') {
-          $t = $null
-          if ($c -is [string]) { $t = $c }
-          elseif ($c) { foreach ($b in $c) { if ($b.type -eq 'text') { $t = $b.text; break } } }
-          if ($t -and -not $t.StartsWith('<') -and -not $t.StartsWith('Caveat') -and $t -notmatch 'tool_result') { $lastUser = $t }
-        }
-        elseif ($m.role -eq 'assistant' -and $c) {
-          if ($m.model) { $lastModel = "$($m.model)" }    # model can change mid-session; last wins
-          # Current context fill = the latest turn's total input (fresh + cache-write + cache-read).
-          # Reading the LAST turn (not summing the transcript) is what makes this accurate.
-          $u = $m.usage
-          if ($u) {
-            $ctx = [long]$u.input_tokens + [long]$u.cache_creation_input_tokens + [long]$u.cache_read_input_tokens
-            if ($ctx -gt 0) { $lastCtx = $ctx }
+  # 1. Select the pane inside the herdr UI (no-op if herdr is not running).
+  try {
+    & $HerdrBin agent focus $paneId 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { return $false }
+  } catch { return $false }
+
+  # 2. Raise a top-level window whose title matches the workspace label or cwd leaf.
+  $needles = @()
+  try {
+    $wl = & $HerdrBin workspace list 2>$null
+    if ($LASTEXITCODE -eq 0 -and $wl) {
+      $wid = ($paneId -split ':')[0]
+      $resp = ($wl -join "`n") | ConvertFrom-Json
+      foreach ($ws in $resp.result.workspaces) {
+        if ("$($ws.workspace_id)" -eq $wid) {
+          if ($ws.label) { $needles += "$($ws.label)" }
+          if ($ws.worktree -and $ws.worktree.checkout_path) {
+            $needles += [System.IO.Path]::GetFileName($("$($ws.worktree.checkout_path)".TrimEnd('\')))
           }
-          foreach ($b in $c) {
-            if ($b.type -eq 'text' -and "$($b.text)".Trim()) { $lastAsst = $b.text }
-            elseif ($b.type -eq 'tool_use') { $lastTool = $b.name }
-          }
+          break
         }
       }
-      $act = if ($lastAsst) { $lastAsst } elseif ($lastUser) { $lastUser } elseif ($lastTool) { "running $lastTool" } else { '' }
-      $act = ($act -replace '\s+', ' ').Trim()
-      if ($act.Length -gt 200) { $act = $act.Substring(0, 200) }
-      $prompt = ($lastUser -replace '\s+', ' ').Trim()
-      if ($prompt.Length -gt 200) { $prompt = $prompt.Substring(0, 200) }
-      $val = @{ activity = $act; prompt = $prompt; model = $lastModel; context = $lastCtx }
-    } catch {}
-  }
-  $script:ActivityCache[$sessionId] = @{ upd = $updatedAt; val = $val }
-  return $val
-}
-
-# Discover the LIVE subagents (Task/Agent spawns) of one parent session as child rows.
-# Subagents have no pid and no ~/.claude/sessions file — scripts\subagent-activity.cjs
-# (SubagentStart/SubagentStop hooks) drops one marker per live spawn under
-# session-subagents\<parentSid>\<agentId>.json. A marker present = the subagent is live
-# (SubagentStop deletes it on finish); a marker older than $SubagentStaleMs is a missed-stop
-# leak, so it is skipped AND reaped here. agentType + spawn-prompt task come straight from
-# the marker (written once at SubagentStart) — no transcript parsing.
-function Get-LiveSubagents($cwd, $parentSid, $now) {
-  $out = @()
-  if (-not $parentSid) { return $out }
-  $dir = Join-Path $SubagentDir $parentSid
-  if (-not (Test-Path $dir)) { return $out }
-
-  foreach ($f in Get-ChildItem -Path $dir -Filter '*.json' -ErrorAction SilentlyContinue) {
-    try { $meta = Get-Content $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
-    $startedAt = [long]$meta.startedAt
-    if ($startedAt -gt 0 -and ($now - $startedAt) -gt $SubagentStaleMs) {
-      Remove-Item $f.FullName -ErrorAction SilentlyContinue   # missed SubagentStop → reap the ghost
-      continue
     }
-    $agentId = $f.BaseName
-    $out += [SessionState]::new($agentId, $parentSid, $cwd, "$($meta.agentType)", "$($meta.task)", $startedAt)
+  } catch {}
+  if ($cwd) { $needles += [System.IO.Path]::GetFileName($cwd.TrimEnd([char]'\', [char]'/')) }
+
+  $best = $null; $bestScore = 0
+  foreach ($w in [WinTools]::List()) {
+    foreach ($n in $needles) {
+      if (-not $n) { continue }
+      if ($w.Title -like "*$n*") {
+        $s = $n.Length
+        if ($s -gt $bestScore) { $bestScore = $s; $best = $w }
+        break
+      }
+    }
   }
-  # Most-recently-spawned subagent first within the parent group.
-  return @($out | Sort-Object @{ e = { -$_.UpdatedAt } })
+  if ($best) { [WinTools]::Focus($best.Handle); return $true }
+  return $true   # pane focused inside herdr even if no window matched
 }
 
-# Read the live activity marker (session-activity.cjs PreToolUse hook) for a session.
-# Returns the precise current-work line ("Editing overlay.ps1") or '' when absent.
-# Uncached: the file is tiny and changes every tool call, so a cache keyed on the
-# native heartbeat would just go stale within a single busy turn.
-function Get-SessionStatus($sessionId) {
-  if (-not $sessionId) { return '' }
-  $path = Join-Path $StatusDir "$sessionId.json"
-  if (-not (Test-Path $path)) { return '' }
-  try { return "$((Get-Content $path -Raw -Encoding UTF8 | ConvertFrom-Json).activity)" } catch { return '' }
-}
-
-# Read the last-user-prompt marker (session-prompt.cjs UserPromptSubmit hook) for a session.
-# Returns the verbatim prompt or '' when absent. Uncached: the file is tiny and only changes
-# once per user turn, so a heartbeat-keyed cache would buy nothing.
-function Get-SessionPrompt($sessionId) {
-  if (-not $sessionId) { return '' }
-  $path = Join-Path $PromptDir "$sessionId.json"
-  if (-not (Test-Path $path)) { return '' }
-  try { return "$((Get-Content $path -Raw -Encoding UTF8 | ConvertFrom-Json).prompt)" } catch { return '' }
-}
-
-# Score how well a Windows Terminal tab/window title identifies a session.
-# Returns 100 when the title contains the exact folder name at a word boundary,
-# else 0. The boundary guard is essential: "Foo_IdleRPG" must NOT match the window
-# of "Foo_IdleRPG2". A 0 means no identifying signal (e.g. generic "Claude Code").
-function Get-TitleScore($title, $folder) {
-  if ([string]::IsNullOrWhiteSpace($title) -or [string]::IsNullOrWhiteSpace($folder)) { return 0 }
-  $t = $title.ToLower()
-  $f = [regex]::Escape($folder.ToLower())
-  if ($t -match "(?<![a-z0-9])$f(?![a-z0-9])") { return 100 }
-  return 0
-}
-
-function Test-LiveWindow($h) {
-  foreach ($w in [WinTools]::List()) { if ($w.Handle -eq $h) { return $true } }
-  return $false
+# Deliver a prompt to a herdr agent: `herdr agent prompt <pane> <text>`. The CLI
+# writes via the pane's own bracketed-paste stream, so the overlay never needs
+# foreground, clipboard surgery, or keystroke synthesis. Fire-and-forget: the
+# call returns once herdr accepts the text.
+function Send-PromptToHerdrAgent([string]$paneId, [string]$text) {
+  if ([string]::IsNullOrWhiteSpace($paneId) -or -not $text) { return $false }
+  try {
+    # Line-broken text is passed as one argv element; the CLI handles submission.
+    & $HerdrBin agent prompt $paneId $text 2>$null | Out-Null
+    return ($LASTEXITCODE -eq 0)
+  } catch { return $false }
 }
 
 # Briefly tint a row (red = failure, green = linked), then restore.
@@ -1368,106 +1225,6 @@ function Show-RowFlash($row, $hex) {
   $ft.Start()
 }
 
-# Resolve and focus the terminal for a session.
-#   $cwd        disambiguates Windows Terminal windows/tabs by title.
-#   $sessionPid looks up a user-created link (right-click) when the title can't be matched.
-function Focus-Session($sessionPid, $cwd, $sessionId) {
-  $sessionPid = [int]$sessionPid
-  $folder = if ($cwd) { Split-Path $cwd -Leaf } else { '' }
-
-  # Prefer an explicit user link if it still points to a live window.
-  if ($script:Links.ContainsKey($sessionPid)) {
-    $lh = [IntPtr]([int64]$script:Links[$sessionPid])
-    if ((Test-LiveWindow $lh)) { [WinTools]::Focus($lh); return $true }
-    $script:Links.Remove($sessionPid); Save-Links           # stale -> forget it
-  }
-
-  # Build a child -> parent process map and a pid -> name map once.
-  $parent = @{}; $pname = @{}
-  foreach ($pr in Get-CimInstance Win32_Process -ErrorAction SilentlyContinue) {
-    $parent[[int]$pr.ProcessId] = [int]$pr.ParentProcessId
-    $pname[[int]$pr.ProcessId] = "$($pr.Name)"
-  }
-
-  # Ancestor chain of the session (incl. itself).
-  $anc = @{}; $c = $sessionPid; $g = 0
-  $isWT = $false
-  while ($c -gt 0 -and -not $anc.ContainsKey($c) -and $g -lt 24) {
-    $anc[$c] = $true
-    if ($pname[$c] -eq 'WindowsTerminal.exe') { $isWT = $true }
-    $c = if ($parent.ContainsKey($c)) { $parent[$c] } else { 0 }
-    $g++
-  }
-
-  # --- Non-Windows-Terminal terminals: process tree is reliable (one window per console). ---
-  if (-not $isWT) {
-    $match = [IntPtr]::Zero
-    foreach ($w in [WinTools]::List()) {
-      $wp = [int]$w.Pid
-      if ($anc.ContainsKey($wp)) { $match = $w.Handle; break }   # window owned by an ancestor
-      $cc = $wp; $gg = 0                                          # or by a descendant (legacy conhost)
-      while ($cc -gt 0 -and $gg -lt 24) {
-        if ($cc -eq $sessionPid) { $match = $w.Handle; break }
-        $cc = if ($parent.ContainsKey($cc)) { $parent[$cc] } else { 0 }
-        $gg++
-      }
-      if ($match -ne [IntPtr]::Zero) { break }
-    }
-    if ($match -ne [IntPtr]::Zero) { [WinTools]::Focus($match); return $true }
-    return $false
-  }
-
-  # --- Windows Terminal: one process hosts every window+tab. Win32 EnumWindows sees
-  # every WT window (incl. minimized / other virtual desktop) which UIA's RootElement
-  # children query misses, so enumerate windows there and match by title. ---
-  $wtPidSet = @{}
-  foreach ($p in (Get-Process WindowsTerminal -ErrorAction SilentlyContinue)) { $wtPidSet[[int]$p.Id] = $true }
-
-  $cands = @()
-  foreach ($w in [WinTools]::List()) { if ($wtPidSet.ContainsKey([int]$w.Pid)) { $cands += $w } }
-
-  $best = $null; $bestScore = 0
-  foreach ($w in $cands) {
-    $s = Get-TitleScore $w.Title $folder
-    if ($s -gt $bestScore) { $bestScore = $s; $best = $w }
-  }
-
-  # Confident match: window title identifies the folder (>=30 = strong token overlap).
-  if ($best -and $bestScore -ge 30) {
-    [WinTools]::Focus($best.Handle)
-    Select-WTTabInWindow $best.Handle $folder    # drill into the right tab if multi-tab
-    return $true
-  }
-  # Exactly one WT window total -> unambiguous.
-  if ($cands.Count -eq 1) { [WinTools]::Focus($cands[0].Handle); return $true }
-
-  # Can't identify it (e.g. a generic "Claude Code" title shared by idle sessions).
-  # Refuse to guess and jump to the wrong window.
-  return $false
-}
-
-# Within an already-matched WT window, select the tab whose title best fits the folder.
-function Select-WTTabInWindow($hwnd, $folder) {
-  try {
-    $el = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$hwnd)
-    if (-not $el) { return }
-    $tabType = New-Object System.Windows.Automation.PropertyCondition(
-      [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-      [System.Windows.Automation.ControlType]::TabItem)
-    $tabs = $el.FindAll([System.Windows.Automation.TreeScope]::Descendants, $tabType)
-    if ($tabs.Count -le 1) { return }
-    $bt = $null; $bs = 0
-    foreach ($t in $tabs) {
-      $s = Get-TitleScore $t.Current.Name $folder
-      if ($s -gt $bs) { $bs = $s; $bt = $t }
-    }
-    if ($bt -and $bs -gt 0) {
-      $sip = $bt.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
-      [void]$sip.Select()
-    }
-  } catch {}
-}
-
 # --- Inline prompt input (shift-click a row) ------------------------------------------
 # The overlay is a no-activate window, so its TextBox can't receive keystrokes until we
 # temporarily clear WS_EX_NOACTIVATE and activate it. Show-PromptInput does that; the
@@ -1475,15 +1232,15 @@ function Select-WTTabInWindow($hwnd, $folder) {
 # steals foreground again. The box mirrors Claude's composer: a '>' chevron, placeholder,
 # Enter to send / Shift+Enter for a newline (auto-grows), and Up/Down to recall history.
 
-# Per-session prompt history (this run), keyed by Claude PID so it survives /clear.
+# Per-agent prompt history (this run), keyed by herdr pane id.
 $script:PromptHistory = @{}
 
 function Add-PromptHistory($sessPid, $text) {
-  $sessPid = [int]$sessPid
-  if (-not $script:PromptHistory.ContainsKey($sessPid)) {
-    $script:PromptHistory[$sessPid] = New-Object System.Collections.Generic.List[string]
+  $key = "$sessPid"
+  if (-not $script:PromptHistory.ContainsKey($key)) {
+    $script:PromptHistory[$key] = New-Object System.Collections.Generic.List[string]
   }
-  $h = $script:PromptHistory[$sessPid]
+  $h = $script:PromptHistory[$key]
   if ($h.Count -eq 0 -or $h[$h.Count - 1] -ne $text) { $h.Add($text) }  # de-dup consecutive
   while ($h.Count -gt 100) { $h.RemoveAt(0) }                            # bound growth
 }
@@ -1507,7 +1264,7 @@ function Recall-History($box, [int]$dir) {
   $tag = $box.Tag
   $rb = $tag.RowBorder
   if (-not ($rb.Tag -and $rb.Tag.Pid)) { return $false }
-  $hist = $script:PromptHistory[[int]$rb.Tag.Pid]
+  $hist = $script:PromptHistory["$($rb.Tag.Pid)"]
   if (-not $hist -or $hist.Count -eq 0) { return $false }
   $multi = $box.Text.Contains([char]10)
   if ($dir -lt 0) { if ($multi -and $box.CaretIndex -ne 0) { return $false } }
@@ -1535,8 +1292,8 @@ function Show-PromptInput($border) {
   $box.Text = ''
   $tag.Draft = ''
   # Start the history cursor past the newest entry (i.e. on the empty draft).
-  $sp = if ($border.Tag -and $border.Tag.Pid) { [int]$border.Tag.Pid } else { 0 }
-  $tag.HistIdx = if ($script:PromptHistory.ContainsKey($sp)) { $script:PromptHistory[$sp].Count } else { 0 }
+  $sp = if ($border.Tag -and $border.Tag.Pid) { "$($border.Tag.Pid)" } else { '' }
+  $tag.HistIdx = if ($sp -and $script:PromptHistory.ContainsKey($sp)) { $script:PromptHistory[$sp].Count } else { 0 }
   $tag.Wrap.Visibility = 'Visible'
   Update-Placeholder $box
   if ($script:overlayHwnd -ne [IntPtr]::Zero) {
@@ -1567,27 +1324,12 @@ function Hide-PromptInput($box) {
   }
 }
 
-# Focus the session's terminal, then deliver the prompt and submit it. Single-line goes in
-# as Unicode keystrokes; multi-line is pasted (bracketed paste preserves newlines) with the
-# clipboard saved and restored around the paste.
-function Send-PromptToSession($targetPid, $cwd, $sessionId, $text) {
-  if (-not (Focus-Session $targetPid $cwd $sessionId)) { return $false }
-  Start-Sleep -Milliseconds 140   # let the terminal actually take foreground
-  if ($text.Contains([char]10)) {
-    $old = $null
-    try { $old = [System.Windows.Clipboard]::GetText() } catch {}
-    try { [System.Windows.Clipboard]::SetText($text) } catch {}
-    Start-Sleep -Milliseconds 40
-    [WinTools]::SendCtrlV()
-    Start-Sleep -Milliseconds 90
-    [WinTools]::SendEnter()
-    if ($old) { try { [System.Windows.Clipboard]::SetText($old) } catch {} }   # restore clipboard
-  } else {
-    [WinTools]::SendText($text)
-    Start-Sleep -Milliseconds 40
-    [WinTools]::SendEnter()
-  }
-  return $true
+# Focus the agent's herdr pane (raising its workspace window) and deliver the prompt
+# through `herdr agent prompt`, which writes into the pane's own input stream — no
+# keystroke synthesis, no clipboard use, no foreground requirement for delivery itself.
+function Send-PromptToSession($paneId, $cwd, $sessionId, $text) {
+  if (-not (Focus-HerdrAgent $paneId $cwd)) { return $false }
+  return (Send-PromptToHerdrAgent $paneId $text)
 }
 
 # Build a row once and return a hashtable of the Border plus references to every
@@ -1605,8 +1347,7 @@ function New-Row {
   $border.Background = [Windows.Media.BrushConverter]::new().ConvertFrom('#386E7681')
   $border.Cursor = 'Hand'
 
-  # Left-click focuses the session's terminal; Shift+left-click opens an inline prompt box;
-  # right-click links it to the current terminal.
+  # Left-click focuses the agent's herdr pane; Shift+left-click opens the inline prompt box.
   $border.Add_MouseLeftButtonUp({
     # A click that lands inside the open input box must not bubble up and re-focus the
     # terminal (which would yank foreground away mid-typing).
@@ -1614,28 +1355,18 @@ function New-Row {
     $t = $this.Tag
     if (-not ($t -and $t.Pid)) { return }
     $shift = ([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Shift) -ne 0
-    # Shift-click opens the prompt composer — but only for real sessions. A subagent can't
-    # be messaged, so shift-click on a child row just focuses the parent terminal instead.
-    if ($shift -and -not $t.IsSubagent) { Show-PromptInput $this; return }
-    $ok = Focus-Session $t.Pid $t.Cwd $t.SessionId
-    if (-not $ok) { Show-RowFlash $this '#55F56C6C' }   # red: couldn't locate; right-click to link
+    if ($shift) { Show-PromptInput $this; return }
+    $ok = Focus-HerdrAgent $t.Pid $t.Cwd
+    if (-not $ok) { Show-RowFlash $this '#55F56C6C' }   # red: couldn't reach the herdr server
   })
 
-  # Right-click: link this session to whatever terminal is currently focused.
-  # (The overlay is no-activate, so the foreground window is the terminal you came from.)
-  # Keyed by Claude PID so the link survives /clear (which changes sessionId, not the PID).
+  # Right-click: raise the herdr window itself (the agent's terminal lives inside herdr,
+  # so a terminal-window link is meaningless here).
   $border.Add_MouseRightButtonUp({
     $t = $this.Tag
-    if ($t -and $t.IsSubagent) { return }   # subagent rows aren't linkable to a terminal
     if ($t -and $t.Pid) {
-      $fg = [WinTools]::GetForegroundWindow()
-      if ($fg -ne [IntPtr]::Zero -and $fg -ne $script:overlayHwnd) {
-        $script:Links[[int]$t.Pid] = $fg.ToInt64()
-        Save-Links
-        Show-RowFlash $this '#5567C23A'                   # green: linked
-      } else {
-        Show-RowFlash $this '#55F56C6C'
-      }
+      $ok = Focus-HerdrAgent $t.Pid $t.Cwd
+      Show-RowFlash $this $(if ($ok) { '#5567C23A' } else { '#55F56C6C' })
     }
   })
 
@@ -1770,7 +1501,7 @@ function New-Row {
   $promptBox.Cursor = 'IBeam'
 
   $placeholder = New-Object System.Windows.Controls.TextBlock
-  $placeholder.Text = 'Send a message to this session...'
+  $placeholder.Text = 'Send a prompt to this agent (via herdr)...'
   $placeholder.FontFamily = 'Segoe UI'
   $placeholder.FontSize = 12
   $placeholder.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#80FFFFFF')
@@ -1837,19 +1568,12 @@ function New-Row {
 # the hover tint (set by MouseEnter/Leave) survives every refresh.
 function Set-RowData($e, [SessionState]$s) {
   # Status -> row background tint (replaces the old dot). Carry base/hover on the Tag so
-  # the MouseEnter/Leave handlers (and Show-RowFlash) restore the right shade.
+  # the MouseEnter/Leave handlers (and Show-RowFlash) restore the right shade. Pid carries
+  # the herdr pane id (the CLI target for focus/prompt).
   $tint = [SessionState]::Tint($s.Color)
-  $e.Border.Tag = [pscustomobject]@{ Pid = $s.Pid; Cwd = $s.Cwd; SessionId = $s.SessionId; IsSubagent = $s.IsSubagent; BaseBg = $tint.base; HoverBg = $tint.hover }
+  $e.Border.Tag = [pscustomobject]@{ Pid = $s.PaneId; Cwd = $s.Cwd; SessionId = $s.SessionId; BaseBg = $tint.base; HoverBg = $tint.hover }
   $tip = $s.Tip()
   if ($e.Border.ToolTip -ne $tip) { $e.Border.ToolTip = $tip }
-
-  # Indent child (subagent) rows so they read as nested under their parent. Re-applied
-  # only when the row's child/parent kind flips — which never happens for a given RowKey
-  # (a child keys on agentId, a parent on sessionId) — so there is no per-tick churn.
-  if ($e.IsChildRow -ne $s.IsChild) {
-    $e.IsChildRow = $s.IsChild
-    $e.Border.Margin = if ($s.IsChild) { '22,2,0,0' } else { '0,3,0,0' }
-  }
 
   # Re-apply the background only when the tint or hover state actually changed, so an
   # unchanged row never churns its brush (keeps the in-place update blink-free).
@@ -1857,9 +1581,8 @@ function Set-RowData($e, [SessionState]$s) {
   if ($e.LastBg -ne $bg) { $e.LastBg = $bg; $e.Border.Background = [Windows.Media.BrushConverter]::new().ConvertFrom($bg) }
 
   $name = $s.Name()
-  if ($s.IsChild) { $name = "$([char]0x2514) $name" }   # '└ ' tree-branch prefix for nesting
   if ($e.RunName.Text -ne $name)        { $e.RunName.Text = $name }
-  $pidTxt = if ($s.IsChild) { '' } else { "  $($s.Pid)" }   # a subagent has no pid of its own
+  $pidTxt = "  $($s.AgentKind)"   # right side of the title: the detected agent kind
   if ($e.RunPid.Text -ne $pidTxt)       { $e.RunPid.Text = $pidTxt }
 
   if ($s.Prompt) {
@@ -1891,168 +1614,108 @@ function Set-RowData($e, [SessionState]$s) {
   if ($e.Age.Text -ne $s.AgeText)       { $e.Age.Text = $s.AgeText }
 }
 
-# Reused row elements, keyed by sessionId, so a session's row is built once and then
+# Reused row elements, keyed by herdr pane id, so an agent's row is built once and then
 # updated in place every tick rather than recreated (prevents the hover blink).
 $script:RowMap = @{}
 
 function Update-List {
-  if (-not (Test-Path $SessionsDir)) {
+  $rows = @(Get-HerdrAgents)
+
+  # Herdr server not running (or no agent list returned): clear the board.
+  if ($rows.Count -eq 0) {
     foreach ($e in $script:RowMap.Values) { [void]$List.Items.Remove($e.Border) }
     $script:RowMap.Clear()
-    $CountText.Text = '0'
+    $CountText.Text = 'herdr offline'
     $script:OverallState = 'idle'
     $script:SndCurStates = @{}
     Apply-ListSnapHeight
     return
   }
-  $alive = Get-AliveProcessIds
   $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-  $rows = @()
-  $nativeSids = @{}   # sessionIds seen this tick, for reaping orphaned attention markers
 
-  foreach ($file in Get-ChildItem -Path $SessionsDir -Filter '*.json' -ErrorAction SilentlyContinue) {
-    try { $json = Get-Content $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
-    if (-not $json.pid) { continue }
+  foreach ($r in $rows) { $r.StampAge($now) }
 
-    # 1. Construct the model from the raw facts + liveness.
-    $isAlive = $alive.ContainsKey([int]$json.pid)
-    $session = [SessionState]::new($json, $isAlive)
+  # Sort: working (busy) first, then blocked, then done, then the rest alphabetically
+  # by project so the board reads like herdr's own attention queue.
+  $prio = @{ busy = 0; waiting = 1; done = 2; idle = 3; stale = 4 }
+  $rows = @($rows | Sort-Object @{e={ $prio[$_.Color] }}, @{e={ $_.Name() }})
 
-    # 2. waiting-state refinement (script-scope IO the model can't do itself).
-    # waiting is a refinement of the idle state. The native session file only ever
-    # carries busy/idle; the Notification hook (scripts\session-attention.cjs) drops a
-    # marker when Claude is waiting for the user. Show waiting when an ALIVE session
-    # is NOT busy and has a marker. We deliberately do NOT compare timestamps: the native
-    # updatedAt is a heartbeat that keeps advancing while a session runs (verified), so a
-    # "marker newer than updatedAt" test would be raced by the heartbeat. The rule is
-    # purely state-based — a busy (working) or dead session can't need input, so its
-    # marker is reaped on sight, which also self-heals a missed `clear`.
-    if ($session.SessionId) {
-      $nativeSids[$session.SessionId] = $true
-      $mk = Join-Path $AttentionDir "$($session.SessionId).json"
-      if (Test-Path $mk) {
-        if ($isAlive -and -not $session.IsBusy) {
-          $session.MarkWaiting()
-        } else {
-          Remove-Item $mk -ErrorAction SilentlyContinue   # busy or dead: can't need input
-        }
-      }
-    }
-
-    # 3. Enrich with cache-backed transcript data, then stamp relative age.
-    #    (Model (from transcript) + CLI version (from session JSON); effort/reasoning
-    #    level is not recorded anywhere, so it can't be shown.)
-    if ($isAlive) {
-      $session.Enrich((Get-SessionActivity $session.Cwd $session.SessionId $session.UpdatedAt))
-      # Live hook activity wins over transcript activity, but only while busy. A non-busy
-      # session can't be mid-tool, so a lingering marker (missed `stop`) is ignored here
-      # and reaped below — purely state-based, matching the attention-marker rule.
-      if ($session.IsBusy) { $session.SetActivity((Get-SessionStatus $session.SessionId)) }
-      # Live hook prompt (UserPromptSubmit) wins over the transcript-derived guess whenever
-      # present — it's the verbatim submitted text. Persists for the whole session.
-      $session.SetPrompt((Get-SessionPrompt $session.SessionId))
-    }
-    $session.StampAge($now)
-
-    $rows += $session
-  }
-
-  # Reap orphaned attention markers whose native session file is gone entirely (the
-  # per-row reap above only covers sessions still present in $SessionsDir). Keeps
-  # ~/.claude/session-attention from growing without bound across many sessions.
-  if (Test-Path $AttentionDir) {
-    foreach ($mf in Get-ChildItem -Path $AttentionDir -Filter '*.json' -ErrorAction SilentlyContinue) {
-      if (-not $nativeSids.ContainsKey($mf.BaseName)) { Remove-Item $mf.FullName -ErrorAction SilentlyContinue }
-    }
-  }
-  # Same reap for live-activity markers whose native session file is gone (a missed
-  # `stop`, or the session ended mid-tool). Keeps ~/.claude/session-status bounded.
-  if (Test-Path $StatusDir) {
-    foreach ($sf in Get-ChildItem -Path $StatusDir -Filter '*.json' -ErrorAction SilentlyContinue) {
-      if (-not $nativeSids.ContainsKey($sf.BaseName)) { Remove-Item $sf.FullName -ErrorAction SilentlyContinue }
-    }
-  }
-  # Same reap for last-prompt markers whose native session file is gone. Keeps
-  # ~/.claude/session-prompt bounded across many ended sessions.
-  if (Test-Path $PromptDir) {
-    foreach ($pf in Get-ChildItem -Path $PromptDir -Filter '*.json' -ErrorAction SilentlyContinue) {
-      if (-not $nativeSids.ContainsKey($pf.BaseName)) { Remove-Item $pf.FullName -ErrorAction SilentlyContinue }
-    }
-  }
-  # Same reap for live-subagent marker dirs whose PARENT session file is gone (the per-file
-  # SubagentStop delete and the staleness skip in Get-LiveSubagents cover the live cases;
-  # this clears a whole dir when the parent ended without its subagents being torn down).
-  # Keyed by the parent sessionId = the directory name. Keeps ~/.claude/session-subagents bounded.
-  if (Test-Path $SubagentDir) {
-    foreach ($sd in Get-ChildItem -Path $SubagentDir -Directory -ErrorAction SilentlyContinue) {
-      if (-not $nativeSids.ContainsKey($sd.Name)) { Remove-Item $sd.FullName -Recurse -Force -ErrorAction SilentlyContinue }
-    }
-  }
-  # Time out stale terminal links. A link whose Claude process is still alive gets its
-  # last-seen stamp refreshed; one whose process has been gone longer than
-  # $StaleLinkMs is dropped. Without this, links.json grows without bound because a
-  # link is otherwise only forgotten the next time someone clicks it (Focus-Session).
-  if ($script:Links.Count -gt 0) {
-    $linksDirty = $false
-    foreach ($lpid in @($script:Links.Keys)) {
-      if ($alive.ContainsKey([int]$lpid)) {
-        $script:LinkSeen[$lpid] = $now
-      } else {
-        $seenAt = if ($script:LinkSeen.ContainsKey($lpid)) { $script:LinkSeen[$lpid] } else { $now }
-        if ($now - $seenAt -gt $StaleLinkMs) {
-          $script:Links.Remove($lpid); $script:LinkSeen.Remove($lpid); $linksDirty = $true
-        } else {
-          $script:LinkSeen[$lpid] = $seenAt   # ensure unseen-on-disk links have a stamp
-        }
-      }
-    }
-    if ($linksDirty) { Save-Links }
-  }
-
-  # Sort: busy first, then alive, then most recently updated
-  $rows = @($rows | Sort-Object @{e={ -([int]$_.IsBusy) }}, @{e={ -([int]$_.IsAlive) }}, @{e={ -$_.UpdatedAt }})
-
-  # Overall Claude state drives the status GIF: waiting > running > idle.
-  # A dead-process ('stale') session counts as not-active and is ignored here.
-  # In the same pass, build the per-session sound-state snapshot (sound is per-session,
-  # not overall): map each alive session's row Color to its sound-state key.
+  # Overall state drives the status GIF: waiting > running > done > idle.
+  # In the same pass, build the per-agent sound-state snapshot (sound is per-agent,
+  # not overall): map each agent's row Color to its sound-state key.
   $st = 'idle'
   $snd = @{}
   foreach ($r in $rows) {
-    if (-not $r.IsAlive) { continue }
     switch ($r.Color) {
       'waiting' { $snd[$r.SessionId] = 'waiting'; $st = 'waiting' }
       'busy'    { $snd[$r.SessionId] = 'running'; if ($st -ne 'waiting') { $st = 'running' } }
+      'done'    { $snd[$r.SessionId] = 'done';    if ($st -eq 'idle')    { $st = 'done' } }
       'idle'    { $snd[$r.SessionId] = 'idle' }
     }
   }
   $script:OverallState = $st
-  $script:SndCurStates = $snd
 
-  # Expand the sorted parent list into the flat render order: each parent immediately
-  # followed by its live subagents (nested child rows). Children inherit the parent's
-  # sort slot, so they always sit directly under the session that spawned them. Only
-  # alive parents are scanned — a dead process can't have a running subagent. The
-  # parent-only $rows is kept for the count/sound math above; $ordered drives rendering.
-  $ordered = New-Object System.Collections.Generic.List[object]
-  foreach ($p in $rows) {
-    $ordered.Add($p)
-    if ($p.IsAlive) {
-      foreach ($ch in (Get-LiveSubagents $p.Cwd $p.SessionId $now)) {
-        $ch.Pid = $p.Pid        # inherit parent's pid → clicking the child focuses its terminal
-        $ch.StampAge($now)
-        $ordered.Add($ch)
+  # Debounce the per-agent sound snapshot against subagent-induced state flaps
+  # (see $SndStableMs above): a raw state change only replaces the confirmed
+  # snapshot after holding steady for $SndStableMs. Waiting (needs-input) bypasses
+  # the debounce — an agent blocked on the user should chime immediately.
+  $prevSnd = $script:SndCurStates
+  $stableSnd = @{}
+  foreach ($k in $snd.Keys) {
+    $raw = $snd[$k]
+    if ($raw -eq 'waiting') { $stableSnd[$k] = $raw; continue }   # urgent: no debounce
+    if (-not $prevSnd.ContainsKey($k)) {
+      # First sighting (overlay start, new agent): pass through unchanged. Update-Sound
+      # treats a first observation as a silent baseline, so nothing chimes at launch.
+      $stableSnd[$k] = $raw
+      continue
+    }
+    $pend = $script:SndPending[$k]
+    if ($pend) {
+      # The pending candidate has already held past the window before we saw this raw
+      # value -> confirm the candidate itself (it is the freshest stable observation).
+      if ($now - [long]$pend.since -ge $SndStableMs) {
+        $stableSnd[$k] = "$($pend.state)"
+        $script:SndPending.Remove($k)
+        # A newer raw value is already waiting behind the confirmed candidate: start
+        # its own debounce clock so it confirms on a later tick if it holds.
+        if ("$($prevSnd[$k])" -ne $raw -and "$($pend.state)" -ne $raw) {
+          $script:SndPending[$k] = @{ state = $raw; since = $now }
+        }
+        continue
+      }
+      if ("$($pend.state)" -ne $raw) {
+        # The candidate changed again before confirming -> it was a flap.
+        if ("$($prevSnd[$k])" -eq $raw) {
+          $script:SndPending.Remove($k)             # flapped back to the confirmed state: fully absorbed
+          $stableSnd[$k] = $raw
+        } else {
+          $script:SndPending[$k] = @{ state = $raw; since = $now }   # different state: restart the clock
+          $stableSnd[$k] = "$($prevSnd[$k])"
+        }
+        continue
+      }
+      $stableSnd[$k] = "$($prevSnd[$k])"            # same candidate, still inside the window
+    } else {
+      if ($prevSnd.ContainsKey($k) -and "$($prevSnd[$k])" -eq $raw) {
+        $stableSnd[$k] = $raw                       # unchanged -> pass through
+      } else {
+        $script:SndPending[$k] = @{ state = $raw; since = $now }   # new candidate: start the clock
+        $stableSnd[$k] = "$($prevSnd[$k])"          # keep reporting the old state until confirmed
       }
     }
   }
+  # Drop debounce bookkeeping for agents that disappeared this tick.
+  foreach ($k in @($script:SndPending.Keys)) { if (-not $snd.ContainsKey($k)) { $script:SndPending.Remove($k); $script:SndPendingSt.Remove($k) } }
+  $script:SndCurStates = $stableSnd
 
-  # Reconcile the live list against $ordered without clearing it. Reuse each row's
+  # Reconcile the live list against $rows without clearing it. Reuse each row's
   # existing Border (updating its content in place), create one only for new rows,
   # and move/insert it to the sorted position. Rows that stay put are never removed
   # from the visual tree, so the row under the cursor doesn't flicker on refresh.
   $seen = @{}
-  for ($i = 0; $i -lt $ordered.Count; $i++) {
-    $r = $ordered[$i]
+  for ($i = 0; $i -lt $rows.Count; $i++) {
+    $r = $rows[$i]
     $sid = $r.RowKey()
     $e = $script:RowMap[$sid]
     if (-not $e) { $e = New-Row; $script:RowMap[$sid] = $e }
@@ -2069,18 +1732,20 @@ function Update-List {
     }
   }
 
-  # Drop rows for sessions that disappeared.
+  # Drop rows for agents that disappeared (pane closed, agent exited).
   $stale = @($script:RowMap.Keys | Where-Object { -not $seen.ContainsKey($_) })
   foreach ($sid in $stale) {
     [void]$List.Items.Remove($script:RowMap[$sid].Border)
     $script:RowMap.Remove($sid)
   }
 
-  $aliveCount = ($rows | Where-Object { $_.IsAlive }).Count
-  $busyCount  = ($rows | Where-Object { $_.IsBusy -and $_.IsAlive }).Count
+  $aliveCount = $rows.Count
+  $busyCount  = ($rows | Where-Object { $_.IsBusy }).Count
+  $blockCount = ($rows | Where-Object { $_.Color -eq 'waiting' }).Count
   $sep = [SessionState]::Sep
   $CountText.Text = "$aliveCount active" +
-    $(if ($busyCount)  { " $sep $busyCount busy" } else { '' })
+    $(if ($busyCount)  { " $sep $busyCount busy" } else { '' }) +
+    $(if ($blockCount) { " $sep $blockCount waiting" } else { '' })
   Apply-ListSnapHeight
 }
 
@@ -2278,8 +1943,11 @@ $script:DlPs.Runspace = $script:DlRunspace
 $script:DlHandle = $script:DlPs.BeginInvoke()
 
 # Background sound downloader: drains $SndQueue, fetching each remote sound to a temp file
-# off the UI thread (browser User-Agent defeats hotlink blocks), then records the local
-# path in $SndFiles for Resolve-SoundFile to play. Mirrors the GIF downloader above.
+# off the UI thread, then records the local path in $SndFiles for Resolve-SoundFile to play.
+# Primary fetch is HttpWebRequest (browser UA); some CDNs (e.g. myinstants behind Cloudflare)
+# fingerprint-block .NET TLS clients with 403 even under a browser UA, so on failure the
+# fetch retries through curl.exe (native TLS stack passes). A FAILED entry is never final:
+# the queue re-arms it after a cooldown so a transient network loss self-heals.
 $script:SndDlRunspace = [runspacefactory]::CreateRunspace()
 $script:SndDlRunspace.Open()
 $script:SndDlRunspace.SessionStateProxy.SetVariable('q', $script:SndQueue)
@@ -2294,23 +1962,64 @@ $script:SndDlPs.Runspace = $script:SndDlRunspace
       [System.Net.SecurityProtocolType]::Tls
   } catch {}
   $tmp = [System.IO.Path]::GetTempPath()
+  $nextRetry = @{}   # url -> unix ms when a FAILED entry may be re-queued
   while ($true) {
     $url = $null
     try { if ($q.Count -gt 0) { $url = $q.Dequeue() } } catch {}
-    if (-not $url) { Start-Sleep -Milliseconds 120; continue }
-    if ($filesMap.ContainsKey($url)) { continue }
+    if (-not $url) {
+      # Idle loop: re-arm FAILED entries past their cooldown so a later fix
+      # (network back, CDN rule change) doesn't need an overlay restart.
+      $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+      foreach ($bad in @($nextRetry.Keys)) {
+        if ($nowMs -ge [long]$nextRetry[$bad]) {
+          $nextRetry.Remove($bad)
+          if (-not ($filesMap[$bad] -is [string] -and $filesMap[$bad] -eq 'FAILED')) { $q.Enqueue($bad) }
+          elseif ($filesMap.ContainsKey($bad) -and "$($filesMap[$bad])" -eq 'FAILED') { $q.Enqueue($bad) }
+        }
+      }
+      Start-Sleep -Milliseconds 5000
+      continue
+    }
+    if ($filesMap.ContainsKey($url)) {
+      $v = "$($filesMap[$url])"
+      if ($v -ne 'FAILED') { continue }   # already downloaded
+      # FAILED: fall through and retry the fetch (this dequeue IS the re-arm).
+    }
+    $ext = [System.IO.Path]::GetExtension(([Uri]$url).AbsolutePath); if (-not $ext) { $ext = '.mp3' }
+    $name = 'overlay-snd-' + ([Math]::Abs($url.GetHashCode())) + $ext
+    $dest = Join-Path $tmp $name
+    $ok = $false
     try {
       $req = [System.Net.HttpWebRequest]::Create($url)
       $req.Timeout = 20000; $req.ReadWriteTimeout = 20000; $req.UserAgent = 'Mozilla/5.0'
       $resp = $req.GetResponse()
-      $ext = [System.IO.Path]::GetExtension(([Uri]$url).AbsolutePath); if (-not $ext) { $ext = '.mp3' }
-      $name = 'overlay-snd-' + ([Math]::Abs($url.GetHashCode())) + $ext
-      $dest = Join-Path $tmp $name
       $fs = [System.IO.File]::Create($dest)
       $resp.GetResponseStream().CopyTo($fs)
       $fs.Close(); $resp.Close()
+      if ((Get-Item -LiteralPath $dest -ErrorAction SilentlyContinue).Length -gt 0) { $ok = $true }
+    } catch {}
+    if (-not $ok) {
+      # Fallback: curl.exe ships with Windows 10 1803+ and its native TLS stack
+      # is not fingerprint-blocked the way .NET's is.
+      try {
+        $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
+        if (Test-Path $curl) {
+          $null = & $curl -sS --max-time 30 -o $dest `
+            -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' `
+            -e "$([Uri]$url).GetLeftPart([System.UriPartial]::Authority)/" `
+            -L -- $url 2>$null
+          if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $dest) -and (Get-Item -LiteralPath $dest).Length -gt 0) { $ok = $true }
+        }
+      } catch {}
+    }
+    if ($ok) {
       $filesMap[$url] = $dest
-    } catch { $filesMap[$url] = 'FAILED' }
+      $nextRetry.Remove($url)
+    } else {
+      $filesMap[$url] = 'FAILED'
+      Remove-Item $dest -ErrorAction SilentlyContinue
+      $nextRetry[$url] = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 300000   # retry in 5 min
+    }
   }
 })
 $script:SndDlHandle = $script:SndDlPs.BeginInvoke()
@@ -2403,9 +2112,11 @@ function Get-GifPathForState([string]$state) {
 
   # Never blank the GIF just because Claude entered a state whose GIF is unset.
   # For waiting, prefer the running GIF as a visual "attention" fallback, then idle.
+  # Herdr's `done` state (blue tint) has no GIF slot of its own; it falls back to idle.
   $fallbackOrder = switch ($state) {
     'waiting' { @('running','idle') }
     'running' { @('waiting','idle') }
+    'done'    { @('idle','running','waiting') }
     default   { @('running','waiting') }
   }
   foreach ($k in $fallbackOrder) {
@@ -2484,6 +2195,8 @@ function Update-Gif([bool]$force = $false) {
 # transition would be misleading).
 function Get-SoundPathForState([string]$state) {
   if (-not $script:Snd.enabled) { return '' }
+  # Herdr's `done` state has no sound slot of its own; treat it as `idle` for sound.
+  if ($state -eq 'done') { $state = 'idle' }
   if (-not $script:Snd.pathEnabled[$state]) { return '' }
   return [string]$script:Snd.paths[$state]
 }
@@ -2491,12 +2204,13 @@ function Get-SoundPathForState([string]$state) {
 # Resolve a configured sound path to a local file ready for MediaPlayer, or $null if not
 # (yet) available. Local paths / file:// URLs resolve immediately; http(s) URLs resolve to
 # a downloaded temp file once the background fetcher has it (enqueues the fetch otherwise).
+# A FAILED entry is re-enqueued: the background worker self-throttles retries via cooldown.
 function Resolve-SoundFile([string]$path) {
   if ([string]::IsNullOrWhiteSpace($path)) { return $null }
   if ($path -match '^https?://') {
     $f = $script:SndFiles[$path]
-    if ($f -is [string] -and $f -ne 'FAILED' -and (Test-Path -LiteralPath $f)) { return $f }
-    if ($f -ne 'FAILED' -and -not $script:SndQueued.ContainsKey($path)) {
+    if ($f -is [string] -and "$f" -ne 'FAILED' -and (Test-Path -LiteralPath $f)) { return $f }
+    if (-not $script:SndQueued.ContainsKey($path)) {
       $script:SndQueued[$path] = $true; $script:SndQueue.Enqueue($path)
     }
     return $null
@@ -2528,24 +2242,37 @@ function Play-SoundFile([string]$file) {
 
 # Resolve a sound path to a local file SYNCHRONOUSLY (used by the settings "Test" button,
 # where blocking briefly on a user click is fine). Remote URLs are fetched inline if not
-# already cached. Returns $null if the path is empty or the fetch fails.
+# already cached — HttpWebRequest first, then curl.exe (CDNs that block .NET TLS pass curl).
+# Returns $null if the path is empty or the fetch fails.
 function Get-SoundFileSync([string]$path) {
   if ([string]::IsNullOrWhiteSpace($path)) { return $null }
   if ($path -match '^https?://') {
     $f = $script:SndFiles[$path]
-    if ($f -is [string] -and $f -ne 'FAILED' -and (Test-Path -LiteralPath $f)) { return $f }
+    if ($f -is [string] -and "$f" -ne 'FAILED' -and (Test-Path -LiteralPath $f)) { return $f }
+    $ext = [System.IO.Path]::GetExtension(([Uri]$path).AbsolutePath); if (-not $ext) { $ext = '.mp3' }
+    $dest = Join-Path ([System.IO.Path]::GetTempPath()) ('overlay-snd-' + ([Math]::Abs($path.GetHashCode())) + $ext)
     try {
       try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
       $req = [System.Net.HttpWebRequest]::Create($path)
       $req.Timeout = 15000; $req.ReadWriteTimeout = 15000; $req.UserAgent = 'Mozilla/5.0'
       $resp = $req.GetResponse()
-      $ext = [System.IO.Path]::GetExtension(([Uri]$path).AbsolutePath); if (-not $ext) { $ext = '.mp3' }
-      $dest = Join-Path ([System.IO.Path]::GetTempPath()) ('overlay-snd-' + ([Math]::Abs($path.GetHashCode())) + $ext)
       $fs = [System.IO.File]::Create($dest)
       $resp.GetResponseStream().CopyTo($fs); $fs.Close(); $resp.Close()
-      $script:SndFiles[$path] = $dest
-      return $dest
-    } catch { return $null }
+      if ((Get-Item -LiteralPath $dest).Length -gt 0) { $script:SndFiles[$path] = $dest; return $dest }
+    } catch {}
+    try {
+      $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
+      if (Test-Path $curl) {
+        $null = & $curl -sS --max-time 30 -o $dest `
+          -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' `
+          -e "$([Uri]$path).GetLeftPart([System.UriPartial]::Authority)/" `
+          -L -- $path 2>$null
+        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $dest) -and (Get-Item -LiteralPath $dest).Length -gt 0) {
+          $script:SndFiles[$path] = $dest; return $dest
+        }
+      }
+    } catch {}
+    return $null
   }
   $local = $path -replace '^file:///?', ''
   try { $local = [System.IO.Path]::GetFullPath($local) } catch { return $null }
