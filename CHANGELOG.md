@@ -4,6 +4,26 @@ All notable changes to the Claude Session Monitor overlay are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.0] - 2026-09-07
+
+- **Herdr edition.** The overlay no longer reads `~/.claude/sessions/*.json` or
+  any Claude Code hooks: it polls `herdr agent list` every 2s and shows every
+  AI coding agent running inside [Herdr](https://herdr.dev) (claude, opencode,
+  codex, …), colour-coded by herdr's own lifecycle state (working / blocked /
+  done / idle).
+- Click-to-focus now runs `herdr agent focus` and raises the herdr workspace
+  window; right-click also raises it (the old per-row terminal linking is gone
+  — herdr owns the terminal).
+- Shift-click prompt composer now delivers through `herdr agent prompt`, which
+  writes into the pane's own input stream (no keystroke synthesis, no
+  clipboard use, works while another window has focus).
+- Rows show the herdr pane id as identity, the detected agent kind next to the
+  project folder, and the stripped terminal title (the current task) as the
+  subtitle. The age column shows herdr's `state_change_seq` counter.
+- Added a blue tint for herdr's `done` state; the GIF `done` state falls back
+  to the idle GIF and the sound `done` state to the idle sound.
+- Header shows **herdr offline** when the herdr server is not running.
+
 ## [1.0.12] - 2026-07-17
 
 - The status GIF window now follows the click-through toggle too: while

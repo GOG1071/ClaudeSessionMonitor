@@ -1,67 +1,49 @@
-# Claude Session Monitor
+# Claude Session Monitor (herdr edition)
 
-A lightweight, always-on-top Windows overlay that shows every running Claude Code
-session globally — across all terminals, projects, and virtual desktops.
-
-> **Setting up on a new machine?** See [INSTALL.md](INSTALL.md) — it covers the one
-> step that isn't in the repo: registering the `waiting` attention hook and the
-> live-activity hook in `~/.claude/settings.json`.
+A lightweight, always-on-top Windows overlay that shows every AI coding agent
+running inside [Herdr](https://herdr.dev) — across all workspaces, panes, and
+projects — polled live through the herdr CLI.
 
 ## Features
 
-- **Live session list** — reads `~/.claude/sessions/<pid>.json` and refreshes every 2s.
-  Each row shows the project folder and the session **PID**, with a **status-coloured row
-  background** (🟢 busy · 🟡 needs-input · ⚪ idle · 🔴 ended).
-- **What each session is doing** — under the session name, the **recent prompt** line
-  (italic amber) shows the most recent user prompt, and the activity line summarises what
-  the session is currently doing. With the **live-activity hook** installed (see
-  [INSTALL.md](INSTALL.md)), a busy session shows the precise current action — `Editing
-  overlay.ps1`, `Bash: git status`, `Read settings.json` — pushed the instant
-  each tool runs (`~/.claude/session-status/`). Without the hook it falls back to a coarser
-  summary read from the transcript (`~/.claude/projects/<cwd>/<sessionId>.jsonl`). Hover a row
-  for the full text plus pid, version, status, and cwd.
-- **Live subagents nested under their parent** — Task/Agent subagents have no pid or session
-  file of their own, so they're normally invisible. With the **subagent hook** installed (see
-  [INSTALL.md](INSTALL.md)), each live subagent appears as a **teal child row** indented directly
-  under the session that spawned it, showing the agent type (e.g. `t1k-debugger`) and its spawn
-  prompt. Driven by Claude Code's `SubagentStart`/`SubagentStop` events (the parent's session id is
-  shared with its subagents, which is what links them) — the row appears the instant the subagent
-  starts and disappears the instant it finishes.
-- **Click to focus** — left-click a row to bring that session's terminal window to the
-  foreground. Works reliably across the foreground-lock and minimised windows.
-- **Shift-click to prompt** — Shift+left-click a row to open an inline composer that reads like
-  Claude's own input: a `>` chevron, placeholder text, **Enter** to send, **Shift+Enter** for a
-  newline (the box auto-grows, then scrolls), and **↑ / ↓** to recall prompts you've sent to that
-  session this run. **Esc** cancels. The overlay focuses the session's terminal and delivers the
-  prompt for you — single-line as Unicode keystrokes, multi-line via a clipboard-preserving paste
-  (the clipboard is saved and restored) — then submits it.
-- **Right-click to link** — for sessions whose terminal can't be auto-identified
-  (Windows Terminal exposes only the tab title), focus the terminal once and right-click
-  the row to link it. The link is remembered per session.
-- **Shown on all desktops** — pinned natively via the Windows virtual-desktop shell API
-  (with an automatic "follow the active desktop" fallback if pinning is unavailable).
-- **Pin toggle** — the 📌 button in the header turns the always-on-top + show-on-all-desktops
-  behaviour on (default) or off. When off, the overlay is a normal window that stays on its
-  current desktop. The choice persists across restarts.
-- **Resizable & adjustable opacity** — drag the right edge to change width; use the
-  header slider to change opacity. Both persist across restarts.
-- **Version & update check** — the header shows the overlay's own version (`v1.0.0`, next to
-  the title). On launch it checks GitHub (off the UI thread) for a newer published version and,
-  if one exists, shows an amber **↑ vX.Y.Z** indicator — click it to open the repo, then
-  `git pull` to update. The local version is read from the `VERSION` file; running from a copy
-  without it shows `vdev` and disables the check.
-- **Status GIF** — an optional separate floating window shows a different animated GIF
-  depending on the overall Claude state across all sessions: **needs-input** (a session
-  waiting for you) takes priority over **running** (any busy session), which takes
-  priority over **idle**. Click the **GIF** button in the header to set a GIF per state.
+- **Live agent list** — polls `herdr agent list` every 2s. Each row shows the
+  project folder, the detected **agent kind** (claude, opencode, codex, …), and
+  the task title herdr read from the terminal, with a **status-coloured row
+  background** (🟢 working · 🟡 blocked/needs-input · 🔵 done · ⚪ idle).
+- **Click to focus** — left-click a row to focus that agent's pane via
+  `herdr agent focus`, then raise the herdr workspace window (matched by
+  workspace label / repo folder in window titles).
+- **Shift-click to prompt** — Shift+left-click a row to open an inline composer
+  (Enter to send, Shift+Enter newline, ↑/↓ history). The prompt is delivered
+  with `herdr agent prompt <pane> <text>` — herdr writes it into the pane's own
+  input stream, so no keystroke synthesis and no clipboard use.
+- **Status GIF** — the separate floating GIF window (different animated GIF per
+  overall state: needs-input > working > done > idle) works exactly as before.
+  Click the **GIF** button in the header to set a GIF per state.
+- **Status sounds** — per-agent transition sounds and re-nag timers, unchanged.
+  Herdr's `done` state maps to the `idle` sound slot.
+- **Shown on all desktops / pin toggle / resizable / opacity** — unchanged
+  overlay chrome.
+- **Version & update check** — unchanged.
 
 ## Install / run
 
-1. Clone the repo anywhere.
-2. Double-click **`Start Overlay.vbs`** (launches with no console window).
+1. Install [Herdr](https://herdr.dev) and keep a herdr session running
+   (`herdr`, or `herdr server` headless). The `herdr` CLI must be on `PATH`
+   (the installer adds it).
+2. Clone the repo anywhere.
+3. Double-click **`Start Overlay.vbs`**.
 
-To start it automatically at login, drop a shortcut to `Start Overlay.vbs` into your
-Startup folder (`shell:startup`).
+To start it automatically at login, drop a shortcut to `Start Overlay.vbs` into
+your Startup folder (`shell:startup`).
+
+**No Claude Code hooks are needed anymore.** Herdr detects each agent and its
+lifecycle state (`working` / `blocked` / `idle` / `done`) by itself. The old
+`scripts/*.cjs` hooks are kept in the repo for reference but are not read by
+the overlay.
+
+If herdr is not running, the overlay shows **"herdr offline"** and stays quiet
+until a herdr server comes back.
 
 ## Files
 
@@ -70,11 +52,30 @@ Startup folder (`shell:startup`).
 | `overlay.ps1` | The overlay (WPF in Windows PowerShell 5.1). |
 | `VERSION` | The overlay's version string (single source of truth; checked against GitHub for updates). |
 | `Start Overlay.vbs` | Launches `overlay.ps1` hidden. |
-| `scripts/session-attention.cjs` | Hook: marks a session **needs-input** (Notification) and clears it (UserPromptSubmit / PreToolUse). |
-| `scripts/session-activity.cjs` | Hook: writes a session's **live activity** line (PreToolUse) and clears it (Stop). |
-| `scripts/subagent-activity.cjs` | Hook: writes a **live subagent** marker (SubagentStart) and clears it (SubagentStop), keyed by parent session id. |
 | `settings.json` | Saved width, opacity + status-GIF config (local, git-ignored). |
-| `links.json` | Saved session→window links (local, git-ignored). |
+| `scripts/*.cjs` | Legacy Claude Code hooks (no longer used by the herdr edition). |
+
+## Data source (herdr)
+
+Each tick runs `herdr agent list` over herdr's local API socket and renders one
+row per record:
+
+- **Name** = project folder (`cwd` leaf).
+- **Right of the name** = detected agent kind.
+- **Subtitle** = stripped terminal title (the task the agent is on).
+- **Tint** = `working` → green, `blocked` → yellow (needs input), `done` →
+  blue, `idle`/`unknown` → gray.
+- **Age column** = herdr's `state_change_seq` counter (bumps on each state
+  change).
+- **Sort** = working first, then blocked, then done, then idle (alphabetical by
+  project inside each group).
+
+Click delivery:
+
+- **Focus** = `herdr agent focus <pane>` + window-title match on the workspace
+  label (or repo folder from the worktree path) to raise herdr's window.
+- **Prompt** = `herdr agent prompt <pane> <text>` (bracketed-paste stream, no
+  foreground needed).
 
 ## Status GIF
 
@@ -85,15 +86,8 @@ for it. The floating GIF window only appears when the current state has a GIF co
 
 - Drag the GIF window anywhere to move it; drag its bottom-right corner to resize. Position
   and size persist across restarts.
-- Busy and idle map directly from each session's native status (`busy` → **running**,
-  otherwise → **idle**). Dead-process sessions are ignored.
-- **Needs-input requires the attention hook.** Claude Code's native `~/.claude/sessions`
-  files only ever report `busy`/`idle` — never `waiting` — so the *waiting-for-you* state
-  comes from `scripts/session-attention.cjs`, wired into `~/.claude/settings.json` as a
-  `Notification` hook (writes a marker when Claude needs input) and a `UserPromptSubmit` hook
-  (clears it when you reply). The overlay shows **needs input** for any alive, non-busy session
-  that has a marker; markers are reaped automatically when the session goes busy or ends. Without
-  these hooks installed, sessions only ever show running/idle.
+- Overall state priority: any **blocked** agent > any **working** agent > any **done** agent
+  > idle.
 - GIFs are decoded and animated natively (no external dependencies). For best results use GIFs
   with a transparent background — the window itself is transparent and always-on-top, and shows
   on every virtual desktop like the main overlay.
@@ -106,16 +100,8 @@ for it. The floating GIF window only appears when the current state has a GIF co
   fills the fields — click the dialog's main **Save** to apply it. Presets persist in
   `settings.json` (`gifPresets` / `sndPresets`).
 
-## Notes / limitations
-
-- The native virtual-desktop pin uses COM GUIDs for Windows 11 24H2/25H2
-  (build 261xx/262xx). On other builds the overlay automatically falls back to
-  follow-the-active-desktop mode.
-- Windows Terminal runs as a single process hosting all windows/tabs, so a session can
-  only be auto-matched to its window when the tab/window title contains the project
-  folder name; otherwise use right-click to link it.
-
 ## Requirements
 
 - Windows 10/11 with Windows PowerShell 5.1 (built in).
-- Claude Code writing session files under `~/.claude/`.
+- [Herdr](https://herdr.dev) v0.8+ installed, with a running session and the
+  `herdr` CLI on `PATH`.
