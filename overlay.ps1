@@ -4,7 +4,9 @@
 
 # Single-instance guard (last-one-wins): if a previous overlay is running, kill
 # it so this new instance takes over. We track the live overlay via a PID file.
-$script:OverlayPidFile = Join-Path $env:TEMP 'ClaudeSessionsOverlay.pid'
+# LOCALAPPDATA, not TEMP: TEMP differs between launchers (Explorer vs. a tool's shell),
+# which let a second overlay start on top of the first and swallow its clicks.
+$script:OverlayPidFile = Join-Path $env:LOCALAPPDATA 'ClaudeSessionsOverlay.pid'
 $script:OverlayHostName = (Get-Process -Id $PID).ProcessName   # powershell / pwsh
 if (Test-Path $script:OverlayPidFile) {
   $oldPid = Get-Content $script:OverlayPidFile -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -24,6 +26,10 @@ Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
+
+# herdr writes UTF-8 JSON; PowerShell 5.1 decodes native stdout with the OEM codepage,
+# which mangles non-ASCII text (Vietnamese folder names, titles). Decode as UTF-8.
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}
 
 # Win32 helpers: enumerate top-level windows and focus one (restoring if minimized,
 # using AttachThreadInput to bypass the foreground lock).
@@ -366,9 +372,6 @@ class SessionState {
   [string] $Activity = ''   # shown as the row subtitle: terminal title or cwd
   [string] $Prompt   = ''   # last prompt is not exposed by herdr; kept for hooks compat
 
-  # --- Per-tick snapshot (relative-time string is recomputed each refresh) ---
-  [string] $AgeText = ''
-
   # Construct from one `herdr agent list` record plus the overall liveness verdict.
   # Herdr only lists agents it currently sees in a pane, so every record is alive.
   SessionState([object]$json) {
@@ -419,14 +422,6 @@ class SessionState {
     return $this.PaneId
   }
 
-  # Refresh the relative-age snapshot against the current clock (called per tick).
-  # Herdr exposes no wall-clock timestamps, so the age column shows the state-change
-  # sequence number instead: a monotonically increasing counter that bumps every time
-  # the agent's lifecycle state changes. Lower = longer since last change.
-  [void] StampAge([long]$now) {
-    $this.AgeText = if ($this.StateChangeSeq -gt 0) { "seq $($this.StateChangeSeq)" } else { '' }
-  }
-
   # --- Display projections (consumed by Set-RowData) ---
 
   [string] Name() {
@@ -436,16 +431,10 @@ class SessionState {
     return $this.Cwd
   }
 
-  [string] Sub() {
+  # Session name shown after the folder: the terminal title (the task the agent is on).
+  [string] SessionName() {
     if ($this.Title) { return $this.Title }
-    if ($this.Activity) { return $this.Activity }
-    return "$($this.StatusText) $([SessionState]::Sep) $($this.AgentKind)"
-  }
-
-  [string] CtxText() { return '' }   # herdr exposes no token usage; column stays collapsed
-
-  [string] MetaText() {
-    return "$($this.AgentKind) $([SessionState]::Sep) $($this.StatusText)"
+    return $this.Activity
   }
 
   [string] Tip() {
@@ -556,7 +545,7 @@ function Get-HerdrAgents {
     <Grid>
       <DockPanel Margin="0">
         <!-- Header bar (drag handle) -->
-        <Grid DockPanel.Dock="Top" x:Name="Header" Background="#00000000" Height="34">
+        <Grid DockPanel.Dock="Top" x:Name="Header" Background="#00000000" Height="24">
           <Grid.ColumnDefinitions>
             <ColumnDefinition Width="*"/>
             <ColumnDefinition Width="Auto"/>
@@ -564,9 +553,9 @@ function Get-HerdrAgents {
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
           </Grid.ColumnDefinitions>
-          <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="12,0,0,0">
+          <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="10,0,0,0">
             <TextBlock Text="&#x25CF; Claude Sessions" Foreground="#FFE6A23C"
-                       FontFamily="Segoe UI Semibold" FontSize="12" VerticalAlignment="Center"/>
+                       FontFamily="Segoe UI Semibold" FontSize="11" VerticalAlignment="Center"/>
             <TextBlock x:Name="VersionText" Text="" Foreground="#66FFFFFF"
                        FontFamily="Segoe UI" FontSize="10" VerticalAlignment="Center" Margin="6,1,0,0"/>
             <TextBlock x:Name="UpdateText" Text="" Foreground="#FFE6A23C"
@@ -575,17 +564,17 @@ function Get-HerdrAgents {
           </StackPanel>
           <TextBlock Grid.Column="1" x:Name="CountText" Text="" Foreground="#80FFFFFF"
                      FontFamily="Segoe UI" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
-          <Button Grid.Column="2" x:Name="SettingsBtn" Content="&#x2699;" Width="30" Height="30"
+          <Button Grid.Column="2" x:Name="SettingsBtn" Content="&#x2699;" Width="22" Height="22" Padding="0"
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
-                  FontSize="15" Cursor="Hand" ToolTip="Settings: opacity, GIF, sound, auto-fit"/>
+                  FontSize="13" Cursor="Hand" ToolTip="Settings: opacity, GIF, sound, auto-fit"/>
           <!-- Reserves the slot; the real button floats outside RootShell (see below). -->
-          <Border Grid.Column="3" Width="30" Background="Transparent"/>
-          <Button Grid.Column="4" x:Name="CloseBtn" Content="&#x2715;" Width="30" Height="30"
+          <Border Grid.Column="3" Width="22" Background="Transparent"/>
+          <Button Grid.Column="4" x:Name="CloseBtn" Content="&#x2715;" Width="22" Height="22" Padding="0"
                   Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
-                  FontSize="13" Cursor="Hand"/>
+                  FontSize="11" Cursor="Hand" Margin="0,0,2,0"/>
         </Grid>
         <!-- Session list: height is snap-resized in row units (2 sessions, 3 sessions, etc.). -->
-        <ScrollViewer x:Name="ScrollHost" Margin="8,2,8,10"
+        <ScrollViewer x:Name="ScrollHost" Margin="6,0,6,6"
                       VerticalScrollBarVisibility="Auto"
                       HorizontalScrollBarVisibility="Disabled"
                       CanContentScroll="False"
@@ -597,7 +586,7 @@ function Get-HerdrAgents {
         </ScrollViewer>
       </DockPanel>
       <!-- Right-edge handle for horizontal resizing (below the header). -->
-      <Thumb x:Name="ResizeGrip" HorizontalAlignment="Right" Width="6" Margin="0,34,0,0" Cursor="SizeWE">
+      <Thumb x:Name="ResizeGrip" HorizontalAlignment="Right" Width="6" Margin="0,24,0,0" Cursor="SizeWE">
         <Thumb.Template>
           <ControlTemplate TargetType="Thumb">
             <Border Background="Transparent"/>
@@ -616,10 +605,10 @@ function Get-HerdrAgents {
   </Border>
   <!-- Sits over RootShell's reserved header slot, so it keeps full opacity while the
        rest of the overlay fades out under the cursor. -->
-  <Button x:Name="ClickThruBtn" Content="&#x25CE;" Width="30" Height="30"
-          HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,3,31,0"
+  <Button x:Name="ClickThruBtn" Content="&#x25CE;" Width="22" Height="22" Padding="0"
+          HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,1,25,0"
           Foreground="#99FFFFFF" Background="Transparent" BorderThickness="0"
-          FontSize="14" Cursor="Hand" ToolTip="Click-through: OFF (clicks hit the overlay)"/>
+          FontSize="12" Cursor="Hand" ToolTip="Click-through: OFF (clicks hit the overlay)"/>
   </Grid>
 </Window>
 "@
@@ -1026,10 +1015,10 @@ $ResizeGrip.Add_DragDelta({
 $ResizeGrip.Add_DragCompleted({ Save-UISettings })
 
 function Get-RowOuterHeight($item) {
-  if (-not $item) { return 66.0 }
-  $h = if ($item.ActualHeight -gt 0) { [double]$item.ActualHeight } else { 66.0 }
+  if (-not $item) { return 26.0 }
+  $h = if ($item.ActualHeight -gt 0) { [double]$item.ActualHeight } else { 26.0 }
   try { $h += [double]$item.Margin.Top + [double]$item.Margin.Bottom } catch {}
-  return [Math]::Max(42.0, $h)
+  return [Math]::Max(20.0, $h)
 }
 
 function Get-RowSlotHeight {
@@ -1040,18 +1029,18 @@ function Get-RowSlotHeight {
       $count++
     }
   }
-  if ($count -gt 0) { return [Math]::Max(42.0, $sum / $count) }
-  return 66.0
+  if ($count -gt 0) { return [Math]::Max(20.0, $sum / $count) }
+  return 26.0
 }
 
 function Get-ListHeightForRows([int]$rows) {
   $rows = [Math]::Max(1, $rows)
-  if ($List.Items.Count -le 0) { return 48.0 }
+  if ($List.Items.Count -le 0) { return 26.0 }
 
   $take = [Math]::Min($rows, $List.Items.Count)
   $h = 0.0
   for ($i = 0; $i -lt $take; $i++) { $h += (Get-RowOuterHeight $List.Items[$i]) }
-  return [Math]::Max(48.0, [Math]::Ceiling($h + 1.0))
+  return [Math]::Max(26.0, [Math]::Ceiling($h + 1.0))
 }
 
 function Get-SnappedRowsForHeight([double]$height) {
@@ -1086,7 +1075,7 @@ function Apply-ListSnapHeight {
 
   $count = [int]$List.Items.Count
   if ($count -le 0) {
-    $ScrollHost.Height = 48.0
+    $ScrollHost.Height = 26.0
     $ScrollHost.VerticalScrollBarVisibility = 'Disabled'
     return
   }
@@ -1150,11 +1139,10 @@ $Window.Add_SourceInitialized({
 # Herdr agent actions (focus + prompt delivery) via the herdr CLI.
 # ---------------------------------------------------------------------------
 
-# Bring the workspace hosting $paneId to the foreground. `herdr agent focus`
-# only selects the pane inside the herdr UI; when the herdr window itself is
-# behind other windows, the workspace label (falling back to the pane's cwd
-# leaf) is matched against top-level window titles to raise the right one.
-function Focus-HerdrAgent([string]$paneId, [string]$cwd) {
+# Show $paneId in the herdr UI: `herdr agent focus` switches the attached client to
+# that pane, then the window hosting the client is raised (found by process tree, not
+# by title, so a same-named editor/terminal window is never picked by mistake).
+function Focus-HerdrAgent([string]$paneId, [string]$cwd, [switch]$LaunchIfDetached) {
   if ([string]::IsNullOrWhiteSpace($paneId)) { return $false }
 
   # 1. Select the pane inside the herdr UI (no-op if herdr is not running).
@@ -1163,39 +1151,44 @@ function Focus-HerdrAgent([string]$paneId, [string]$cwd) {
     if ($LASTEXITCODE -ne 0) { return $false }
   } catch { return $false }
 
-  # 2. Raise a top-level window whose title matches the workspace label or cwd leaf.
-  $needles = @()
+  # 2. Show the herdr UI itself: raise the window hosting an attached herdr client
+  #    (now switched to this pane). With no client attached, open one when asked.
+  $win = Get-HerdrClientWindow
+  if ($win) { [WinTools]::Focus($win.Handle); return $true }
+  if ($LaunchIfDetached) { Start-HerdrClient }
+  return $true   # pane focused inside herdr even if no window is showing it
+}
+
+# The top-level window hosting an attached herdr client: walk each client process
+# (herdr.exe without the `server` arg) up its parent chain to the first process that
+# owns a visible window (Windows Terminal, or the shell for a classic console).
+function Get-HerdrClientWindow {
   try {
-    $wl = & $HerdrBin workspace list 2>$null
-    if ($LASTEXITCODE -eq 0 -and $wl) {
-      $wid = ($paneId -split ':')[0]
-      $resp = ($wl -join "`n") | ConvertFrom-Json
-      foreach ($ws in $resp.result.workspaces) {
-        if ("$($ws.workspace_id)" -eq $wid) {
-          if ($ws.label) { $needles += "$($ws.label)" }
-          if ($ws.worktree -and $ws.worktree.checkout_path) {
-            $needles += [System.IO.Path]::GetFileName($("$($ws.worktree.checkout_path)".TrimEnd('\')))
-          }
-          break
-        }
+    $procs = @{}
+    foreach ($p in (Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, CommandLine)) { $procs[[uint32]$p.ProcessId] = $p }
+    $wins = [WinTools]::List()
+    foreach ($c in $procs.Values) {
+      if ($c.Name -ne 'herdr.exe' -or "$($c.CommandLine)" -match '\sserver(\s|$)') { continue }
+      $id = [uint32]$c.ParentProcessId
+      for ($i = 0; $i -lt 6 -and $procs.ContainsKey($id); $i++) {
+        $w = $wins | Where-Object { $_.Pid -eq $id } | Select-Object -First 1
+        if ($w) { return $w }
+        $id = [uint32]$procs[$id].ParentProcessId
       }
     }
   } catch {}
-  if ($cwd) { $needles += [System.IO.Path]::GetFileName($cwd.TrimEnd([char]'\', [char]'/')) }
+  return $null
+}
 
-  $best = $null; $bestScore = 0
-  foreach ($w in [WinTools]::List()) {
-    foreach ($n in $needles) {
-      if (-not $n) { continue }
-      if ($w.Title -like "*$n*") {
-        $s = $n.Length
-        if ($s -gt $bestScore) { $bestScore = $s; $best = $w }
-        break
-      }
+# Open a terminal attached to the persistent herdr session (it shows the focused pane).
+function Start-HerdrClient {
+  try {
+    if (Get-Command 'wt.exe' -ErrorAction SilentlyContinue) {
+      Start-Process 'wt.exe' -ArgumentList $HerdrBin
+    } else {
+      Start-Process 'powershell.exe' -ArgumentList '-NoExit', '-Command', $HerdrBin
     }
-  }
-  if ($best) { [WinTools]::Focus($best.Handle); return $true }
-  return $true   # pane focused inside herdr even if no window matched
+  } catch {}
 }
 
 # Deliver a prompt to a herdr agent: `herdr agent prompt <pane> <text>`. The CLI
@@ -1340,8 +1333,8 @@ function Send-PromptToSession($paneId, $cwd, $sessionId, $text) {
 function New-Row {
   $border = New-Object System.Windows.Controls.Border
   $border.CornerRadius = '7'
-  $border.Margin = '0,3,0,0'
-  $border.Padding = '10,7,10,7'
+  $border.Margin = '0,2,0,0'
+  $border.Padding = '8,4,8,4'
   # Default tint until Set-RowData re-tints by status (New-Row is a parameterless
   # template; per-session content/colour is filled in by Set-RowData each tick).
   $border.Background = [Windows.Media.BrushConverter]::new().ConvertFrom('#386E7681')
@@ -1356,7 +1349,7 @@ function New-Row {
     if (-not ($t -and $t.Pid)) { return }
     $shift = ([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Shift) -ne 0
     if ($shift) { Show-PromptInput $this; return }
-    $ok = Focus-HerdrAgent $t.Pid $t.Cwd
+    $ok = Focus-HerdrAgent $t.Pid $t.Cwd -LaunchIfDetached
     if (-not $ok) { Show-RowFlash $this '#55F56C6C' }   # red: couldn't reach the herdr server
   })
 
@@ -1365,7 +1358,7 @@ function New-Row {
   $border.Add_MouseRightButtonUp({
     $t = $this.Tag
     if ($t -and $t.Pid) {
-      $ok = Focus-HerdrAgent $t.Pid $t.Cwd
+      $ok = Focus-HerdrAgent $t.Pid $t.Cwd -LaunchIfDetached
       Show-RowFlash $this $(if ($ok) { '#5567C23A' } else { '#55F56C6C' })
     }
   })
@@ -1379,72 +1372,33 @@ function New-Row {
   $grid.ColumnDefinitions.Add($c0)
   $grid.ColumnDefinitions.Add($c1)
 
-  $stack = New-Object System.Windows.Controls.StackPanel
-  [Windows.Controls.Grid]::SetColumn($stack, 0)
-
+  # Single line: "<folder>  <session name>", trimmed with an ellipsis when too wide.
   $name = New-Object System.Windows.Controls.TextBlock
   $name.FontFamily = 'Segoe UI Semibold'
   $name.FontSize = 12
   $name.TextTrimming = 'CharacterEllipsis'
+  $name.VerticalAlignment = 'Center'
+  [Windows.Controls.Grid]::SetColumn($name, 0)
   $runName = New-Object System.Windows.Documents.Run
   $runName.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#FFFFFFFF')
-  $runPid = New-Object System.Windows.Documents.Run
-  $runPid.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#80FFFFFF')
-  $runPid.FontFamily = 'Segoe UI'
-  $runPid.FontSize = 11
+  $runTitle = New-Object System.Windows.Documents.Run
+  $runTitle.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#80FFFFFF')
+  $runTitle.FontFamily = 'Segoe UI'
+  $runTitle.FontSize = 11
   $name.Inlines.Add($runName)
-  $name.Inlines.Add($runPid)
-  $stack.Children.Add($name) | Out-Null
+  $name.Inlines.Add($runTitle)
 
-  # Most recent user prompt — always built, collapsed when empty so the row's element
-  # structure stays stable across refreshes (no add/remove churn under the cursor).
-  $promptTb = New-Object System.Windows.Controls.TextBlock
-  $promptTb.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#99E6A23C')
-  $promptTb.FontFamily = 'Segoe UI'
-  $promptTb.FontStyle = 'Italic'
-  $promptTb.FontSize = 10
-  $promptTb.TextTrimming = 'CharacterEllipsis'
-  $stack.Children.Add($promptTb) | Out-Null
+  # Agent kind (claude, codex, ds4, ...) pinned to the end of the line, dim blue.
+  $kind = New-Object System.Windows.Controls.TextBlock
+  $kind.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#997AC2FF')
+  $kind.FontFamily = 'Segoe UI'
+  $kind.FontSize = 10
+  $kind.VerticalAlignment = 'Center'
+  $kind.Margin = '8,0,0,0'
+  [Windows.Controls.Grid]::SetColumn($kind, 1)
 
-  $sub = New-Object System.Windows.Controls.TextBlock
-  $sub.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#80FFFFFF')
-  $sub.FontFamily = 'Segoe UI'
-  $sub.FontSize = 10
-  $sub.TextTrimming = 'CharacterEllipsis'
-  $stack.Children.Add($sub) | Out-Null
-
-  # Model + CLI version (e.g. "opus 4.8 · v2.1.170"), dim. Collapsed when unknown.
-  $meta = New-Object System.Windows.Controls.TextBlock
-  $meta.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#807AC2FF')
-  $meta.FontFamily = 'Segoe UI'
-  $meta.FontSize = 10
-  $meta.TextTrimming = 'CharacterEllipsis'
-  $stack.Children.Add($meta) | Out-Null
-
-  # Right column: current context fill (top) over relative age (bottom).
-  $right = New-Object System.Windows.Controls.StackPanel
-  $right.VerticalAlignment = 'Center'
-  $right.Margin = '8,0,0,0'
-  [Windows.Controls.Grid]::SetColumn($right, 1)
-
-  # Current context-window fill (e.g. "ctx 139K"), dim blue. Collapsed until known.
-  $ctx = New-Object System.Windows.Controls.TextBlock
-  $ctx.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#997AC2FF')
-  $ctx.FontFamily = 'Segoe UI'
-  $ctx.FontSize = 10
-  $ctx.HorizontalAlignment = 'Right'
-
-  $age = New-Object System.Windows.Controls.TextBlock
-  $age.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#66FFFFFF')
-  $age.FontFamily = 'Segoe UI'
-  $age.FontSize = 10
-  $age.HorizontalAlignment = 'Right'
-
-  $right.Children.Add($ctx) | Out-Null
-  $right.Children.Add($age) | Out-Null
-
-  $grid.Children.Add($stack) | Out-Null
-  $grid.Children.Add($right) | Out-Null
+  $grid.Children.Add($name) | Out-Null
+  $grid.Children.Add($kind) | Out-Null
 
   # Outer container so the inline prompt box can sit full-width below the row content.
   # (border.Child must be a single element; the grid alone can't host the extra box.)
@@ -1557,8 +1511,7 @@ function New-Row {
   $border.Child = $outer
 
   return @{
-    Border = $border; RunName = $runName; RunPid = $runPid
-    Prompt = $promptTb; Sub = $sub; Meta = $meta; Ctx = $ctx; Age = $age
+    Border = $border; RunName = $runName; RunTitle = $runTitle; Kind = $kind
   }
 }
 
@@ -1582,36 +1535,10 @@ function Set-RowData($e, [SessionState]$s) {
 
   $name = $s.Name()
   if ($e.RunName.Text -ne $name)        { $e.RunName.Text = $name }
-  $pidTxt = "  $($s.AgentKind)"   # right side of the title: the detected agent kind
-  if ($e.RunPid.Text -ne $pidTxt)       { $e.RunPid.Text = $pidTxt }
-
-  if ($s.Prompt) {
-    if ($e.Prompt.Text -ne $s.Prompt)   { $e.Prompt.Text = $s.Prompt }
-    if ($e.Prompt.Visibility -ne 'Visible') { $e.Prompt.Visibility = 'Visible' }
-  } elseif ($e.Prompt.Visibility -ne 'Collapsed') {
-    $e.Prompt.Visibility = 'Collapsed'
-  }
-
-  $sub = $s.Sub()
-  if ($e.Sub.Text -ne $sub)             { $e.Sub.Text = $sub }
-
-  $metaTxt = $s.MetaText()
-  if ($metaTxt) {
-    if ($e.Meta.Text -ne $metaTxt)      { $e.Meta.Text = $metaTxt }
-    if ($e.Meta.Visibility -ne 'Visible') { $e.Meta.Visibility = 'Visible' }
-  } elseif ($e.Meta.Visibility -ne 'Collapsed') {
-    $e.Meta.Visibility = 'Collapsed'
-  }
-
-  $ctxTxt = $s.CtxText()
-  if ($ctxTxt) {
-    if ($e.Ctx.Text -ne $ctxTxt)        { $e.Ctx.Text = $ctxTxt }
-    if ($e.Ctx.Visibility -ne 'Visible') { $e.Ctx.Visibility = 'Visible' }
-  } elseif ($e.Ctx.Visibility -ne 'Collapsed') {
-    $e.Ctx.Visibility = 'Collapsed'
-  }
-
-  if ($e.Age.Text -ne $s.AgeText)       { $e.Age.Text = $s.AgeText }
+  $title = $s.SessionName()
+  $titleTxt = if ($title) { "  $title" } else { '' }
+  if ($e.RunTitle.Text -ne $titleTxt)   { $e.RunTitle.Text = $titleTxt }
+  if ($e.Kind.Text -ne $s.AgentKind)    { $e.Kind.Text = $s.AgentKind }
 }
 
 # Reused row elements, keyed by herdr pane id, so an agent's row is built once and then
@@ -1633,7 +1560,6 @@ function Update-List {
   }
   $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 
-  foreach ($r in $rows) { $r.StampAge($now) }
 
   # Sort: working (busy) first, then blocked, then done, then the rest alphabetically
   # by project so the board reads like herdr's own attention queue.
