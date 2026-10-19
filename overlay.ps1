@@ -4,7 +4,9 @@
 
 # Single-instance guard (last-one-wins): if a previous overlay is running, kill
 # it so this new instance takes over. We track the live overlay via a PID file.
-$script:OverlayPidFile = Join-Path $env:TEMP 'ClaudeSessionsOverlay.pid'
+# LOCALAPPDATA, not TEMP: TEMP differs between launchers (Explorer vs. a tool's shell),
+# which let a second overlay start on top of the first and swallow its clicks.
+$script:OverlayPidFile = Join-Path $env:LOCALAPPDATA 'ClaudeSessionsOverlay.pid'
 $script:OverlayHostName = (Get-Process -Id $PID).ProcessName   # powershell / pwsh
 if (Test-Path $script:OverlayPidFile) {
   $oldPid = Get-Content $script:OverlayPidFile -ErrorAction SilentlyContinue | Select-Object -First 1
