@@ -1137,11 +1137,10 @@ $Window.Add_SourceInitialized({
 # Herdr agent actions (focus + prompt delivery) via the herdr CLI.
 # ---------------------------------------------------------------------------
 
-# Bring the workspace hosting $paneId to the foreground. `herdr agent focus`
-# only selects the pane inside the herdr UI; when the herdr window itself is
-# behind other windows, the workspace label (falling back to the pane's cwd
-# leaf) is matched against top-level window titles to raise the right one.
-function Focus-HerdrAgent([string]$paneId, [string]$cwd) {
+# Show $paneId in the herdr UI: `herdr agent focus` switches the attached client to
+# that pane, then the window hosting the client is raised (found by process tree, not
+# by title, so a same-named editor/terminal window is never picked by mistake).
+function Focus-HerdrAgent([string]$paneId, [string]$cwd, [switch]$LaunchIfDetached) {
   if ([string]::IsNullOrWhiteSpace($paneId)) { return $false }
 
   # 1. Select the pane inside the herdr UI (no-op if herdr is not running).
@@ -1150,39 +1149,44 @@ function Focus-HerdrAgent([string]$paneId, [string]$cwd) {
     if ($LASTEXITCODE -ne 0) { return $false }
   } catch { return $false }
 
-  # 2. Raise a top-level window whose title matches the workspace label or cwd leaf.
-  $needles = @()
+  # 2. Show the herdr UI itself: raise the window hosting an attached herdr client
+  #    (now switched to this pane). With no client attached, open one when asked.
+  $win = Get-HerdrClientWindow
+  if ($win) { [WinTools]::Focus($win.Handle); return $true }
+  if ($LaunchIfDetached) { Start-HerdrClient }
+  return $true   # pane focused inside herdr even if no window is showing it
+}
+
+# The top-level window hosting an attached herdr client: walk each client process
+# (herdr.exe without the `server` arg) up its parent chain to the first process that
+# owns a visible window (Windows Terminal, or the shell for a classic console).
+function Get-HerdrClientWindow {
   try {
-    $wl = & $HerdrBin workspace list 2>$null
-    if ($LASTEXITCODE -eq 0 -and $wl) {
-      $wid = ($paneId -split ':')[0]
-      $resp = ($wl -join "`n") | ConvertFrom-Json
-      foreach ($ws in $resp.result.workspaces) {
-        if ("$($ws.workspace_id)" -eq $wid) {
-          if ($ws.label) { $needles += "$($ws.label)" }
-          if ($ws.worktree -and $ws.worktree.checkout_path) {
-            $needles += [System.IO.Path]::GetFileName($("$($ws.worktree.checkout_path)".TrimEnd('\')))
-          }
-          break
-        }
+    $procs = @{}
+    foreach ($p in (Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, CommandLine)) { $procs[[uint32]$p.ProcessId] = $p }
+    $wins = [WinTools]::List()
+    foreach ($c in $procs.Values) {
+      if ($c.Name -ne 'herdr.exe' -or "$($c.CommandLine)" -match '\sserver(\s|$)') { continue }
+      $id = [uint32]$c.ParentProcessId
+      for ($i = 0; $i -lt 6 -and $procs.ContainsKey($id); $i++) {
+        $w = $wins | Where-Object { $_.Pid -eq $id } | Select-Object -First 1
+        if ($w) { return $w }
+        $id = [uint32]$procs[$id].ParentProcessId
       }
     }
   } catch {}
-  if ($cwd) { $needles += [System.IO.Path]::GetFileName($cwd.TrimEnd([char]'\', [char]'/')) }
+  return $null
+}
 
-  $best = $null; $bestScore = 0
-  foreach ($w in [WinTools]::List()) {
-    foreach ($n in $needles) {
-      if (-not $n) { continue }
-      if ($w.Title -like "*$n*") {
-        $s = $n.Length
-        if ($s -gt $bestScore) { $bestScore = $s; $best = $w }
-        break
-      }
+# Open a terminal attached to the persistent herdr session (it shows the focused pane).
+function Start-HerdrClient {
+  try {
+    if (Get-Command 'wt.exe' -ErrorAction SilentlyContinue) {
+      Start-Process 'wt.exe' -ArgumentList $HerdrBin
+    } else {
+      Start-Process 'powershell.exe' -ArgumentList '-NoExit', '-Command', $HerdrBin
     }
-  }
-  if ($best) { [WinTools]::Focus($best.Handle); return $true }
-  return $true   # pane focused inside herdr even if no window matched
+  } catch {}
 }
 
 # Deliver a prompt to a herdr agent: `herdr agent prompt <pane> <text>`. The CLI
@@ -1343,7 +1347,7 @@ function New-Row {
     if (-not ($t -and $t.Pid)) { return }
     $shift = ([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Shift) -ne 0
     if ($shift) { Show-PromptInput $this; return }
-    $ok = Focus-HerdrAgent $t.Pid $t.Cwd
+    $ok = Focus-HerdrAgent $t.Pid $t.Cwd -LaunchIfDetached
     if (-not $ok) { Show-RowFlash $this '#55F56C6C' }   # red: couldn't reach the herdr server
   })
 
@@ -1352,7 +1356,7 @@ function New-Row {
   $border.Add_MouseRightButtonUp({
     $t = $this.Tag
     if ($t -and $t.Pid) {
-      $ok = Focus-HerdrAgent $t.Pid $t.Cwd
+      $ok = Focus-HerdrAgent $t.Pid $t.Cwd -LaunchIfDetached
       Show-RowFlash $this $(if ($ok) { '#5567C23A' } else { '#55F56C6C' })
     }
   })
